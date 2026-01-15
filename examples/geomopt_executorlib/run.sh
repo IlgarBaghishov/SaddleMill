@@ -16,6 +16,6 @@ srun -n $SLURM_NNODES mkdir -p $CUDA_MPS_LOG_DIRECTORY
 
 srun -n $SLURM_NNODES nvidia-cuda-mps-control -d
 
-srun -n $SLURM_NNODES flux start python -u execute.py
+srun -n $SLURM_NNODES flux start python -u -m tsearch
 
 srun -n $SLURM_NNODES bash -c "echo quit | nvidia-cuda-mps-control"

@@ -5,46 +5,37 @@ from ase.io import read
 from ase.mep import NEB, NEBTools
 from tsearch.catsunami.ocpneb import OCPNEB
 from tsearch.catsunami.autoframe import interpolate
-from fairchem.core import FAIRChemCalculator
+from tsearch.tools import parse_inputfile, load_calculator
 
 
-def nebopt():
-    relax_endpoints = True
-    neb_method = "improvedtangent"
-    interpolate_method = "ocp_idpp"  # this is idpp implementation from Meta OCP, other choises are "ase_idpp" and "ase_linear" or False if you already have a frame set
-    fmax = 0.05
-    k = 5
-    num_frames = 10
+config_dict = parse_inputfile("config.ini")
+calc = load_calculator(config_dict)
 
-    device = "cuda"
-    model_name_or_path = "uma-s-1p1"
-    task_name = "oc20"
 
-    calc = FAIRChemCalculator.from_model_checkpoint(model_name_or_path, task_name, device=device)
+def nebopt(i, config_dict):
+    relax_endpoints = config_dict["ourNEB"]["relax_endpoints"]
+    interpolate_method = config_dict["ourNEB"]["interpolate_method"]  # this is idpp implementation from Meta OCP, other choises are "ase_idpp" and "ase_linear" or False if you already have a frame set
+    num_frames = config_dict["ourNEB"]["num_frames"]
 
     if not interpolate_method:
         """
         The approach uses ase, so you must provide a list of ase.Atoms objects
         with the appropriate constraints.
         """
-        # file_path = "../../../datasets/all_dft_neb_trajs/transfer_id_0_2342_21_2-1-1-3_neb1.traj"
-        file_path = "../../../datasets/all_dft_neb_trajs/dissociation_ood_595_3492_21_211-2_neb1.traj"
-        # file_path = "../../../datasets/all_dft_neb_trajs/desorption_id_106_6686_7_111-3_neb1.traj"
-        images = read(file_path, f"0:{num_frames}")  # Change to the path to your atoms of the frame set
+        images = read(config_dict["ourNEB"]["interpolated_images_path"], f"0:{num_frames}")  # Change to the path to your atoms of the frame set
         reactant = images[0]
         product = images[-1]
     else:
-        reactant = read("optimized_reactant.vasp")
-        product = read("optimized_product.vasp")
-
-    reactant.calc = FAIRChemCalculator.from_model_checkpoint(model_name_or_path, task_name, device=device)
-    product.calc = FAIRChemCalculator.from_model_checkpoint(model_name_or_path, task_name, device=device)
+        reactant = read(config_dict["ourNEB"]["reactant_path"])
+        product = read(config_dict["ourNEB"]["product_path"])
 
     if relax_endpoints:
         if not interpolate_method: print("Are you sure you want to relax end points while keeping the intermediate inages from your traj?")
-        opt = BFGS(reactant, trajectory='reactant_relaxation.traj')
+        reactant.calc = calc
+        opt = BFGS(reactant, trajectory=f'reactant_relaxation{i}.traj')
         opt.run(0.05, 300)
-        opt = BFGS(product, trajectory='product_relaxation.traj')
+        reactant.calc = calc
+        opt = BFGS(product, trajectory=f'product_relaxation{i}.traj')
         opt.run(0.05, 300)
 
     if interpolate_method == "ocp_idpp":
@@ -67,31 +58,20 @@ def nebopt():
         images += [reactant.copy() for i in range(num_frames-2)]
         images += [product]
 
-        neb0 = NEB(
-            images,
-            k=k,
-            climb=True,
-            method=neb_method,
-            allow_shared_calculator=False,
-            dynamic_relaxation=False,
-        )
+        neb0 = NEB(images, **config_dict["DyNEB"])
         neb0.interpolate(method=interpolate_method[4:], mic=True)
 
-    for image in images[1:-1]:
+    for image in images:
         image.calc = calc
 
     neb = OCPNEB(
         images,
-        k=k,
-        climb=True,
-        method=neb_method,
-        allow_shared_calculator=True,
-        dynamic_relaxation=False,
-        batch_size=8, # If you get a memory error, try reducing it to 4
+        batch_size = config_dict["ourNEB"]["batch_size"], # If you get a memory error, try reducing it to 4
+        **config_dict["DyNEB"],
     )
 
-    optimizer = MDMin(neb, dt=0.02, maxstep=0.1, trajectory=f"your-neb.traj")
-    conv = optimizer.run(fmax=fmax, steps=500)
+    optimizer = MDMin(neb, dt=0.02, maxstep=0.1, trajectory=f"your-neb{i}.traj")
+    conv = optimizer.run(fmax=config_dict["Main"]["fmax"], steps=config_dict["Main"]["steps"])
 
     # optimizer = MDMin(neb, dt=0.02, maxstep=0.1, trajectory=f"your-neb.traj")
     # conv = optimizer.run(fmax=fmax + delta_fmax_climb, steps=500)
@@ -120,7 +100,3 @@ def nebopt():
     # ax = fig.add_axes((0.15, 0.15, 0.8, 0.75))
     # nebtools.plot_band(ax)
     # fig.savefig('diffusion-barrier.png')
-
-
-if __name__ == "__main__":
-    nebopt(sys.argv[1])

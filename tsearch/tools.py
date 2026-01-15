@@ -1,6 +1,21 @@
 import configparser
 
 
+def load_calculator(config_dict):
+    if config_dict["Main"]["Calculator"] == "FAIRChemCalculator":
+        from fairchem.core import FAIRChemCalculator
+        calc = FAIRChemCalculator.from_model_checkpoint(
+            config_dict["FAIRChemCalculator"]["model_name_or_path"],
+            task_name = config_dict["FAIRChemCalculator"]["task_name"],
+            device = config_dict["FAIRChemCalculator"]["device"],
+            )
+    elif config_dict["Main"]["Calculator"] == "VaspInteractive":
+        raise NotImplementedError
+    elif config_dict["Main"]["Calculator"] == "Vasp":
+        raise NotImplementedError
+    return calc
+
+
 def load_method(method_name):
     if method_name.lower() == "neb":
         from tsearch.nebopt import nebopt as method

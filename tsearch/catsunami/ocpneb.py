@@ -76,6 +76,10 @@ class OCPNEB(DyNEB):
         self.predictor = tmp_calc.predictor
         self.a2g = tmp_calc.a2g
 
+        if self.method != 'aseneb':
+            self.reactant_energy = self.images[0].get_potential_energy()
+            self.product_energy = self.images[-1].get_potential_energy()
+
         self.intermediate_energies = []
         self.intermediate_forces = []
         self.cached = False
@@ -105,8 +109,8 @@ class OCPNEB(DyNEB):
             energies[1:-1] = energies_calcd
 
             if self.method != 'aseneb':
-                energies[0] = self.images[0].get_potential_energy()
-                energies[-1] = self.images[-1].get_potential_energy()
+                energies[0] = self.reactant_energy
+                energies[-1] = self.product_energy
 
             # Handle constraints:
             if self.images[0].constraints and np.equal(self.images[0].get_tags(), np.zeros(len(self.images[0]),int)).all():  # if had constraints and all atom tags are 0
