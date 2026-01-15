@@ -7,7 +7,6 @@ from ase.optimize.precon import Precon, PreconImages
 
 from fairchem.core.common.utils import setup_imports, setup_logging
 from fairchem.core.datasets.atomic_data import atomicdata_list_to_batch
-from fairchem.core.calculate import FAIRChemCalculator
 
 from ase.mep.neb import DyNEB, NEBState
 
@@ -16,9 +15,7 @@ class OCPNEB(DyNEB):
     def __init__(
         self,
         images,
-        model_name_or_path,
-        task_name,
-        k=0.1,
+        k=5,
         fmax=0.05,
         climb=False,
         parallel=False,
@@ -29,9 +26,7 @@ class OCPNEB(DyNEB):
         method="improvedtangent",
         allow_shared_calculator=True,
         precon=None,
-        device=None,
         batch_size=4,
-        **kwargs,
     ):
         """
         Subclass of NEB that allows for scaled and dynamic optimizations of
@@ -77,25 +72,7 @@ class OCPNEB(DyNEB):
         setup_imports()
         setup_logging()
 
-
-        self.images[0].calc = FAIRChemCalculator.from_model_checkpoint(
-            model_name_or_path,
-            task_name,
-            device=device,
-            **kwargs 
-        )
-        self.images[-1].calc = FAIRChemCalculator.from_model_checkpoint(
-            model_name_or_path,
-            task_name,
-            device=device,
-            **kwargs 
-        )
-        tmp_calc = FAIRChemCalculator.from_model_checkpoint(
-            model_name_or_path,
-            task_name,
-            device=device,
-            **kwargs 
-        )
+        tmp_calc = self.images[1].calc
         self.predictor = tmp_calc.predictor
         self.a2g = tmp_calc.a2g
 
@@ -103,11 +80,6 @@ class OCPNEB(DyNEB):
         self.intermediate_forces = []
         self.cached = False
 
-        # # Handle constraints:
-        # fixed_atoms = [idx for idx, tag in enumerate(self.images[0].get_tags()) if tag == 0]
-        # fixed_atoms_all = []
-        # for image in self.images[1:-1]:
-        #     image.constraints = [FixAtoms(indices=fixed_atoms)]
 
     def get_forces(self):
         images = self.images[1:-1]
@@ -123,31 +95,24 @@ class OCPNEB(DyNEB):
                 data_list = [self.a2g(img) for img in batch_images]
                 batch = atomicdata_list_to_batch(data_list)
 
-                # 3. Predict
-                # The @collate_predictions decorator in fairchem ensures 
-                # keys are 'energy' and 'forces' regardless of model task name
                 predictions = self.predictor.predict(batch)
-                energies_calcd.extend(predictions["energy"].flatten().tolist())
+                energies_calcd.extend(predictions["energy"].detach().cpu().flatten().tolist())
                 forces_calcd.extend(predictions["forces"].cpu().numpy())
+
+            forces = np.array(forces_calcd)
 
             energies = np.empty(self.nimages)
             energies[1:-1] = energies_calcd
 
             if self.method != 'aseneb':
-                energies[0] = self.reactant_energy
-                energies[-1] = self.product_energy
-
-            forces = np.array(forces_calcd)
+                energies[0] = self.images[0].get_potential_energy()
+                energies[-1] = self.images[-1].get_potential_energy()
 
             # Handle constraints:
             if self.images[0].constraints and np.equal(self.images[0].get_tags(), np.zeros(len(self.images[0]),int)).all():  # if had constraints and all atom tags are 0
-                fixed_atoms = np.array(
-                    [idx for idx, tag in enumerate(self.images[0].constraints[0].get_indices()) if tag == 0]
-                )
+                fixed_atoms = self.images[0].constraints[0].get_indices()
             else:
-                fixed_atoms = np.array(
-                    [idx for idx, tag in enumerate(self.images[0].get_tags()) if tag == 0]
-                )
+                fixed_atoms = np.array([idx for idx, tag in enumerate(self.images[0].get_tags()) if tag == 0])
 
             for i in range(self.nimages - 2):
                 for fixed_atom in fixed_atoms:
