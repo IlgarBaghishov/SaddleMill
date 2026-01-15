@@ -18,4 +18,4 @@ htmlcov/
 .DS_Store
 *.log
 *ll_out*
-examples/catsunami/
+examples/catsunami/datasets
