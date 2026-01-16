@@ -16,7 +16,6 @@ from tsearch.tools import parse_inputfile, load_calculator
 
 config_dict = parse_inputfile("config.ini")
 calc = load_calculator(config_dict)
-rank = "DetermineRankHereFromExecutorlibOrFlux"
 
 csv_path = config_dict["ourDimer"]["csv_path"]
 df = pd.read_csv(csv_path, index_col=0)
@@ -42,8 +41,9 @@ def turn_into_supercell(atoms):
     return atoms
 
 
-def dimeropt(i, config_dict):
+def dimeropt(i, config_dict, executorlib_worker_id=None):
 
+    rank = executorlib_worker_id
     random.seed(i)
     np.random.seed(i)
 

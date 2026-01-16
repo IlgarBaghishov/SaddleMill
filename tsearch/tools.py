@@ -16,7 +16,8 @@ def load_calculator(config_dict):
     return calc
 
 
-def load_method(method_name):
+def load_method(config_dict):
+    method_name = config_dict["Main"]["method"]
     if method_name.lower() == "neb":
         from tsearch.nebopt import nebopt as method
     elif method_name.lower() == "dimer":
@@ -30,7 +31,8 @@ def load_method(method_name):
     return method
 
 
-def load_optimizer(optimizer_name):
+def load_optimizer(config_dict):
+    optimizer_name = config_dict["Main"]["Optimizer"]
     if optimizer_name.lower() == "mdmin":
         from ase.optimize import MDMin as Optimizer
     elif optimizer_name.lower() == "bfgs":

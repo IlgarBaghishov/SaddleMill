@@ -12,7 +12,9 @@ config_dict = parse_inputfile("config.ini")
 calc = load_calculator(config_dict)
 
 
-def nebopt(i, config_dict):
+def nebopt(i, config_dict, executorlib_worker_id=None):
+
+    rank = executorlib_worker_id
     relax_endpoints = config_dict["ourNEB"]["relax_endpoints"]
     interpolate_method = config_dict["ourNEB"]["interpolate_method"]  # this is idpp implementation from Meta OCP, other choises are "ase_idpp" and "ase_linear" or False if you already have a frame set
     num_frames = config_dict["ourNEB"]["num_frames"]

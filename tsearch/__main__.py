@@ -26,7 +26,7 @@ def main():
     jobs_per_gpu = config_dict["Main"]["jobs_per_gpu"]
     cpus_per_job = all_ncores // (all_ngpus*jobs_per_gpu)
 
-    method = load_method(config_dict["Main"]["method"])
+    method = load_method(config_dict)
 
     nstructures = 16
 
