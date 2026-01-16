@@ -69,6 +69,7 @@ def main():
         submit_counter = 0
 
         for traj_name in all_traj_files:
+            if submit_counter == 8: break
             if method_name == "NEB":
                 f = submitter(method, submit_counter, config_dict, traj_name)
                 if config_dict["Main"]["executorlib"]: futures.append(f)
@@ -83,37 +84,6 @@ def main():
         if config_dict["Main"]["executorlib"]:
             while len(futures):
                 futures = check_and_print_status(futures, submit_counter)
-
-    # with FluxJobExecutor(flux_log_files=True, max_workers=all_ngpus, block_allocation=True, resource_dict={"cores": 1, "gpus_per_core": 1, "threads_per_core":1, "num_nodes": 1}) as mps_exe:
-    with FluxJobExecutor(flux_log_files=True,
-                         max_workers=all_ngpus*jobs_per_gpu,
-                         block_allocation=True,
-                         resource_dict={"cores": 1, "gpus_per_core": 0, "threads_per_core": cpus_per_job, "num_nodes": 1, "error_log_file": "error"}
-                         ) as exe:  # pmi_mode="pmix"
-    
-        # command = "export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps-pipe-$USER\n"\
-        #             "export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-mps-log-$USER\n"\
-        #             "mkdir -p $CUDA_MPS_PIPE_DIRECTORY\n"\
-        #             "mkdir -p $CUDA_MPS_LOG_DIRECTORY\n"\
-        #             "nvidia-cuda-mps-control -d"
-        # # Starting daemons:
-        # for i in range(all_ngpus):
-        #     mps_exe.submit(os.system,command)
-
-        futures = []
-        submit_counter = 0
-        for traj_name in all_traj_files:
-            if method_name == "NEB":
-                futures.append(exe.submit(method, submit_counter, config_dict, traj_name))
-                submit_counter += 1
-            else:
-                with Trajectory(traj_name, 'r') as traj:
-                    for atoms in traj:
-                        futures.append(exe.submit(method, submit_counter, config_dict, atoms))
-                        submit_counter += 1
-
-        while len(futures):
-            futures = check_and_print_status(futures, submit_counter)
 
 
 if __name__ == "__main__":

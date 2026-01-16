@@ -1,0 +1,3 @@
+WARNING:root:The 'seed' argument is deprecated and will be removed in future versions. Please set the seed in the MLIPPredictUnit configuration instead.
+/work/08405/ilgar/vista/conda_libraries/tsearch/lib/python3.12/site-packages/ase/mep/neb.py:761: FutureWarning: Keyword dynamic_relaxation of NEB is deprecated.  Please use the DyNEB class instead for dynamic relaxation
+  warnings.warn(f'Keyword {keyword} of NEB is deprecated.  '
