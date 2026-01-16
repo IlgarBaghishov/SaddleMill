@@ -1,4 +1,4 @@
-import configparser
+import configparser, os, glob
 
 
 def load_calculator(config_dict):
@@ -24,6 +24,8 @@ def load_method(config_dict):
         from tsearch.dimeropt import dimeropt as method
     elif method_name.lower() == "minimization":
         from tsearch.geomopt import geomopt as method
+    elif method_name.lower() == "DoubleMinimization":
+        from tssearch.geomopt import doublegeomopt as method
     else:
         raise NotImplementedError(
             f"Method '{method_name}' is not implemented. Only NEB, Dimer, and Minimization are supported."
@@ -46,6 +48,19 @@ def load_optimizer(config_dict):
             f"Method '{optimizer_name}' is not implemented. Only MDMin, BFGS, LBFGS and FIRE are supported."
         )
     return Optimizer
+
+
+def get_all_traj_names(config_dict):
+    main_cfg = config_dict.get("Main", {})
+    dir_path = main_cfg.get("dir_path", ".")
+    input_pattern = os.path.join(dir_path, "*.traj")
+    all_traj_files = sorted(glob.glob(input_pattern))
+    return all_traj_files
+
+def save_ordered_traj_names(all_traj_files):
+    with open('traj_files_ordered.txt', 'w') as f:
+        for name in all_traj_files:
+            f.write(f"{name}\n")
 
 
 
