@@ -114,10 +114,12 @@ Ensure you run these commands (or add to `.bashrc`) every time you log in or sta
 
 ```bash
 # On Vista:
+export PYTHONPATH=<tsearch_path>:$PYTHONPATH
 export LD_LIBRARY_PATH=/opt/apps/cuda/12.4/targets/sbsa-linux/lib/:$LD_LIBRARY_PATH
 export FAIRCHEM_CACHE_DIR="$SCRATCH/.cache/fairchem"
 
 # On LS6:
+export PYTHONPATH=<tsearch_path>:$PYTHONPATH
 module unload impi python3
 module load cuda/12.8
 export FAIRCHEM_CACHE_DIR="$SCRATCH/.cache/fairchem"
