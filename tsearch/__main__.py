@@ -39,8 +39,9 @@ def main():
         print(all_ncores,all_ngpus)
 
         jobs_per_gpu = config_dict["Main"]["jobs_per_gpu"]
-        cpus_per_job = all_ncores // (all_ngpus*jobs_per_gpu)
-        
+        gpus_per_core = 1 if jobs_per_gpu == 1 else 0
+        cpus_per_job = all_ncores // (all_ngpus*jobs_per_gpu) - 1
+
         # Use FluxJobExecutor and its submit method
         executor = FluxJobExecutor(
             flux_log_files=True,
@@ -48,7 +49,7 @@ def main():
             block_allocation=True,
             resource_dict={
                 "cores": 1, 
-                "gpus_per_core": 0, 
+                "gpus_per_core": gpus_per_core, 
                 "threads_per_core": cpus_per_job, 
                 "num_nodes": 1, 
                 "error_log_file": "error"

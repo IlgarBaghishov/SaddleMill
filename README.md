@@ -101,10 +101,12 @@ export FAIRCHEM_CACHE_DIR="$SCRATCH/.cache/fairchem"
 
 ### Interactive Node
 
-Request an interactive node on the `gh-dev` partition:
+Request an interactive node:
 
 ```bash
-idev -p gh-dev -m 120 -A CHE23004
+idev -p gh-dev -N 1 -m 120 -A CHE23004
+# or for Lonestar:
+idev -p gpu-a100-dev -N 1 -m 120 -A CHE23004
 
 ```
 
