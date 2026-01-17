@@ -1,5 +1,7 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+from tsearch.tools import parse_inputfile, load_calculator, load_optimizer
+config_dict = parse_inputfile("config.ini")
+if config_dict["Main"]["jobs_per_gpu"] != 1: os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 from pathlib import Path
 import zipfile, os
@@ -9,10 +11,8 @@ from ase.io import Trajectory
 from ase.mep.neb import NEB, NEBTools, NEBState
 from tsearch.catsunami.ocpneb import OCPNEB
 from tsearch.catsunami.autoframe import interpolate
-from tsearch.tools import parse_inputfile, load_calculator, load_optimizer
 
 
-config_dict = parse_inputfile("config.ini")
 calc = load_calculator(config_dict)
 Optimizer = load_optimizer(config_dict)
 

@@ -51,7 +51,9 @@ MPICC=$(which mpicc) pip install --no-binary=mpi4py mpi4py
 Check if flux detects all resources correctly:
 
 ```bash
-srun -n 1 flux start flux resource list
+srun -n 2 flux start flux resource list
+# For LS6
+srun -n 2 --mpi=pmi2 flux start flux resource list
 
 ```
 
@@ -62,7 +64,10 @@ Clone the environment and install specific machine learning libraries.
 ```bash
 conda create --prefix /work/08405/ilgar/vista/conda_libraries/tsearch --clone executorlib
 
-pip install --cache-dir <scratch_cache_dir> fairchem-core
+pip config set global.cache-dir "/path/to/your/cache/directory"
+
+pip install fairchem-core fairchem-data-oc
+pip install scipy==1.16
 # This part below is only necessary for Vista and not for Lonestar6
 pip uninstall torch
 pip install "torch==2.9.0+cu128" --index-url https://download.pytorch.org/whl/cu128

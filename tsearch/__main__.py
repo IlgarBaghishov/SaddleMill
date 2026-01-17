@@ -70,7 +70,6 @@ def main():
         submit_counter = 0
 
         for traj_name in all_traj_files:
-            if submit_counter == 8: break
             if method_name == "NEB":
                 f = submitter(method, submit_counter, config_dict, traj_name)
                 if config_dict["Main"]["executorlib"]: futures.append(f)
