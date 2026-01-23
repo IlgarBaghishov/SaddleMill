@@ -8,6 +8,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
 import zipfile, os
+import numpy as np
+from ase.data import covalent_radii
 from ase.optimize import BFGS
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import Trajectory
@@ -39,6 +41,7 @@ def nebopt(i, config_dict, traj_name, executorlib_worker_id=None):
 
     relax_endpoints = config_dict["ourNEB"]["relax_endpoints"]
     interpolate_method = config_dict["ourNEB"]["interpolate_method"]  # this is idpp implementation from Meta OCP, other choises are "ase_idpp" and "ase_linear" or False if you already have a frame set
+    perform_aseidpp = False
     num_frames = config_dict["ourNEB"]["num_frames"]
 
     try:
@@ -79,7 +82,26 @@ def nebopt(i, config_dict, traj_name, executorlib_worker_id=None):
                 images += [product]
 
                 neb0 = NEB(images, **config_dict["DyNEB"])
-                neb0.interpolate(method=interpolate_method[4:], mic=True)
+
+                if interpolate_method[4:] == "idpp":
+                    perform_aseidpp = True
+                else:
+                    neb0.interpolate(method="linear", mic=True)
+
+                    # Array of covalent radii for the system
+                    radii = np.array([covalent_radii[z] for z in reactant.numbers])
+                    radii_sum = radii[:, None] + radii[None, :]
+                    
+                    for atoms in neb0.images[1:-1]:
+                        dists = atoms.get_all_distances(mic=True)
+                        np.fill_diagonal(dists, np.inf)
+
+                        if np.any(dists < 0.6 * radii_sum):
+                            perform_aseidpp = True
+                            break
+
+                if perform_aseidpp:
+                    neb0.interpolate(method="idpp", mic=True)
 
         for image in images:
             image.calc = calc
@@ -133,6 +155,9 @@ def nebopt(i, config_dict, traj_name, executorlib_worker_id=None):
             ci_image.info['max_forces'] = max_forces
             ci_image.info['reactant_positions'] = neb.images[0].positions
             ci_image.info['product_positions'] = neb.images[-1].positions
+            ci_image.info['interpolation_method'] = interpolate_method
+            if isinstance(interpolate_method, str) and interpolate_method.startswith("ase_") and perform_aseidpp:
+                ci_image.info['interpolation_method'] = "ase_idpp"
             writer.write(ci_image)
 
         # Create a figure of the band. However this slows it down by around 4 second per NEB optimization

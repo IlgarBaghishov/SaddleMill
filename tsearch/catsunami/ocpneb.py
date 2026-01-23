@@ -25,7 +25,7 @@ class OCPNEB(DyNEB):
         method="improvedtangent",
         allow_shared_calculator=True,
         precon=None,
-        batch_size=4,
+        batch_size=8,
     ):
         """
         Subclass of NEB that allows for scaled and dynamic optimizations of
