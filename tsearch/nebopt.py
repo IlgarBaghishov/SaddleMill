@@ -55,10 +55,10 @@ def nebopt(i, config_dict, traj_name, executorlib_worker_id=None):
             if not interpolate_method: print("Are you sure you want to relax end points while keeping the intermediate inages from your traj?")
             reactant.calc = calc
             opt = BFGS(reactant, trajectory=temp_react_relax)
-            opt.run(0.05, 300)
+            opt.run(config_dict["ourNEB"]["endpoint_relax_fmax"], config_dict["ourNEB"]["endpoint_relax_maxsteps"])
             product.calc = calc
             opt = BFGS(product, trajectory=temp_prod_relax)
-            opt.run(0.05, 300)
+            opt.run(config_dict["ourNEB"]["endpoint_relax_fmax"], config_dict["ourNEB"]["endpoint_relax_maxsteps"])
 
         if interpolate_method:
             if interpolate_method == "ocp_idpp":
