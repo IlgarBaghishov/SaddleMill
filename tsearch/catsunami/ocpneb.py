@@ -113,8 +113,10 @@ class OCPNEB(DyNEB):
             # Handle constraints:
             if self.images[0].constraints and np.equal(self.images[0].get_tags(), np.zeros(len(self.images[0]),int)).all():  # if had constraints and all atom tags are 0
                 fixed_atoms = self.images[0].constraints[0].get_indices()
-            else:
+            elif not np.equal(self.images[0].get_tags(), np.zeros(len(self.images[0]),int)).all():
                 fixed_atoms = np.array([idx for idx, tag in enumerate(self.images[0].get_tags()) if tag == 0])
+            else:
+                fixed_atoms = np.array([],dtype=int) 
 
             for i in range(self.nimages - 2):
                 for fixed_atom in fixed_atoms:
