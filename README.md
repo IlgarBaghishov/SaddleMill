@@ -29,13 +29,14 @@ Load necessary modules and create the base Conda environment.
 
 ```bash
 # Create base environment
-conda create -n executorlib -c conda-forge python=3.12 flux-core flux-sched "openmpi=5.0.5=external_*" executorlib
+conda create -n executorlib -c conda-forge python=3.12 flux-core flux-sched "openmpi=5.0.5" executorlib
 conda activate executorlib
 
 # Install hardware locality
 conda install "libhwloc=*=cuda*" -c conda-forge
 export LD_LIBRARY_PATH=/opt/apps/cuda/12.4/targets/sbsa-linux/lib/:$LD_LIBRARY_PATH
 
+find $CONDA_PREFIX -name "sched-fluxion-*.so" -path "*feedstock_root*" -exec cp {} $CONDA_PREFIX/lib/flux/modules/ \;
 ```
 
 **(Optional) MPI Support:**
