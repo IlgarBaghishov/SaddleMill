@@ -2,8 +2,8 @@ from executorlib import FluxJobExecutor
 from flux import Flux, resource
 import concurrent.futures
 from contextlib import nullcontext
-from tsearch.tools import parse_inputfile, load_method, \
-    get_all_traj_names, save_ordered_traj_names
+from tsearch.tools import save_ordered_traj_names
+from tsearch.config import load_config, load_method, get_all_traj_names
 import os, pathlib
 from ase.io import Trajectory
 
@@ -17,7 +17,9 @@ def check_and_print_status(futures, total):
 
 def main():
 
-    config_dict = parse_inputfile("config.ini")
+    config_dict = load_config("config.ini")
+    print(config_dict)
+    print()
 
     method = load_method(config_dict)
     all_traj_files = get_all_traj_names(config_dict)

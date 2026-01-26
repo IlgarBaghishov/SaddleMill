@@ -9,11 +9,11 @@ import pandas as pd
 from ase.io import Trajectory
 from ase.mep import DimerControl, MinModeAtoms, MinModeTranslate
 from ase.calculators.singlepoint import SinglePointCalculator
-from tsearch.tools import parse_inputfile, load_calculator
+from tsearch.config import load_config, load_calculator
 from tsearch.dimertools.structure_edit import get_attempts
 
 
-config_dict = parse_inputfile("config.ini")
+config_dict = load_config("config.ini")
 calc = load_calculator(config_dict)
 
 

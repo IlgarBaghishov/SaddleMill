@@ -5,10 +5,10 @@ import zipfile
 from ase.io import Trajectory
 from ase.filters import FrechetCellFilter
 from ase.calculators.singlepoint import SinglePointCalculator
-from tsearch.tools import parse_inputfile, load_calculator, load_optimizer
+from tsearch.config import load_config, load_calculator, load_optimizer
 
 
-config_dict = parse_inputfile("config.ini")
+config_dict = load_config("config.ini")
 calc = load_calculator(config_dict)
 Optimizer = load_optimizer(config_dict)
 
