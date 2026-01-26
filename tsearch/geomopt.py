@@ -96,6 +96,7 @@ def doublegeomopt(i, config_dict, atoms, executorlib_worker_id=None):
     temp_files = []
 
     with Trajectory(my_output_file, 'a') as writer:
+        parent_source_idx = atoms.info['src_index']
         try:
             if not atoms.info['converged']:
                 raise Exception("Input structure marked as unconverged.")
@@ -107,7 +108,6 @@ def doublegeomopt(i, config_dict, atoms, executorlib_worker_id=None):
 
 
             # Identify IDs
-            parent_source_idx = atoms.info['src_index']
             refined_eigenmode = atoms.info['eigenmode']
 
             # --- PREPARE TS (Middle Image) ---
