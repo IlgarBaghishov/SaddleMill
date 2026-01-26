@@ -75,7 +75,7 @@ def get_attempts(atoms, config_dict):
         mask[unique_neighbors] = True
         mask = mask.tolist()
 
-        num_needed = config_dict["ourDimer"]["num_attempts"] // 2
+        num_needed = config_dict["ourDimer"]["num_attempts"]//3
         if len(adsorbate_indices) >= num_needed:
             chosen_indices = random.sample(list(adsorbate_indices), num_needed)
         else:
@@ -86,9 +86,12 @@ def get_attempts(atoms, config_dict):
         for i in range(config_dict["ourDimer"]["num_attempts"]):
             images.append(atoms.copy())
 
-            if i < config_dict["ourDimer"]["num_attempts"]//2:
+            if i < num_needed:
                 displacement_dicts.append({"displacement_center": int(chosen_indices[i])})
                 selected_indices.append(int(chosen_indices[i]))
+            elif num_needed <= i < 2*num_needed:
+                displacement_dicts.append({"displacement_center": int(chosen_indices[i-num_needed]), "gauss_std":0.2, "number_of_atoms":1})
+                selected_indices.append(int(chosen_indices[i-num_needed]))
             else:
                 displacement_dicts.append({"mask": mask})
                 selected_indices.append(-1)

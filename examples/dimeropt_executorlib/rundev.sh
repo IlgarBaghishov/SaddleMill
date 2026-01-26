@@ -1,6 +1,6 @@
 #!/bin/sh
-#SBATCH -N 4
-#SBATCH -n 4
+#SBATCH -N 1
+#SBATCH -n 1
 #SBATCH -o ll_out
 #SBATCH -p gh-dev
 #SBATCH -t 02:00:00
