@@ -39,17 +39,17 @@ class swDNEB(NEBMethod):
     def add_image_force(self, state, tangential_force, tangent, imgforce,
                         spring1, spring2, i):
         imgforce -= tangential_force * tangent
-        perp_pot_force = imgforce
+        perp_pot_force = imgforce.copy()
         perp_pot_force_norm = np.linalg.norm(perp_pot_force)
         perp_pot_force /= perp_pot_force_norm if perp_pot_force_norm > 0 else 1
 
-        # # Improved parallel spring force (formula 12 of paper I)
-        # imgforce += (spring2.nt * spring2.k - spring1.nt * spring1.k) * tangent
+        # Improved parallel spring force (formula 12 of paper I)
+        imgforce += (spring2.nt * spring2.k - spring1.nt * spring1.k) * tangent
 
         spring_force = spring2.t * spring2.k - spring1.t * spring1.k
         
-        # Or use this one from aseneb
-        imgforce += np.vdot(spring_force, tangent) * tangent
+        # # Or use this spring formula from aseneb
+        # imgforce += np.vdot(spring_force, tangent) * tangent
 
         perp_spring_force = spring_force - np.vdot(spring_force, tangent) * tangent
         perp_spring_force_norm = np.linalg.norm(perp_spring_force) or 1
