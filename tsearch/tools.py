@@ -1,107 +1,99 @@
-import configparser, os, glob
+import numpy as np
+from ase.neighborlist import neighbor_list, natural_cutoffs
 
 
-def load_calculator(config_dict):
-    if config_dict["Main"]["Calculator"] == "FAIRChemCalculator":
-        from fairchem.core import FAIRChemCalculator
-        calc = FAIRChemCalculator.from_model_checkpoint(
-            config_dict["FAIRChemCalculator"]["model_name_or_path"],
-            task_name = config_dict["FAIRChemCalculator"]["task_name"],
-            device = config_dict["FAIRChemCalculator"]["device"],
-            )
-    elif config_dict["Main"]["Calculator"] == "VaspInteractive":
-        raise NotImplementedError
-    elif config_dict["Main"]["Calculator"] == "Vasp":
-        raise NotImplementedError
-    return calc
-
-
-def load_method(config_dict):
-    method_name = config_dict["Main"]["method"]
-    if method_name.lower() == "neb":
-        from tsearch.nebopt import nebopt as method
-    elif method_name.lower() == "dimer":
-        from tsearch.dimeropt import dimeropt as method
-    elif method_name.lower() == "minimization":
-        from tsearch.geomopt import geomopt as method
-    elif method_name.lower() == "doubleminimization":
-        from tsearch.geomopt import doublegeomopt as method
-    else:
-        raise NotImplementedError(
-            f"Method '{method_name}' is not implemented. Only NEB, Dimer, Minimization, and DoubleMinimization are supported."
-        )
-    return method
-
-
-def load_optimizer(config_dict):
-    optimizer_name = config_dict["Main"]["Optimizer"]
-    if optimizer_name.lower() == "mdmin":
-        from ase.optimize import MDMin as Optimizer
-    elif optimizer_name.lower() == "bfgs":
-        from ase.optimize import BFGS as Optimizer
-    elif optimizer_name.lower() == "lbfgs":
-        from ase.optimize import LBFGS as Optimizer
-    elif optimizer_name.lower() == "fire":
-        from ase.optimize import FIRE as Optimizer
-    else:
-        raise NotImplementedError(
-            f"Method '{optimizer_name}' is not implemented. Only MDMin, BFGS, LBFGS and FIRE are supported."
-        )
-    return Optimizer
-
-
-def get_all_traj_names(config_dict):
-    main_cfg = config_dict.get("Main", {})
-    dir_path = main_cfg.get("dir_path", ".")
-    input_pattern = os.path.join(dir_path, "*.traj")
-    all_traj_files = sorted(glob.glob(input_pattern))
-    return all_traj_files
+#==============================================================================
+### FILE IO
 
 def save_ordered_traj_names(all_traj_files):
     with open('traj_files_ordered.txt', 'w') as f:
         for name in all_traj_files:
             f.write(f"{name}\n")
 
+#==============================================================================
+### BOND-BREAKING/FORMING DETECTION
 
-
-def interpret_string(val):
-    val = val.strip()
-
-    if val.lower() == 'true': return True
-    if val.lower() == 'false': return False
-
-    try:
-        return int(val)
-    except ValueError:
-        pass
-
-    try:
-        return float(val)
-    except ValueError:
-        pass
-
-    # Only convert to list if the elements look like numbers or booleans
-    if ' ' in val:
-        parts = val.split()
-        interpreted_parts = [interpret_string(p) for p in parts]
-        return interpreted_parts
-
-    return val
-
-
-def configparse(input_path):
-    config = configparser.ConfigParser(inline_comment_prefixes='#')
-    config.optionxform = str # Preserves case sensitivity
-    config.read(input_path)
-    return config
-
-
-def parse_inputfile(input_path):
-    config = configparse(input_path)
+def get_bond_set(atoms, cutoffs, tag_filter=None):
+    """
+    Returns a python set of bonds tuple(atom_index_A, atom_index_B).
     
-    return {
-        section: {
-            k: interpret_string(v) for k, v in config.items(section)
-        }
-        for section in config.sections()
-    }
+    Args:
+        atoms: The ASE atoms object
+        cutoffs: Dictionary or list of cutoff radii
+        tag_filter: (Optional) Only include bonds where BOTH atoms have this tag.
+    """
+    # 'i' and 'j' are indices of bonded atoms
+    i_list, j_list = neighbor_list('ij', atoms, cutoffs)
+    
+    bonds = set()
+    tags = atoms.get_tags()
+    
+    for k in range(len(i_list)):
+        a, b = i_list[k], j_list[k]
+        
+        # We only want each bond once (0-1 is same as 1-0)
+        # So we sort them: tuple((min, max))
+        bond = tuple(sorted((a, b)))
+        
+        # If a filter is applied (e.g., tag==2), check tags
+        if tag_filter is not None:
+            if tags[a] == tag_filter and tags[b] == tag_filter:
+                bonds.add(bond)
+        else:
+            bonds.add(bond)
+            
+    return bonds
+
+def check_reaction(atoms_initial, atoms_final, neighbor_fudge=1.25):
+    """
+    Compares connectivity of two structures.
+    """
+    # 1. Get bonds for both
+    assert np.array_equal(atoms_initial.numbers, atoms_final.numbers), \
+            "Error: Atomic numbers do not match between initial and final states."
+    cutoffs = natural_cutoffs(atoms_initial, mult=neighbor_fudge)
+    bonds_ini = get_bond_set(atoms_initial, cutoffs)
+    bonds_fin = get_bond_set(atoms_final, cutoffs)
+    
+    # 2. Compare sets
+    # Bonds present in Initial but NOT in Final = BROKEN
+    broken = bonds_ini - bonds_fin
+    
+    # Bonds present in Final but NOT in Initial = FORMED
+    formed = bonds_fin - bonds_ini
+    
+    reaction_occurred = len(broken) > 0 or len(formed) > 0
+    
+    #return {
+    #    "occurred": reaction_occurred,
+    #    "broken_bonds": broken,
+    #    "formed_bonds": formed,
+    #    "n_broken": len(broken),
+    #    "n_formed": len(formed)
+    #}
+    return reaction_occurred
+
+def check_adsorbate_reaction(atoms_initial, atoms_final, neighbor_fudge=1.25, target_tag=2):
+    """
+    Checks for reactions ONLY within atoms having specific tag (e.g. tag=2).
+    """
+    # 1. Get filtered bonds
+    assert np.array_equal(atoms_initial.numbers, atoms_final.numbers), \
+            "Error: Atomic numbers do not match between initial and final states."
+    cutoffs = natural_cutoffs(atoms_initial, mult=neighbor_fudge)
+    bonds_ini = get_bond_set(atoms_initial, cutoffs, tag_filter=target_tag)
+    bonds_fin = get_bond_set(atoms_final, cutoffs, tag_filter=target_tag)
+    
+    # 2. Calculate differences
+    broken = bonds_ini - bonds_fin
+    formed = bonds_fin - bonds_ini
+    
+    #return {
+    #    "occurred": len(broken) > 0 or len(formed) > 0,
+    #    "broken_bonds": broken,
+    #    "formed_bonds": formed
+    #}
+    return (len(broken) > 0 or len(formed) > 0)
+
+#==============================================================================
+

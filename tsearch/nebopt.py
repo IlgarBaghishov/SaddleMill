@@ -1,6 +1,6 @@
 import os
-from tsearch.tools import parse_inputfile, load_calculator, load_optimizer
-config_dict = parse_inputfile("config.ini")
+from tsearch.config import load_config, load_calculator, load_optimizer
+config_dict = load_config("config.ini")
 if config_dict["Main"]["jobs_per_gpu"] != 1: os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import matplotlib

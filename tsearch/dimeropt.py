@@ -6,39 +6,22 @@ import random
 import zipfile
 import numpy as np
 import pandas as pd
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
+from ase.neighborlist import natural_cutoffs, neighbor_list
 from ase.io import Trajectory
-from ase.build import make_supercell
 from ase.mep import DimerControl, MinModeAtoms, MinModeTranslate
 from ase.calculators.singlepoint import SinglePointCalculator
-from ase.neighborlist import neighbor_list
-from tsearch.tools import parse_inputfile, load_calculator
+from tsearch.config import load_config, load_calculator
+from tsearch.dimertools.structure_edit import get_attempts
 
 
-config_dict = parse_inputfile("config.ini")
+config_dict = load_config("config.ini")
 calc = load_calculator(config_dict)
-
-#csv_path = config_dict["ourDimer"]["csv_path"]
-#df = pd.read_csv(csv_path, index_col=0)
 
 
 class StopRun(Exception):
     pass
-
-
-def turn_into_supercell(atoms):
-    n_atoms = len(atoms)
-    M = [1, 1, 1]
-    if n_atoms == 1: M = [3, 3, 3]
-    if n_atoms <= 4: M = [2, 2, 2]
-    elif 5 <= n_atoms <= 8:
-        lengths = atoms.cell.lengths()
-        M[np.argsort(lengths)[0]] = 2
-        M[np.argsort(lengths)[1]] = 2
-    elif 9 <= n_atoms <= 16:
-        M[np.argmin(atoms.cell.lengths())] = 2
-    if M != [1, 1, 1]:
-        atoms = make_supercell(atoms, np.diag(M))
-    return atoms
 
 
 def dimeropt(i, config_dict, atoms_orig, executorlib_worker_id=None):
@@ -52,56 +35,35 @@ def dimeropt(i, config_dict, atoms_orig, executorlib_worker_id=None):
     my_output_file = f"{method_name}_trajes/collected_ts_rank_{rank}.traj"
     zip_name = f"{method_name}_debug_zips/structure_rank_{rank}_data.zip"
 
-    def log_status(attempt, rm_idx, status_msg):
+    def log_status(attempt, slctd_indx, status_msg):
         with open(status_file, 'a') as f:
-            f.write(f"{i},{rank},{attempt},{rm_idx},{status_msg}\n")
+            f.write(f"{i},{rank},{attempt},{slctd_indx},{status_msg}\n")
 
     # --- MAIN LOOP ---
     with Trajectory(my_output_file, 'a') as writer:
 
         attempt = "init"
-        rm_idx = -1
+        slctd_indx = -1
         temp_files = []
 
         try:
-            # Look up structure from main DF using the index
-            atoms_orig = turn_into_supercell(atoms_orig)
+            for attempt, (atoms, displacement_dict, slctd_indx) in enumerate(zip(*get_attempts(atoms_orig, config_dict))):
 
-            # Fresh random sampling for this restart
-            remove_indices = random.sample(range(len(atoms_orig)), config_dict["ourDimer"]["num_attempts"])
-
-            for attempt, rm_idx in enumerate(remove_indices):
-
-                temp_log = f'dimer_control_r{rank}_{i}_{attempt}.log'
-                temp_opt_log = f'dimer_opt_r{rank}_{i}_{attempt}.log'
-                temp_traj = f'dimer_r{rank}_{i}_{attempt}.traj'
+                temp_log = f'dimer_control_{i}_{attempt}_{slctd_indx}.log'
+                temp_opt_log = f'dimer_opt_{i}_{attempt}_{slctd_indx}.log'
+                temp_traj = f'dimer_{i}_{attempt}_{slctd_indx}.traj'
                 temp_files = [temp_log, temp_opt_log, temp_traj]
 
-                # Neighbor Logic
-                i_idx, j_idx = neighbor_list('ij', atoms_orig, 3.5)
-                neighbor_indices = j_idx[i_idx == rm_idx]
-
-                if len(neighbor_indices) == 0:
-                    neighbor_indices = [x for x in range(len(atoms_orig)) if x != rm_idx]
-
-                chosen_neighbor = random.choice(neighbor_indices)
-
-                atoms = atoms_orig.copy()
-                del atoms[rm_idx]
-
-                new_center_idx = chosen_neighbor if chosen_neighbor < rm_idx else chosen_neighbor - 1
-
                 atoms.calc = calc
+                free_indices = [atom.index for atom in atoms if atom.index not in atoms.constraints[0].get_indices()]
 
                 d_control = DimerControl(
-                    displacement_center = int(new_center_idx),
-                    # displacement_center = atoms_orig[rm_idx].position.tolist(),
                     logfile = temp_log,
                     **config_dict["DimerControl"],
                 )
 
                 d_atoms = MinModeAtoms(atoms, d_control)
-                d_atoms.displace()
+                d_atoms.displace(**displacement_dict)
 
                 dim_rlx = MinModeTranslate(
                     d_atoms,
@@ -113,13 +75,24 @@ def dimeropt(i, config_dict, atoms_orig, executorlib_worker_id=None):
                 def check_delocalization():
                     mode = d_atoms.get_eigenmode()
                     v2 = (mode**2).sum(axis=1)
+                    v2 = v2[free_indices]
                     sum_v2 = np.sum(v2)
                     if sum_v2 < 1e-12: return
-                    pr = (sum_v2**2) / (len(atoms) * np.sum(v2**2))
+                    pr = (sum_v2**2) / (len(v2) * np.sum(v2**2))
                     if pr > config_dict["ourDimer"]["delocalization_threshold"]:
                         raise StopRun(f"Eigenmode Delocalized (PR={pr:.3f})")
 
+                def check_desorption():
+                    check_atoms = d_atoms.atoms
+                    cutoffs = natural_cutoffs(check_atoms, mult=2.0)
+                    i, j = neighbor_list('ij', check_atoms, cutoffs)
+                    adjacency = csr_matrix((np.ones(len(i)), (i, j)), shape=(len(check_atoms), len(check_atoms)))
+                    n_components, labels = connected_components(adjacency, connection='weak')
+                    if n_components > 1:
+                        raise StopRun(f"Adsorbate desorbed")
+
                 dim_rlx.attach(check_delocalization, interval=5)
+                dim_rlx.attach(check_desorption, interval=5)
 
                 stopped_early = False
                 converged = False
@@ -130,10 +103,12 @@ def dimeropt(i, config_dict, atoms_orig, executorlib_worker_id=None):
                     converged = False
 
                 if converged:
-                    log_status(attempt, rm_idx, "converged")
+                    log_status(attempt, slctd_indx, "converged")
                 elif not converged and not stopped_early:
                     # Extension check
-                    if np.sqrt((d_atoms.get_forces()**2).sum(axis=1).max()) < 0.4 and d_atoms.get_curvature() < -0.2:
+                    fmax_check = np.sqrt((d_atoms.get_forces()**2).sum(axis=1).max()) < config_dict['ourDimer']['extension_check_fmax']
+                    curvature_check = d_atoms.get_curvature() < config_dict['ourDimer']['extension_check_curvature']
+                    if fmax_check and curvature_check:
                         try:
                             converged = dim_rlx.run(fmax=config_dict["Main"]["fmax"], steps=150)
                         except StopRun:
@@ -141,13 +116,13 @@ def dimeropt(i, config_dict, atoms_orig, executorlib_worker_id=None):
                             converged = False
 
                         if converged:
-                            log_status(attempt, rm_idx, "converged_after_extension")
+                            log_status(attempt, slctd_indx, "converged_after_extension")
                         else:
-                            log_status(attempt, rm_idx, "not_converged_after_extension")
+                            log_status(attempt, slctd_indx, "not_converged_after_extension")
                     else:
-                        log_status(attempt, rm_idx, "not_converged")
+                        log_status(attempt, slctd_indx, "not_converged")
                 else:
-                    log_status(attempt, rm_idx, "not_converged_delocalized")
+                    log_status(attempt, slctd_indx, "not_converged_StopRun")
 
                 # Metadata
                 eigenmode = d_atoms.get_eigenmode()
@@ -159,19 +134,18 @@ def dimeropt(i, config_dict, atoms_orig, executorlib_worker_id=None):
                 atoms.info['converged'] = 1 if converged else 0
                 atoms.info['src_index'] = i
                 atoms.info['attempt_id'] = attempt
-                atoms.info['delocalized'] = 1 if stopped_early else 0
-                atoms.info['removed_atom_index'] = rm_idx
+                atoms.info['stoprun'] = 1 if stopped_early else 0
+                atoms.info['selected_index'] = slctd_indx
+                atoms.wrap()
 
                 writer.write(atoms)
 
                 # Clean up temp files
                 existing_files = [f for f in temp_files if os.path.exists(f)]
                 if existing_files:
-                    #if not converged:
-                    if True:  # converged or unconverged
-                        with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
-                            for f_name in existing_files:
-                                zf.write(f_name, arcname=f"attempt_{attempt}_{f_name}")
+                    with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
+                        for f_name in existing_files:
+                            zf.write(f_name, arcname=f"{f_name}")
                     for f_name in existing_files:
                         os.remove(f_name)
 
@@ -181,7 +155,7 @@ def dimeropt(i, config_dict, atoms_orig, executorlib_worker_id=None):
             if existing_files:
                 with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
                     for f_name in existing_files:
-                        zf.write(f_name, arcname=f"attempt_{attempt}_ERROR_{f_name}")
+                        zf.write(f_name, arcname=f"ERROR_{f_name}")
                 for f_name in existing_files:
                     os.remove(f_name)
-            log_status(attempt, rm_idx, "error")
+            log_status(attempt, slctd_indx, "error")

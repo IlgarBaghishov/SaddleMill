@@ -1,9 +1,9 @@
 #!/bin/sh
-#SBATCH -N 64
-#SBATCH -n 64
+#SBATCH -N 2
+#SBATCH -n 2
 #SBATCH -o ll_out
-#SBATCH -p gh
-#SBATCH -t 48:00:00
+#SBATCH -p gh-dev
+#SBATCH -t 02:00:00
 #SBATCH -A CHE23004
 #SBATCH -J dimer1
 
