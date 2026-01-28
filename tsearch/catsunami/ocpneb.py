@@ -11,23 +11,6 @@ from ase.mep.neb import DyNEB, NEBState
 from ase.mep.neb import FullSpringMethod, ASENEBMethod, ImprovedTangentMethod, SplineMethod, StringMethod, NEBMethod
 
 
-def get_neb_method(neb, method):
-    if method == 'eb':
-        return FullSpringMethod(neb)
-    elif method == 'aseneb':
-        return ASENEBMethod(neb)
-    elif method == 'improvedtangent':
-        return ImprovedTangentMethod(neb)
-    elif method == 'spline':
-        return SplineMethod(neb)
-    elif method == 'string':
-        return StringMethod(neb)
-    elif method == 'swdneb':
-        return swDNEB(neb)
-    else:
-        raise ValueError(f'Bad method: {method}')
-
-
 class swDNEB(NEBMethod):
     """
     Tangent estimates and spring force are according to Eqs. 12-15 in paper IV.
@@ -60,10 +43,14 @@ class swDNEB(NEBMethod):
         perp_pot_force_norm = np.linalg.norm(perp_pot_force)
         perp_pot_force /= perp_pot_force_norm if perp_pot_force_norm > 0 else 1
 
-        # Improved parallel spring force (formula 12 of paper I)
-        imgforce += (spring2.nt * spring2.k - spring1.nt * spring1.k) * tangent
+        # # Improved parallel spring force (formula 12 of paper I)
+        # imgforce += (spring2.nt * spring2.k - spring1.nt * spring1.k) * tangent
 
         spring_force = spring2.t * spring2.k - spring1.t * spring1.k
+        
+        # Or use this one from aseneb
+        imgforce += np.vdot(spring_force, tangent) * tangent
+
         perp_spring_force = spring_force - np.vdot(spring_force, tangent) * tangent
         perp_spring_force_norm = np.linalg.norm(perp_spring_force) or 1
         sw = 2/np.pi * np.arctan(perp_pot_force_norm**2 / perp_spring_force_norm**2)
@@ -86,6 +73,7 @@ class OCPNEB(DyNEB):
         allow_shared_calculator=True,
         precon=None,
         batch_size=8,
+        dneb=False,
     ):
         """
         Subclass of NEB that allows for scaled and dynamic optimizations of
@@ -127,6 +115,8 @@ class OCPNEB(DyNEB):
             precon=precon,
             scale_fmax=scale_fmax,
         )
+        if dneb: self.neb_method = swDNEB(self)
+
         self.batch_size = batch_size
         setup_imports()
         setup_logging()

@@ -32,6 +32,7 @@ class ConfigManager:
             "interpolate_method": "ase_linear",
             "num_frames": 10,
             "batch_size": 4,
+            "DNEB": False,
         },
         "ourDimer": {
             "dataset_type": None,
