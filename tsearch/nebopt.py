@@ -14,7 +14,6 @@ from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import Trajectory
 from ase.mep.neb import NEB, NEBTools, NEBState
 from tsearch.catsunami.ocpneb import OCPNEB
-from tsearch.catsunami.autoframe import interpolate
 
 
 calc = load_calculator(config_dict)
@@ -73,6 +72,7 @@ def nebopt(i, config_dict, traj_name, executorlib_worker_id=None):
             The approach uses ase, so you must provide ase.Atoms objects
             with the appropriate constraints (i.e. fixed subsurface atoms).
             """
+            from tsearch.catsunami.autoframe import interpolate
             images = interpolate(reactant, product, num_frames)
 
         elif interpolate_method[:4] == "ase_":
