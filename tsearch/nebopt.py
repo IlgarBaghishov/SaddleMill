@@ -3,6 +3,7 @@ from tsearch.config import load_config, load_calculator, load_optimizer
 config_dict = load_config("config.ini")
 if config_dict["Main"]["jobs_per_gpu"] != 1: os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+import traceback
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -90,7 +91,7 @@ def nebopt(i, config_dict, traj_name, executorlib_worker_id=None):
                     # Array of covalent radii for the system
                     radii = np.array([covalent_radii[z] for z in reactant.numbers])
                     radii_sum = radii[:, None] + radii[None, :]
-                    
+
                     for atoms in neb0.images[1:-1]:
                         dists = atoms.get_all_distances(mic=True)
                         np.fill_diagonal(dists, np.inf)
@@ -133,7 +134,7 @@ def nebopt(i, config_dict, traj_name, executorlib_worker_id=None):
 
         ci_image = neb.images[neb.imax].copy()
         energy = neb.intermediate_energies[neb.imax]
-        forces = neb.intermediate_forces[neb.imax]
+        forces = neb.intermediate_forces[len(ci_image)*(neb.imax-1):len(ci_image)*neb.imax]
         state = NEBState(neb, neb.images, neb.intermediate_energies)
         spring1 = state.spring(neb.imax-1)
         spring2 = state.spring(neb.imax)
@@ -176,6 +177,7 @@ def nebopt(i, config_dict, traj_name, executorlib_worker_id=None):
 
     except Exception as e:
         print(f"Rank {rank} FAILED on structure {i}: {e}")
+        print(f"\nTraceback details:\n{traceback.format_exc()}")
         existing_files = [f for f in temp_files if os.path.exists(f)]
         if existing_files:
             with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
