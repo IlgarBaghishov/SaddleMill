@@ -103,7 +103,7 @@ def dimeropt(i, config_dict, atoms_orig, executorlib_worker_id=None):
                     converged = False
 
                 if converged:
-                    log_status(attempt, slctd_indx, "converged")
+                    status = "converged"
                 elif not converged and not stopped_early:
                     # Extension check
                     fmax_check = np.sqrt((d_atoms.get_forces()**2).sum(axis=1).max()) < config_dict['ourDimer']['extension_check_fmax']
@@ -116,13 +116,13 @@ def dimeropt(i, config_dict, atoms_orig, executorlib_worker_id=None):
                             converged = False
 
                         if converged:
-                            log_status(attempt, slctd_indx, "converged_after_extension")
+                            status = "converged_after_extension"
                         else:
-                            log_status(attempt, slctd_indx, "not_converged_after_extension")
+                            status = "not_converged_after_extension"
                     else:
-                        log_status(attempt, slctd_indx, "not_converged")
+                        status = "not_converged"
                 else:
-                    log_status(attempt, slctd_indx, "not_converged_StopRun")
+                    status = "not_converged_StopRun"
 
                 # Metadata
                 eigenmode = d_atoms.get_eigenmode()
@@ -139,6 +139,8 @@ def dimeropt(i, config_dict, atoms_orig, executorlib_worker_id=None):
                 atoms.wrap()
 
                 writer.write(atoms)
+                
+                log_status(attempt, slctd_indx, status)
 
                 # Clean up temp files
                 existing_files = [f for f in temp_files if os.path.exists(f)]

@@ -1,8 +1,9 @@
 import concurrent.futures
+import time
 from ase.io import Trajectory
 from itertools import groupby
 from contextlib import nullcontext
-from tsearch.tools import save_ordered_traj_names, clean_up_files
+from tsearch.tools import save_ordered_traj_names, read_ordered_traj_names, clean_up_files
 from tsearch.config import load_config, load_method, get_trajes_and_indices, create_results_directories, get_remaining_trajes
 
 
@@ -19,14 +20,19 @@ def main():
     print(config_dict,"\n")
 
     method = load_method(config_dict)
+    st = time.time()
     trajes_and_idxs = get_trajes_and_indices(config_dict)
+    print("it took", time.time()-st)
     if config_dict["Main"]["resume"]:
-        # trajes_and_idxs_old = read_ordered_traj_names()
-        # if trajes_and_idxs != trajes_and_idxs_old:
-        #     raise ValueError("Provided dirpath creates a different trajes_and_idxs. I can't resume.")
-        trajes_and_idxs = get_remaining_trajes(trajes_and_idxs)
+        trajes_and_idxs_old = read_ordered_traj_names()
+        if trajes_and_idxs != trajes_and_idxs_old:
+            raise ValueError("Provided dirpath creates a different trajes_and_idxs. I can't resume.")
+        print(trajes_and_idxs[:10])
+        job_IDs, trajes_and_idxs = get_remaining_trajes(trajes_and_idxs, config_dict)
+        print(trajes_and_idxs[:10])
         clean_up_files()
     else:
+        job_IDs = list(range(len(trajes_and_idxs)))
         create_results_directories(config_dict)
         save_ordered_traj_names(trajes_and_idxs)
 
@@ -69,20 +75,20 @@ def main():
     with executor as exe:
         submitter = get_submitter(exe)
         futures = []
-        submit_counter = 0
+        idx = 0
 
         for traj_name, group in groupby(trajes_and_idxs, key=lambda x: x[0]):
             traj = Trajectory(traj_name, 'r')
             for _, i, j in group:
-                images = traj[i:j].copy()
-                f = submitter(method, submit_counter, config_dict, images)
+                images = list(traj[i:j])
+                f = submitter(method, job_IDs[idx], config_dict, images)
                 if config_dict["Main"]["executorlib"]: futures.append(f)
-                submit_counter += 1
+                idx += 1
             traj.close()
 
         if config_dict["Main"]["executorlib"]:
             while len(futures):
-                futures = check_and_print_status(futures, submit_counter)
+                futures = check_and_print_status(futures, idx)
 
 
 if __name__ == "__main__":

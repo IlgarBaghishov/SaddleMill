@@ -18,7 +18,7 @@ def read_ordered_traj_names():
 
 
 def clean_up_files():
-    os.system("rm -rf your_neb_*.traj reactant_relaxation_*.traj product_relaxation_*.traj neb_*.log flux* diffusion_barrier_*.png error")
+    os.system("rm -rf neb_*.log neb_*.traj reactant_relaxation_*.log reactant_relaxation_*.traj product_relaxation_*.log product_relaxation_*.traj flux* diffusion_barrier_*.png error")
     
 
 #==============================================================================

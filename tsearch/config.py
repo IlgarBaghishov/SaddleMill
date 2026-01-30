@@ -30,6 +30,7 @@ class ConfigManager:
         },
         "ourNEB": {
             "only_endpoints_in_input_traj": False,
+            "images_location_in_input_traj": ":",  # can also be 0 or -1, meaning begining or end of file. This defines where are the initial endpoints or the band in the input traj
             "relax_endpoints": True,
             "endpoint_relax_fmax": 0.01,
             "endpoint_relax_steps": 500,
@@ -200,12 +201,13 @@ def get_trajes_and_indices(config_dict):
     input_pattern = os.path.join(dir_path, "*.traj")
     all_traj_files = sorted(glob.glob(input_pattern))
     
-    traj_lens = []
-    for traj_name in all_traj_files:
-        with Trajectory(traj_name, 'r') as traj:
-            traj_lens.append(len(traj))
-    
-    if config_dict["Main"]["Method"] == "NEB":
+    if config_dict["ourNEB"]["images_location_in_input_traj"] == ":":
+        traj_lens = []
+        for traj_name in all_traj_files:
+            with Trajectory(traj_name, 'r') as traj:
+                traj_lens.append(len(traj))
+
+    if config_dict["Main"]["method"] == "NEB":
         if config_dict["ourNEB"]["only_endpoints_in_input_traj"]:
             nimages = 2
         else:
@@ -214,10 +216,16 @@ def get_trajes_and_indices(config_dict):
         nimages = 1
 
     trajes_and_idxs = []
-    for traj_name, traj_len in zip(all_traj_files,traj_lens):
-        if traj_len%nimages != 0: raise ValueError(f"Can't divide a traj file with {traj_len} atoms objects into batches of {nimages} atoms objects")
-        for i in range(traj_len//nimages):
-            trajes_and_idxs.append([traj_name, i*nimages, (i+1)*nimages])
+    for i,traj_name in enumerate(all_traj_files):
+        if config_dict["ourNEB"]["images_location_in_input_traj"] == 0:
+            trajes_and_idxs.append([traj_name, 0, nimages])
+        elif config_dict["ourNEB"]["images_location_in_input_traj"] == -1:
+            trajes_and_idxs.append([traj_name, -nimages, 0])
+        elif config_dict["ourNEB"]["images_location_in_input_traj"] == ":":
+            traj_len = traj_lens[i]
+            if traj_len%nimages != 0: raise ValueError(f"Can't divide a traj file with {traj_len} atoms objects into batches of {nimages} atoms objects")
+            for i in range(traj_len//nimages):
+                trajes_and_idxs.append([traj_name, i*nimages, (i+1)*nimages])
     
     return trajes_and_idxs
 
@@ -236,13 +244,9 @@ def get_previous_job_status_df(config_dict):
     return status_df
 
 
-def filter_trajectories(trajes_and_idxs, status_df):
-    successful_jobs = status_df[status_df.iloc[:, -1] != "error"]
-    ids_to_skip = set(successful_jobs.iloc[:, 0])
-    return [item for i, item in enumerate(trajes_and_idxs) if i not in ids_to_skip]
-
-
 def get_remaining_trajes(trajes_and_idxs, config_dict):
     status_df = get_previous_job_status_df(config_dict)
-    trajes_and_idxs = filter_trajectories(trajes_and_idxs, status_df)
-    return trajes_and_idxs
+    successful_jobs = status_df[status_df.iloc[:, -1] != "error"]
+    ids_to_skip = set(successful_jobs.iloc[:, 0])
+    job_IDs, trajes_and_idxs = zip(*[[i,item] for i, item in enumerate(trajes_and_idxs) if i not in ids_to_skip])
+    return job_IDs, trajes_and_idxs

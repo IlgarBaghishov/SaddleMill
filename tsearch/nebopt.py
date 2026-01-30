@@ -21,18 +21,20 @@ calc = load_calculator(config_dict)
 Optimizer = load_optimizer(config_dict)
 
 
-def nebopt(i, config_dict, traj_name, executorlib_worker_id=None):
+def nebopt(i, config_dict, images, executorlib_worker_id=None):
 
     rank = executorlib_worker_id
+    zip_name = f"{config_dict['Main']['method']}_debug_zips/structure_rank_{rank}_data.zip"
     status_file = f"{config_dict['Main']['method']}_status_csvs/status_rank_{rank}.csv"
     my_output_file = f"{config_dict['Main']['method']}_trajes/collected_ts_rank_{rank}.traj"
-    temp_log = f'neb_r{rank}_{i}.log'
-    temp_traj = f'your_neb_r{rank}_{i}.traj'
-    temp_plot = f'diffusion_barrier_r{rank}_{i}.png'
-    temp_react_relax = f'reactant_relaxation_r{rank}_{i}.traj'
-    temp_prod_relax = f'product_relaxation_r{rank}_{i}.traj'
-    temp_files = [temp_log, temp_traj, temp_plot, temp_react_relax, temp_prod_relax]
-    zip_name = f"{config_dict['Main']['method']}_debug_zips/structure_rank_{rank}_data.zip"
+    temp_log = f'neb_{i}.log'
+    temp_traj = f'neb_{i}.traj'
+    temp_plot = f'diffusion_barrier_{i}.png'
+    temp_react_relax_log = f'reactant_relaxation_{i}.log'
+    temp_prod_relax_log = f'product_relaxation_{i}.log'
+    temp_react_relax = f'reactant_relaxation_{i}.traj'
+    temp_prod_relax = f'product_relaxation_{i}.traj'
+    temp_files = [temp_log, temp_traj, temp_plot, temp_react_relax_log, temp_prod_relax_log, temp_react_relax, temp_prod_relax]
 
     def log_status(status_msg):
         with open(status_file, 'a') as f:
@@ -44,19 +46,16 @@ def nebopt(i, config_dict, traj_name, executorlib_worker_id=None):
     num_frames = config_dict["ourNEB"]["num_frames"]
 
     try:
-        images = Trajectory(traj_name)
-        if len(images)>2: images = images[:num_frames]  # Change to the path to your atoms of the frame set
-        images = list(images)
         reactant = images[0]
         product = images[-1]
 
         if relax_endpoints:
             if not interpolate_method: print("Are you sure you want to relax end points while keeping the intermediate inages from your traj?")
             reactant.calc = calc
-            opt = Optimizer(reactant, trajectory=temp_react_relax, **config_dict[config_dict["Main"]["Optimizer"]])
+            opt = Optimizer(reactant, logfile=temp_react_relax_log, trajectory=temp_react_relax, **config_dict[config_dict["Main"]["Optimizer"]])
             opt.run(config_dict["ourNEB"]["endpoint_relax_fmax"], config_dict["ourNEB"]["endpoint_relax_steps"])
             product.calc = calc
-            opt = Optimizer(product, trajectory=temp_prod_relax, **config_dict[config_dict["Main"]["Optimizer"]])
+            opt = Optimizer(product, logfile=temp_prod_relax_log, trajectory=temp_prod_relax, **config_dict[config_dict["Main"]["Optimizer"]])
             opt.run(config_dict["ourNEB"]["endpoint_relax_fmax"], config_dict["ourNEB"]["endpoint_relax_steps"])
 
         if interpolate_method:
@@ -120,18 +119,6 @@ def nebopt(i, config_dict, traj_name, executorlib_worker_id=None):
                         )
         converged = opt.run(fmax = config_dict["Main"]["fmax"], steps = config_dict["Main"]["steps"])
 
-        if converged:
-            log_status("converged")
-        else:
-            log_status("not_converged")
-
-        # optimizer = MDMin(neb, dt=0.02, maxstep=0.1, trajectory=f"your-neb.traj")
-        # conv = optimizer.run(fmax=fmax + delta_fmax_climb, steps=500)
-        # if conv:
-        #     print("initial NEB optimization is done, starting climbing image")
-        #     neb.climb = True
-        #     conv = optimizer.run(fmax=fmax, steps=1000)
-
         ci_image = neb.images[neb.imax].copy()
         energy = neb.intermediate_energies[neb.imax]
         forces = neb.intermediate_forces[len(ci_image)*(neb.imax-1):len(ci_image)*neb.imax]
@@ -140,13 +127,14 @@ def nebopt(i, config_dict, traj_name, executorlib_worker_id=None):
         spring2 = state.spring(neb.imax)
         tangent = neb.neb_method.get_tangent(state, spring1, spring2, neb.imax)
 
-        # Final analysis
         nebtools = NEBTools(neb.images)
         Ef, dE = nebtools.get_barrier()
         max_forces = nebtools.get_fmax(**config_dict["DyNEB"])
+        fig = nebtools.plot_band()
+        fig.savefig(temp_plot)
+        plt.close(fig)
 
         with Trajectory(my_output_file, 'a') as writer:
-            ci_image.info['filename'] = Path(traj_name).stem
             ci_image.info['eigenmode'] = tangent
             ci_image.calc = SinglePointCalculator(ci_image, energy=energy, forces=forces)
             ci_image.info['converged'] = 1 if converged else 0
@@ -159,12 +147,13 @@ def nebopt(i, config_dict, traj_name, executorlib_worker_id=None):
             ci_image.info['interpolation_method'] = interpolate_method
             if isinstance(interpolate_method, str) and interpolate_method.startswith("ase_") and perform_aseidpp:
                 ci_image.info['interpolation_method'] = "ase_idpp"
+            ci_image.wrap()
             writer.write(ci_image)
 
-        # Create a figure of the band. However this slows it down by around 4 second per NEB optimization
-        fig = nebtools.plot_band()
-        fig.savefig(temp_plot)
-        plt.close(fig)
+        if converged:
+            log_status("converged")
+        else:
+            log_status("not_converged")
 
         # Clean up temp files
         existing_files = [f for f in temp_files if os.path.exists(f)]
