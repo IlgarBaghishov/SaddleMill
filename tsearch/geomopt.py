@@ -84,7 +84,6 @@ def geomopt(i, config_dict, atoms, executorlib_worker_id=None):
 def doublegeomopt(i, config_dict, atoms, executorlib_worker_id=None):
     
     rank = executorlib_worker_id
-    atoms = atoms[0]
     atoms.calc = calc
 
     method_name = config_dict["Main"]["method"]
