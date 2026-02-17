@@ -1,6 +1,4 @@
 import sys, os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
 import traceback
 import zipfile
 from ase.io import Trajectory
@@ -10,19 +8,27 @@ from tsearch.config import load_config, load_calculator, load_optimizer
 from tsearch.tools import check_reaction, check_adsorbate_reaction
 
 
-config_dict = load_config("config.ini")
-calc = load_calculator(config_dict)
-Optimizer = load_optimizer(config_dict)
+def opt_init_function(executorlib_worker_id=None):
+    from flux import Flux, resource
+    handle = Flux()
+    all_ngpus = resource.list.resource_list(handle).get().all.ngpus
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(int(executorlib_worker_id) % int(all_ngpus))
+
+    config_dict = load_config("config.ini")
+    calc = load_calculator(config_dict)
+    Optimizer = load_optimizer(config_dict)
+    
+    return {"calc": calc, "Optimizer": Optimizer}
 
 
-def relax_structure(config_dict, optimizable, logfile, trajfile):
+def relax_structure(config_dict, optimizable, logfile, trajfile, Optimizer):
     opt = Optimizer(optimizable, logfile=logfile, trajectory=trajfile,
                     **config_dict[config_dict["Main"]["Optimizer"]])
     converged = opt.run(fmax=config_dict["Main"]["fmax"], steps=config_dict["Main"]["steps"])
     return converged
 
 
-def geomopt(i, config_dict, atoms, executorlib_worker_id=None):
+def geomopt(i, config_dict, atoms, calc, Optimizer, executorlib_worker_id=None):
     
     rank = executorlib_worker_id
     atoms.calc = calc
@@ -45,7 +51,7 @@ def geomopt(i, config_dict, atoms, executorlib_worker_id=None):
 
         try:
             optimizable = FrechetCellFilter(atoms) if config_dict['our'+method_name]['relax_cell'] else atoms
-            converged = relax_structure(config_dict, optimizable, temp_opt_log, temp_traj)
+            converged = relax_structure(config_dict, optimizable, temp_opt_log, temp_traj, Optimizer)
             
             if converged:
                 log_status("converged")
@@ -81,7 +87,7 @@ def geomopt(i, config_dict, atoms, executorlib_worker_id=None):
             log_status("error") 
 
 
-def doublegeomopt(i, config_dict, atoms, executorlib_worker_id=None):
+def doublegeomopt(i, config_dict, atoms, calc, Optimizer, executorlib_worker_id=None):
     
     rank = executorlib_worker_id
     atoms.calc = calc
@@ -134,7 +140,7 @@ def doublegeomopt(i, config_dict, atoms, executorlib_worker_id=None):
             temp_files.extend([log1, traj1])
             
             optimizable = FrechetCellFilter(min1) if config_dict['our'+method_name]['relax_cell'] else min1
-            conv1 = relax_structure(config_dict, optimizable, log1, traj1)
+            conv1 = relax_structure(config_dict, optimizable, log1, traj1, Optimizer)
             
             # Freeze results
             min1.calc = SinglePointCalculator(min1, energy=min1.get_potential_energy(), forces=min1.get_forces())
@@ -153,7 +159,7 @@ def doublegeomopt(i, config_dict, atoms, executorlib_worker_id=None):
             temp_files.extend([log2, traj2])
             
             optimizable = FrechetCellFilter(min2) if config_dict['our'+method_name]['relax_cell'] else min2
-            conv2 = relax_structure(config_dict, optimizable, log2, traj2)
+            conv2 = relax_structure(config_dict, optimizable, log2, traj2, Optimizer)
             
             # Freeze results
             min2.calc = SinglePointCalculator(min2, energy=min2.get_potential_energy(), forces=min2.get_forces())

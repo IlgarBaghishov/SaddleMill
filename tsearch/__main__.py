@@ -3,7 +3,7 @@ from ase.io import Trajectory
 from itertools import groupby
 from contextlib import nullcontext
 from tsearch.tools import save_ordered_traj_names, read_ordered_traj_names, clean_up_files
-from tsearch.config import load_config, load_method, get_trajes_and_indices, create_results_directories, get_remaining_trajes
+from tsearch.config import load_config, load_method, load_init_function, get_trajes_and_indices, create_results_directories, get_remaining_trajes
 
 
 def check_and_print_status(futures, total):
@@ -19,6 +19,7 @@ def main():
     print(config_dict,"\n")
 
     method = load_method(config_dict)
+    init_function = load_init_function(config_dict)
     trajes_and_idxs = get_trajes_and_indices(config_dict)
     if config_dict["Main"]["resume"]:
         trajes_and_idxs_old = read_ordered_traj_names()
@@ -50,6 +51,7 @@ def main():
             flux_log_files=True,
             max_workers=all_ngpus * jobs_per_gpu,
             block_allocation=True,
+            init_function=init_function,
             resource_dict={
                 "cores": 1, 
                 "gpus_per_core": gpus_per_core, 

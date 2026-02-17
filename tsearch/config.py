@@ -161,7 +161,7 @@ def load_calculator(config_dict):
 def load_method(config_dict):
     method_name = config_dict["Main"]["method"]
     if method_name is None:
-            raise ValueError("Configuration error: 'Main' -> 'method' is not set. Please specify a method (e.g., 'minimization') in config.ini")
+        raise ValueError("Configuration error: 'Main' -> 'method' is not set. Please specify a method (e.g., 'minimization') in config.ini")
     if method_name == "NEB":
         from tsearch.nebopt import nebopt as method
     elif method_name == "Dimer":
@@ -175,6 +175,23 @@ def load_method(config_dict):
             f"Method '{method_name}' is not implemented. Only NEB, Dimer, Minimization, and DoubleMinimization are supported."
         )
     return method
+
+
+def load_init_function(config_dict):
+    method_name = config_dict["Main"]["method"]
+    if method_name is None:
+        raise ValueError("Configuration error: 'Main' -> 'method' is not set. Please specify a method (e.g., 'minimization') in config.ini")
+    if method_name == "NEB":
+        from tsearch.nebopt import nebopt_init_function as init_function
+    elif method_name == "Dimer":
+        from tsearch.dimeropt import dimeropt_init_function as init_function
+    elif method_name == "Minimization" or method_name == "DoubleMinimization":
+        from tsearch.geomopt import opt_init_function as init_function
+    else:
+        raise NotImplementedError(
+            f"Method '{method_name}' is not implemented. Only NEB, Dimer, Minimization, and DoubleMinimization are supported."
+        )
+    return init_function
 
 
 def load_optimizer(config_dict):
