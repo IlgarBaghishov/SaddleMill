@@ -9,15 +9,26 @@ from tsearch.tools import check_reaction, check_adsorbate_reaction
 
 
 def opt_init_function(executorlib_worker_id=None):
-    from flux import Flux, resource
-    handle = Flux()
-    all_ngpus = resource.list.resource_list(handle).get().all.ngpus
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(int(executorlib_worker_id) % int(all_ngpus))
-
+    # from flux import Flux, resource
     config_dict = load_config("config.ini")
+    # handle = Flux()
+    # rset = resource.list.resource_list(handle).get().all
+    # node_ngpus_list = [[str(rset.copy_ranks(str(i)).nodelist), rset.copy_ranks(str(i)).ngpus] for i in range(rset.nnodes)]
+    # gpu_ID = executorlib_worker_id
+
+    # for i in range(len(node_ngpus_list)):
+    #     node, ngpus = node_ngpus_list[i]
+    #     if gpu_ID < config_dict['Main']['jobs_per_gpu']*ngpus:
+    #         print(f"Worker {executorlib_worker_id} assigned to GPU {gpu_ID} on node {node} with {ngpus} GPUs.")
+    #         break
+    #     else:
+    #         gpu_ID -= config_dict['Main']['jobs_per_gpu']*ngpus
+    # os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ID%ngpus)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(executorlib_worker_id%4)
+
     calc = load_calculator(config_dict)
     Optimizer = load_optimizer(config_dict)
-    
+
     return {"calc": calc, "Optimizer": Optimizer}
 
 
@@ -29,7 +40,7 @@ def relax_structure(config_dict, optimizable, logfile, trajfile, Optimizer):
 
 
 def geomopt(i, config_dict, atoms, calc, Optimizer, executorlib_worker_id=None):
-    
+
     rank = executorlib_worker_id
     atoms.calc = calc
 
@@ -52,7 +63,7 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, executorlib_worker_id=None):
         try:
             optimizable = FrechetCellFilter(atoms) if config_dict['our'+method_name]['relax_cell'] else atoms
             converged = relax_structure(config_dict, optimizable, temp_opt_log, temp_traj, Optimizer)
-            
+
             if converged:
                 log_status("converged")
                 atoms.info['converged'] = 1
@@ -88,7 +99,7 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, executorlib_worker_id=None):
 
 
 def doublegeomopt(i, config_dict, atoms, calc, Optimizer, executorlib_worker_id=None):
-    
+
     rank = executorlib_worker_id
     atoms.calc = calc
 
@@ -109,7 +120,7 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, executorlib_worker_id=
         try:
             if not atoms.info['converged']:
                 raise Exception("Input structure marked as unconverged.")
-            
+
             if 'eigenmode' not in atoms.info:
                  raise Exception("Input structure missing 'eigenmode' in info.")
             if 'src_index' not in atoms.info:
@@ -208,7 +219,7 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, executorlib_worker_id=
             writer.write(min1)
             writer.write(ts_atoms)
             writer.write(min2)
-            
+
             log_status(parent_source_idx, int(conv1 and conv2))
 
             # --- CLEANUP (Success Case) ---
@@ -225,7 +236,7 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, executorlib_worker_id=
             print(f"Rank {rank} FAILED on structure {i}: {e}")
             print(f"\nTraceback details:\n{traceback.format_exc()}")
             log_status(parent_source_idx, f"error: {str(e)}")
-            
+
             existing_files = [f for f in temp_files if os.path.exists(f)]
             if existing_files:
                 with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:

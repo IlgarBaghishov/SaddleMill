@@ -45,23 +45,23 @@ def main():
 
         jobs_per_gpu = config_dict["Main"]["jobs_per_gpu"]
         gpus_per_core = 1 if jobs_per_gpu == 1 else 0
-        cpus_per_job = all_ncores // (all_ngpus*jobs_per_gpu) - 1
+        cpus_per_job = all_ncores // (all_ngpus*jobs_per_gpu) #- 1
 
         executor = FluxJobExecutor(
-            flux_log_files=True,
-            max_workers=all_ngpus * jobs_per_gpu,
-            block_allocation=True,
-            init_function=init_function,
-            resource_dict={
-                "cores": 1, 
-                "gpus_per_core": gpus_per_core, 
-                "threads_per_core": cpus_per_job, 
-                "num_nodes": 1, 
+            flux_log_files = True,
+            max_workers = all_ngpus * jobs_per_gpu,
+            block_allocation = True,
+            init_function = init_function,
+            resource_dict = {
+                "cores": 1,
+                "gpus_per_core": gpus_per_core,
+                "threads_per_core": cpus_per_job,
+                "num_nodes": 1,
                 "error_log_file": "error"
             }
         )
         # 'exe' will be the executor instance
-        get_submitter = lambda exe: exe.submit  
+        get_submitter = lambda exe: exe.submit
     else:
         # Serial Mode: Use empty context and a dummy submitter that runs immediately
         executor = nullcontext()
@@ -80,11 +80,11 @@ def main():
                 images = list(traj[i:j]) if j!=i+1 else traj[i]
                 try:
                     f = submitter(method, job_IDs[idx], config_dict, images)
-                    if config_dict["Main"]["executorlib"]: 
+                    if config_dict["Main"]["executorlib"]:
                         futures.append(f)
                 except Exception as e:
                     print(f"CRITICAL ERROR on job {idx} ({traj_name}): {e}")
-                    # In serial mode, we catch it and move on. 
+                    # In serial mode, we catch it and move on.
                     # In parallel mode, 'submitter' usually doesn't raise immediately, so this is safe.
                 if config_dict["Main"]["executorlib"]: futures.append(f)
                 idx += 1
