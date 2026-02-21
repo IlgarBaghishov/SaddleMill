@@ -220,7 +220,15 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, executorlib_worker_id=
             writer.write(ts_atoms)
             writer.write(min2)
 
-            log_status(parent_source_idx, int(conv1 and conv2))
+            if conv1 and conv2:
+                status_msg = "converged_both"
+            elif conv1:
+                status_msg = "converged_min1"
+            elif conv2:
+                status_msg = "converged_min2"
+            else:
+                status_msg = "unconverged"
+            log_status(parent_source_idx, status_msg)
 
             # --- CLEANUP (Success Case) ---
             existing_files = [f for f in temp_files if os.path.exists(f)]
