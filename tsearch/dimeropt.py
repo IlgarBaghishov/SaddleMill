@@ -137,7 +137,7 @@ def dimeropt(i, config_dict, atoms_orig, calc, executorlib_worker_id=None, **kwa
 
                 # Clean up temp files
                 existing_files = [f for f in temp_files if os.path.exists(f)]
-                if existing_files:
+                if existing_files and config_dict['Main']['zip']:
                     with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
                         for f_name in existing_files:
                             zf.write(f_name, arcname=f"{f_name}")
@@ -148,7 +148,7 @@ def dimeropt(i, config_dict, atoms_orig, calc, executorlib_worker_id=None, **kwa
             print(f"Rank {rank} FAILED on structure {i}: {e}")
             print(f"\nTraceback details:\n{traceback.format_exc()}")
             existing_files = [f for f in temp_files if os.path.exists(f)]
-            if existing_files:
+            if existing_files and config_dict['Main']['zip']:
                 with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
                     for f_name in existing_files:
                         zf.write(f_name, arcname=f"ERROR_{f_name}")

@@ -41,12 +41,16 @@ def nebopt(i, config_dict, images, calc, Optimizer, executorlib_worker_id=None):
         product = images[-1]
 
         if relax_endpoints:
-            if not interpolate_method: print("Are you sure you want to relax end points while keeping the intermediate inages from your traj?")
+            if not interpolate_method: print("Are you sure you want to relax end points while keeping the intermediate images from your traj?")
             reactant.calc = calc
-            opt = Optimizer(reactant, logfile=temp_react_relax_log, trajectory=temp_react_relax, **config_dict[config_dict["Main"]["Optimizer"]])
+            if config_dict["ourNEB"]["endpoint_relax_Optimizer"] is None:
+                endpoint_relax_optimizer_name = config_dict["Main"]["Optimizer"]
+            else:
+                endpoint_relax_optimizer_name = config_dict["ourNEB"]["endpoint_relax_Optimizer"]
+            opt = Optimizer[0](reactant, logfile=temp_react_relax_log, trajectory=temp_react_relax, **config_dict[endpoint_relax_optimizer_name])
             opt.run(config_dict["ourNEB"]["endpoint_relax_fmax"], config_dict["ourNEB"]["endpoint_relax_steps"])
             product.calc = calc
-            opt = Optimizer(product, logfile=temp_prod_relax_log, trajectory=temp_prod_relax, **config_dict[config_dict["Main"]["Optimizer"]])
+            opt = Optimizer[0](product, logfile=temp_prod_relax_log, trajectory=temp_prod_relax, **config_dict[endpoint_relax_optimizer_name])
             opt.run(config_dict["ourNEB"]["endpoint_relax_fmax"], config_dict["ourNEB"]["endpoint_relax_steps"])
 
         if interpolate_method:
@@ -103,11 +107,11 @@ def nebopt(i, config_dict, images, calc, Optimizer, executorlib_worker_id=None):
             **config_dict["DyNEB"],
         )
 
-        opt = Optimizer(neb,
-                        logfile = temp_log,
-                        trajectory = temp_traj,
-                        **config_dict[config_dict["Main"]["Optimizer"]],
-                        )
+        opt = Optimizer[1](neb,
+                           logfile = temp_log,
+                           trajectory = temp_traj,
+                           **config_dict[config_dict["Main"]["Optimizer"]],
+                           )
         converged = opt.run(fmax = config_dict["Main"]["fmax"], steps = config_dict["Main"]["steps"])
 
         ci_image = neb.images[neb.imax].copy()
@@ -148,7 +152,7 @@ def nebopt(i, config_dict, images, calc, Optimizer, executorlib_worker_id=None):
 
         # Clean up temp files
         existing_files = [f for f in temp_files if os.path.exists(f)]
-        if existing_files:
+        if existing_files and config_dict['Main']['zip']:
             with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
                 for f_name in existing_files:
                     zf.write(f_name, arcname=f"{f_name}")
@@ -159,7 +163,7 @@ def nebopt(i, config_dict, images, calc, Optimizer, executorlib_worker_id=None):
         print(f"Rank {rank} FAILED on structure {i}: {e}")
         print(f"\nTraceback details:\n{traceback.format_exc()}")
         existing_files = [f for f in temp_files if os.path.exists(f)]
-        if existing_files:
+        if existing_files and config_dict['Main']['zip']:
             with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
                 for f_name in existing_files:
                     zf.write(f_name, arcname=f"{f_name}")

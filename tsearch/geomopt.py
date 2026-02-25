@@ -51,7 +51,7 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, executorlib_worker_id=None):
 
             # Clean up temp files
             existing_files = [f for f in temp_files if os.path.exists(f)]
-            if existing_files:
+            if existing_files and config_dict['Main']['zip']:
                 #if not converged:
                 if True:  # converged or unconverged
                     with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
@@ -64,7 +64,7 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, executorlib_worker_id=None):
             print(f"Rank {rank} FAILED on structure {i}: {e}")
             print(f"\nTraceback details:\n{traceback.format_exc()}")
             existing_files = [f for f in temp_files if os.path.exists(f)]
-            if existing_files:
+            if existing_files and config_dict['Main']['zip']:
                 with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
                     for f_name in existing_files:
                         zf.write(f_name, arcname=f"ERROR_{f_name}")
@@ -207,7 +207,7 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, executorlib_worker_id=
 
             # --- CLEANUP (Success Case) ---
             existing_files = [f for f in temp_files if os.path.exists(f)]
-            if existing_files:
+            if existing_files and config_dict['Main']['zip']:
                 with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
                     for f_name in existing_files:
                         zf.write(f_name, arcname=f_name)
@@ -221,7 +221,7 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, executorlib_worker_id=
             log_status(parent_source_idx, f"error: {str(e)}")
 
             existing_files = [f for f in temp_files if os.path.exists(f)]
-            if existing_files:
+            if existing_files and config_dict['Main']['zip']:
                 with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
                     for f_name in existing_files:
                         zf.write(f_name, arcname=f"ERROR_{f_name}")

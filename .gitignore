@@ -19,6 +19,7 @@ htmlcov/
 *.log
 *ll_out*
 examples/catsunami
+examples/dneb_tests
 examples/nebopt_executorlib_ls6_ilgar
 examples/nebopt_intcases_impr_tang_aselinear_20images
 examples/nebopt_interesting_cases_aseneb_aselinear

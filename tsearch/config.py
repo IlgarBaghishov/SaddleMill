@@ -16,6 +16,7 @@ class ConfigManager:
             "Calculator": "FAIRChemCalculator",
             "jobs_per_gpu": 1,
             "resume": False,
+            "zip": True,
         },
         "FAIRChemCalculator": {
             "device": 'cuda',
@@ -32,6 +33,7 @@ class ConfigManager:
             "only_endpoints_in_input_traj": False,
             "images_location_in_input_traj": ":",  # can also be 0 or -1, meaning begining or end of file. This defines where are the initial endpoints or the band in the input traj
             "relax_endpoints": True,
+            "endpoint_relax_Optimizer": None,
             "endpoint_relax_fmax": 0.01,
             "endpoint_relax_steps": 500,
             "interpolate_method": "ase_linear",
@@ -142,7 +144,6 @@ def load_config(path="config.ini"):
     return ConfigManager(path)
 
 
-
 def load_calculator(config_dict):
     if config_dict["Main"]["Calculator"] == "FAIRChemCalculator":
         from fairchem.core import FAIRChemCalculator
@@ -177,8 +178,7 @@ def load_method(config_dict):
     return method
 
 
-def load_optimizer(config_dict):
-    optimizer_name = config_dict["Main"]["Optimizer"]
+def _load_optimizer(optimizer_name):
     if optimizer_name.lower() == "mdmin":
         from ase.optimize import MDMin as Optimizer
     elif optimizer_name.lower() == "bfgs":
@@ -191,6 +191,17 @@ def load_optimizer(config_dict):
         raise NotImplementedError(
             f"Method '{optimizer_name}' is not implemented. Only MDMin, BFGS, LBFGS and FIRE are supported."
         )
+    return Optimizer
+
+
+def load_optimizer(config_dict):
+    Optimizer = _load_optimizer(config_dict["Main"]["Optimizer"])
+    if config_dict["Main"]["method"] == "NEB":
+        if config_dict["ourNEB"]["endpoint_relax_Optimizer"] is None:
+            return Optimizer, Optimizer
+        else:
+            endpoint_relax_Optimizer = _load_optimizer(config_dict["ourNEB"]["endpoint_relax_Optimizer"])
+            return endpoint_relax_Optimizer, Optimizer
     return Optimizer
 
 

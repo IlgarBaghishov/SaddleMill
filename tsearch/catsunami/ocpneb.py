@@ -12,9 +12,6 @@ from ase.mep.neb import NEBMethod
 
 
 class swDNEB(NEBMethod):
-    """
-    Tangent estimates and spring force are according to Eqs. 12-15 in paper IV.
-    """
 
     def get_tangent(self, state, spring1, spring2, i):
         energies = state.energies
@@ -43,17 +40,18 @@ class swDNEB(NEBMethod):
         perp_pot_force_norm = np.linalg.norm(perp_pot_force)
         perp_pot_force /= perp_pot_force_norm if perp_pot_force_norm > 0 else 1
 
-        # Improved parallel spring force (formula 12 of paper I)
+        # Improved parallel spring force (formula 12 of paper on Improved tangent)
         imgforce += (spring2.nt * spring2.k - spring1.nt * spring1.k) * tangent
 
         spring_force = spring2.t * spring2.k - spring1.t * spring1.k
-        
+
         # # Or use this spring formula from aseneb
         # imgforce += np.vdot(spring_force, tangent) * tangent
 
         perp_spring_force = spring_force - np.vdot(spring_force, tangent) * tangent
         perp_spring_force_norm = np.linalg.norm(perp_spring_force) or 1
-        sw = 2/np.pi * np.arctan(perp_pot_force_norm**2 / perp_spring_force_norm**2)
+        ratio = perp_pot_force_norm / perp_spring_force_norm
+        sw = 2/np.pi * np.arctan(ratio**2)
         imgforce += sw * (perp_spring_force - np.vdot(perp_spring_force, perp_pot_force) * perp_pot_force)
 
 
