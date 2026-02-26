@@ -5,7 +5,7 @@ def init_function(executorlib_worker_id=None):
     config_dict = load_config("config.ini")
     
     if config_dict["Main"]["executorlib"] == True and config_dict["Main"]["jobs_per_gpu"] != 1:
-        if config_dict["Main"]["Calculator"][:4] != "Vasp" and config_dict[config_dict["Main"]["Calculator"]]["device"] == "cuda":
+        if config_dict["Main"]["Calculator"] not in ("Vasp", "VaspInteractive") and config_dict[config_dict["Main"]["Calculator"]]["device"] == "cuda":
             from flux import Flux, resource
             handle = Flux()
             rset = resource.list.resource_list(handle).get().all
@@ -22,7 +22,7 @@ def init_function(executorlib_worker_id=None):
             os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ID%ngpus)
 
     calc = load_calculator(config_dict)
-    if config_dict["Main"]["Calculator"][:4] != "Vasp":  # Then initialize, store on device memory and share the calculator object between structures
+    if config_dict["Main"]["Calculator"] not in ("Vasp", "VaspInteractive"):  # Then initialize, store on device memory and share the calculator object between structures
         calc = calc(**config_dict[config_dict["Main"]["Calculator"]])
     Optimizer = load_optimizer(config_dict)
 

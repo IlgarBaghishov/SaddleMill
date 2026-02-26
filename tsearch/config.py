@@ -151,6 +151,8 @@ def load_calculator(config_dict):
         from vasp_interactive import VaspInteractive as calc
     elif calculator_name == "Vasp":
         from ase.calculators.vasp import Vasp as calc
+    else:
+        raise ValueError(f"Unknown calculator: {calculator_name}")
 
     # To-do: implement this for Omat24 level DFT:
     # from fairchem.data.omat.vasp.sets import OMat24StaticSet

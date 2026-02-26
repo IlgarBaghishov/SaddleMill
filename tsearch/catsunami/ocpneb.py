@@ -4,9 +4,6 @@ import logging
 import numpy as np
 from ase.optimize.precon import Precon, PreconImages
 
-from fairchem.core.common.utils import setup_imports, setup_logging
-from fairchem.core.datasets.atomic_data import atomicdata_list_to_batch
-
 from ase.mep.neb import DyNEB, NEBState
 from ase.mep.neb import NEBMethod
 
@@ -118,6 +115,10 @@ class OCPNEB(DyNEB):
         self.vasp = vasp
 
         if not self.vasp:
+            from fairchem.core.common.utils import setup_imports, setup_logging
+            from fairchem.core.datasets.atomic_data import atomicdata_list_to_batch
+            self.atomicdata_list_to_batch = atomicdata_list_to_batch
+            
             self.batch_size = batch_size
             setup_imports()
             setup_logging()
@@ -127,7 +128,9 @@ class OCPNEB(DyNEB):
             self.a2g = tmp_calc.a2g
 
             self.reactant_energy = self.images[0].get_potential_energy()
+            self.reactant_forces = self.images[0].get_forces()
             self.product_energy = self.images[-1].get_potential_energy()
+            self.product_forces = self.images[-1].get_forces()
 
             self.intermediate_energies = []
             self.intermediate_forces = []
@@ -148,7 +151,7 @@ class OCPNEB(DyNEB):
                 for i in range(0, len(images), self.batch_size):
                     batch_images = images[i : i + self.batch_size]
                     data_list = [self.a2g(img) for img in batch_images]
-                    batch = atomicdata_list_to_batch(data_list)
+                    batch = self.atomicdata_list_to_batch(data_list)
 
                     predictions = self.predictor.predict(batch)
                     energies_calcd.extend(predictions["energy"].detach().cpu().flatten().tolist())
@@ -253,6 +256,8 @@ class OCPNEB(DyNEB):
         self.energies = energies
         self.real_forces = np.zeros((self.nimages, self.natoms, 3))
         self.real_forces[1:-1] = forces
+        self.real_forces[0] = self.reactant_forces
+        self.real_forces[-1] = self.product_forces
 
         state = NEBState(self, images, energies)
 

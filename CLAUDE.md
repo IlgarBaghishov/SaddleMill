@@ -2,7 +2,7 @@
 
 ## Overview
 
-tsearch is a Python library for creating datasets of Transition States (TS) using neural network potentials (FAIRChemCalculator / Meta OCP models). It supports distributed GPU execution on HPC systems (NERSC Perlmutter, TACC Vista/LS6) via executorlib + Flux.
+tsearch is a Python library for creating datasets of Transition States (TS) using neural network potentials (FAIRChemCalculator / Meta's UMA model) or DFT (VASP / VaspInteractive). It supports distributed GPU execution on HPC systems (NERSC Perlmutter, TACC Vista/LS6) via executorlib + Flux.
 
 ## Entry Point
 
@@ -42,22 +42,25 @@ catsunami/ocpneb.py  (OCPNEB: batched NEB with swDNEB switching)
 ## Key Modules
 
 ### `config.py`
-- `ConfigManager`: Reads `config.ini` with type inference (bool/int/float/list/string)
-- `load_calculator()`: Creates FAIRChemCalculator from config
+- `ConfigManager`: Reads `config.ini` with type inference (bool/int/float/list/string). Quoted strings (`"..."` or `'...'`) are preserved as literal strings (used for VASP commands containing spaces).
+- `load_calculator()`: Returns calculator class/callable based on config (`FAIRChemCalculator`, `Vasp`, or `VaspInteractive`). For FAIRChem, returns `from_model_checkpoint` method; for VASP calculators, returns the class itself. Instantiation is deferred to `init_function.py` (for FAIRChem) or `nebopt.py` (for VASP, per-image).
 - `load_method()`: Imports the correct optimization function
 - `load_optimizer()`: Returns optimizer class(es) - for NEB returns (endpoint_optimizer, neb_optimizer)
 - `get_trajes_and_indices()`: Scans dir_path for .traj files, splits into job batches
 - Resume support: `get_remaining_trajes()` skips completed jobs
 
 ### `nebopt.py` - NEB Workflow
-1. **Endpoint relaxation** (optional): Relaxes reactant/product with configurable optimizer (e.g., LBFGS)
+1. **Endpoint relaxation** (optional): Relaxes reactant/product with configurable optimizer (e.g., LBFGS). For VaspInteractive, calculators are finalized after relaxation and endpoints are frozen with `SinglePointCalculator`.
 2. **Interpolation**: `ocp_idpp` (Meta's PBC-aware), `ase_idpp`, `ase_linear` (auto-falls back to IDPP on atom overlap), or `False` (use provided frames)
-3. **NEB optimization**: Uses `OCPNEB` class with MDMin optimizer. Supports climbing image.
+3. **NEB optimization**: Uses `OCPNEB` class with MDMin optimizer. Supports climbing image. For VASP/VaspInteractive, each image gets its own calculator instance with separate working directories (`{job_id}_{image_idx}/`), separate `command`/`ncore` settings for endpoints vs intermediates, and WAVECAR/CHG/CHGCAR cleanup after completion.
 4. **Output**: Extracts critical image (TS candidate) with tangent vector as eigenmode, barrier height, and reaction energetics. Generates band plot PNG.
 
 ### `catsunami/ocpneb.py` - Core NEB Engine
-- **`OCPNEB`** (extends DyNEB): Batch-evaluates intermediate images via FAIRChemCalculator for efficiency. Caches forces between calls. Handles constraints (fixed atoms by tag=0 or explicit constraints). Supports dynamic relaxation (skipping converged images).
-- **`swDNEB`** (NEBMethod subclass): Implements the switched Doubly Nudged Elastic Band method:
+- **`OCPNEB`** (extends DyNEB): Two modes controlled by `vasp` flag:
+  - **FAIRChem mode** (`vasp=False`): Batch-evaluates intermediate images via FAIRChemCalculator for efficiency. Caches forces between calls. fairchem imports are lazy (only loaded in this mode).
+  - **VASP mode** (`vasp=True`): Delegates to parent `DyNEB`/`BaseNEB` for standard per-image force evaluation. Each image has its own VASP calculator. No batching, no caching, no fairchem dependency at runtime.
+  - Both modes: Handles constraints (fixed atoms by tag=0 or explicit constraints). Supports dynamic relaxation (skipping converged images). Stores full `real_forces` array `(nimages, natoms, 3)` including endpoint forces for uniform access via `real_forces[imax]`.
+- **`swDNEB`** (NEBMethod subclass): Implements the switched Doubly Nudged Elastic Band method (works with both FAIRChem and VASP modes):
   - Uses improved tangent vectors (energy-weighted at extrema)
   - Adds perpendicular spring force component to straighten the band
   - Switching function `sw = (2/pi) * arctan(|F_perp|^2 / |F_S_perp|^2)` turns off DNEB force as convergence is reached (preventing frustration)
@@ -101,7 +104,9 @@ Bulk dimer mode supports 7 reaction types, configured via `reaction_types` (spac
 
 ### `init_function.py` - Worker Initialization
 - Assigns GPU to worker based on executorlib_worker_id and jobs_per_gpu
-- Sets `CUDA_VISIBLE_DEVICES` for multi-job-per-GPU scenarios
+- Sets `CUDA_VISIBLE_DEVICES` for multi-job-per-GPU scenarios (skipped for VASP calculators)
+- For FAIRChem: instantiates calculator once (stored on GPU, shared across structures)
+- For VASP/VaspInteractive: returns the class itself (instantiation deferred to per-image in `nebopt.py`)
 - Returns `{calc, Optimizer}` dict passed to method functions
 
 ### `catsunami/autoframe.py` - NEB Frame Generation
@@ -123,7 +128,7 @@ Optimizer = MDMin           # MDMin | BFGS | LBFGS | FIRE (used for NEB band opt
 fmax = 0.05                 # Force convergence criterion (eV/A)
 steps = 6000                # Maximum optimization steps
 jobs_per_gpu = 1            # Number of concurrent jobs per GPU
-Calculator = FAIRChemCalculator
+Calculator = FAIRChemCalculator  # FAIRChemCalculator | Vasp | VaspInteractive
 resume = False              # Resume from previous partial run
 zip = True                  # Compress debug files
 
@@ -131,6 +136,20 @@ zip = True                  # Compress debug files
 device = cuda
 name_or_path = uma-s-1p1   # Model checkpoint
 task_name = oc20                  # Task type
+
+[Vasp]                             # VASP INCAR parameters (used by both Vasp and VaspInteractive calculators)
+setups = minimal
+isif = 0
+ispin = 1
+isym = 0
+lreal = Auto
+ediff = 0.00001
+ediffg = -0.03
+symprec = 1e-10
+encut = 350.0
+gga = RP
+pp = PBE
+xc = PBE
 
 [MDMin]
 dt = 0.02                   # Time step (dimensionless, ASE default=0.2)
@@ -149,8 +168,13 @@ endpoint_relax_fmax = 0.02
 endpoint_relax_steps = 1000
 interpolate_method = ase_linear    # ocp_idpp | ase_idpp | ase_linear | False
 num_frames = 10                    # Number of NEB images
-batch_size = 8                     # Batch size for FAIRChem inference
+batch_size = 8                     # Batch size for FAIRChem inference (ignored in VASP mode)
 DNEB = True                        # Enable switched DNEB
+# VASP-only settings (required when Calculator = Vasp or VaspInteractive):
+vasp_command_endpoints = "srun --exclusive -n 64 vasp_std"
+vasp_ncore_endpoints = 8           # NCORE for endpoint relaxation VASP jobs
+vasp_command_intermediates = "srun --exclusive -n 16 vasp_std"
+vasp_ncore_intermediates = 4       # NCORE for intermediate image VASP jobs
 
 [DyNEB]
 k = 5                       # Spring constant (eV/A^2)
@@ -210,6 +234,18 @@ srun -N $SLURM_NNODES -n $SLURM_NNODES --gpus-per-node=4 flux start python -u -m
 ```
 
 Set `FAIRCHEM_CACHE_DIR` for model caching. Requires CUDA libraries in `LD_LIBRARY_PATH`.
+
+## VASP / VaspInteractive Calculator Support
+
+The NEB method supports VASP and VaspInteractive as alternatives to FAIRChemCalculator. Key design differences:
+
+- **No batching**: Unlike FAIRChem (which batch-evaluates all intermediate images on GPU), VASP runs each image as a separate process. `OCPNEB` delegates to the parent `BaseNEB` force evaluation when `vasp=True`.
+- **Per-image calculator instances**: Each NEB image gets its own calculator with a unique working directory (`{job_id}_{image_idx}/`). Endpoints and intermediates can use different `command`/`ncore` settings (e.g., more cores for endpoint relaxation).
+- **Deferred instantiation**: `load_calculator()` returns the VASP class (not an instance). Calculators are instantiated per-image in `nebopt.py` with directory, command, ncore, and `[Vasp]` INCAR parameters.
+- **VaspInteractive lifecycle**: VaspInteractive keeps a persistent VASP process. Endpoint calculators are finalized after relaxation (before replacing with `SinglePointCalculator`). Intermediate calculators are finalized after the NEB run completes.
+- **Cleanup**: WAVECAR, CHG, CHGCAR files are removed after each job (both success and error paths) to avoid disk bloat. Image directories are added to `temp_files` for zip archival.
+- **VASP config**: INCAR parameters live in the `[Vasp]` section regardless of whether the calculator is `Vasp` or `VaspInteractive`. VASP-specific NEB settings (`vasp_command_endpoints`, `vasp_ncore_endpoints`, `vasp_command_intermediates`, `vasp_ncore_intermediates`) live in `[ourNEB]`.
+- **Current scope**: VASP support is implemented for NEB only. Dimer, Minimization, and DoubleMinimization still require FAIRChemCalculator.
 
 ## DNEB Theory Notes
 

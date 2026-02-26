@@ -30,8 +30,8 @@ def nebopt(i, config_dict, images, calc, Optimizer, executorlib_worker_id=None):
     temp_react_relax = f'reactant_relaxation_{i}.traj'
     temp_prod_relax = f'product_relaxation_{i}.traj'
     temp_files = [temp_log, temp_traj, temp_plot, temp_react_relax_log, temp_prod_relax_log, temp_react_relax, temp_prod_relax]
-    if config_dict["Main"]["Calculator"][:4] == "Vasp":
-        temp_files.append([f"{i}_{image_idx}" for image_idx in range(num_frames)])
+    if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
+        temp_files.extend([f"{i}_{image_idx}" for image_idx in range(num_frames)])
 
     def log_status(status_msg):
         with open(status_file, 'a') as f:
@@ -39,25 +39,25 @@ def nebopt(i, config_dict, images, calc, Optimizer, executorlib_worker_id=None):
 
     try:
         reactant = images[0]
-        if config_dict["Main"]["Calculator"][:4] == "Vasp":
+        if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
             reactant.calc = calc(
                 directory=f"{i}_{0}",
                 command=config_dict["ourNEB"]["vasp_command_endpoints"],
                 ncore=int(config_dict["ourNEB"]["vasp_ncore_endpoints"]),
-                **config_dict[config_dict["Main"]["Calculator"]],
+                **config_dict["Vasp"],
                 )
-        elif config_dict["Main"]["Calculator"][:4] != "Vasp":
+        else:
             reactant.calc = calc
 
         product = images[-1]
-        if config_dict["Main"]["Calculator"][:4] == "Vasp":
+        if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
             product.calc = calc(
                 directory=f"{i}_{num_frames-1}",
                 command=config_dict["ourNEB"]["vasp_command_endpoints"],
                 ncore=int(config_dict["ourNEB"]["vasp_ncore_endpoints"]),
-                **config_dict[config_dict["Main"]["Calculator"]],
+                **config_dict["Vasp"],
                 )
-        elif config_dict["Main"]["Calculator"][:4] != "Vasp":
+        else:
             product.calc = calc
 
         if relax_endpoints:
@@ -124,21 +124,21 @@ def nebopt(i, config_dict, images, calc, Optimizer, executorlib_worker_id=None):
                     neb0.interpolate(method="idpp", mic=True)
 
         for image_idx in range(1,num_frames-1):
-            if config_dict["Main"]["Calculator"][:4] == "Vasp":
+            if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
                 images[image_idx].calc = calc(
                     directory=f"{i}_{image_idx}",
                     command=config_dict["ourNEB"]["vasp_command_intermediates"],
                     ncore=int(config_dict["ourNEB"]["vasp_ncore_intermediates"]),
                     **config_dict["Vasp"],
                     )
-            elif config_dict["Main"]["Calculator"][:4] != "Vasp":
+            else:
                 images[image_idx].calc = calc
 
         neb = OCPNEB(
             images,
             batch_size = config_dict["ourNEB"]["batch_size"], # If you get a memory error, try reducing it to 4
             dneb = config_dict["ourNEB"]["DNEB"],
-            vasp = config_dict["Main"]["Calculator"][:4] == "Vasp",
+            vasp = config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"),
             **config_dict["DyNEB"],
         )
 
@@ -149,10 +149,14 @@ def nebopt(i, config_dict, images, calc, Optimizer, executorlib_worker_id=None):
                            )
         converged = opt.run(fmax = config_dict["Main"]["fmax"], steps = config_dict["Main"]["steps"])
 
+        if config_dict["Main"]["Calculator"] == "VaspInteractive":
+            for img in neb.images[1:-1]:
+                img.calc.finalize()
+
         ci_image = neb.images[neb.imax].copy()
-        energy = neb.intermediate_energies[neb.imax]
-        forces = neb.intermediate_forces[len(ci_image)*(neb.imax-1):len(ci_image)*neb.imax]
-        state = NEBState(neb, neb.images, neb.intermediate_energies)
+        energy = neb.energies[neb.imax]
+        forces = neb.real_forces[neb.imax]
+        state = NEBState(neb, neb.images, neb.energies)
         spring1 = state.spring(neb.imax-1)
         spring2 = state.spring(neb.imax)
         tangent = neb.neb_method.get_tangent(state, spring1, spring2, neb.imax)
@@ -186,10 +190,10 @@ def nebopt(i, config_dict, images, calc, Optimizer, executorlib_worker_id=None):
             log_status("not_converged")
 
         # Clean up temp files
-        if config_dict["Main"]["Calculator"][:4] == "Vasp":
+        if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
             for image_idx in range(num_frames):
                 for vasp_heavy_files in [f'{i}_{image_idx}/WAVECAR',f'{i}_{image_idx}/CHG',f'{i}_{image_idx}/CHGCAR']:
-                    os.remove(vasp_heavy_files)
+                    if os.path.exists(vasp_heavy_files): os.remove(vasp_heavy_files)
         existing_files = [f for f in temp_files if os.path.exists(f)]
         if existing_files and config_dict['Main']['zip']:
             with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
@@ -201,10 +205,10 @@ def nebopt(i, config_dict, images, calc, Optimizer, executorlib_worker_id=None):
     except Exception as e:
         print(f"Rank {rank} FAILED on structure {i}: {e}")
         print(f"\nTraceback details:\n{traceback.format_exc()}")
-        if config_dict["Main"]["Calculator"][:4] == "Vasp":
+        if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
             for image_idx in range(num_frames):
                 for vasp_heavy_files in [f'{i}_{image_idx}/WAVECAR',f'{i}_{image_idx}/CHG',f'{i}_{image_idx}/CHGCAR']:
-                    os.remove(vasp_heavy_files)
+                    if os.path.exists(vasp_heavy_files): os.remove(vasp_heavy_files)
         existing_files = [f for f in temp_files if os.path.exists(f)]
         if existing_files and config_dict['Main']['zip']:
             with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:

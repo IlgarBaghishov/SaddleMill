@@ -81,13 +81,11 @@ def main():
                 images = list(traj[i:j]) if j!=i+1 else traj[i]
                 try:
                     f = submitter(method, job_IDs[idx], config_dict, images)
-                    if config_dict["Main"]["executorlib"]:
-                        futures.append(f)
+                    if config_dict["Main"]["executorlib"]: futures.append(f)
                 except Exception as e:
                     print(f"CRITICAL ERROR on job {idx} ({traj_name}): {e}")
                     # In serial mode, we catch it and move on.
                     # In parallel mode, 'submitter' usually doesn't raise immediately, so this is safe.
-                if config_dict["Main"]["executorlib"]: futures.append(f)
                 idx += 1
             traj.close()
 
