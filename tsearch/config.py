@@ -17,7 +17,7 @@ class ConfigManager:
             "device": 'cuda',
             "jobs_per_node": 1,  # this only used if device = 'cpu', otherwise jobs_per_gpu is used
             "jobs_per_gpu": 1,
-            "resume": False,
+            "resume": True,
             "zip": True,
         },
         "FAIRChemCalculator": {
@@ -249,11 +249,18 @@ def get_trajes_and_indices(config_dict):
     return trajes_and_idxs
 
 
-def create_results_directories(config_dict):
+def create_results_directories(config_dict, exist_ok=False):
     method_name = config_dict["Main"]["method"]
-    pathlib.Path(f"{method_name}_status_csvs").mkdir(exist_ok=False)
-    pathlib.Path(f"{method_name}_trajes").mkdir(exist_ok=False)
-    pathlib.Path(f"{method_name}_debug_zips").mkdir(exist_ok=False)
+    dirs = [f"{method_name}_status_csvs", f"{method_name}_trajes", f"{method_name}_debug_zips"]
+    if exist_ok:
+        for d in dirs:
+            if os.path.isdir(d) and os.listdir(d):
+                raise RuntimeError(
+                    f"Directory '{d}' already contains files from a previous run. "
+                    f"Cannot start fresh with resume=True. Either delete the output "
+                    f"directories manually or fix traj_files_ordered.json.")
+    for d in dirs:
+        pathlib.Path(d).mkdir(exist_ok=exist_ok)
 
 
 def get_previous_job_status_df(config_dict):

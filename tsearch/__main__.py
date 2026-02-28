@@ -22,7 +22,13 @@ def main():
 
     method = load_method(config_dict)
     trajes_and_idxs = get_trajes_and_indices(config_dict)
-    if config_dict["Main"]["resume"]:
+    method_name = config_dict["Main"]["method"]
+    status_dir = f"{method_name}_status_csvs"
+    import glob
+    can_resume = (config_dict["Main"]["resume"]
+                  and os.path.exists('traj_files_ordered.json')
+                  and glob.glob(os.path.join(status_dir, "*.csv")))
+    if can_resume:
         trajes_and_idxs_old = read_ordered_traj_names()
         if trajes_and_idxs != trajes_and_idxs_old:
             raise ValueError("Provided dirpath creates a different trajes_and_idxs. I can't resume.")
@@ -30,8 +36,8 @@ def main():
         clean_up_files()
     else:
         job_IDs = list(range(len(trajes_and_idxs)))
-        create_results_directories(config_dict)
         save_ordered_traj_names(trajes_and_idxs)
+        create_results_directories(config_dict, exist_ok=config_dict["Main"]["resume"])
 
     if config_dict["Main"]["executorlib"]:
         from executorlib import FluxJobExecutor
