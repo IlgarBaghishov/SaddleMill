@@ -4,6 +4,26 @@ from ase.neighborlist import neighbor_list, natural_cutoffs
 
 
 #==============================================================================
+### ATOMS LOADING
+
+def load_and_sanitize(traj, i, j):
+    """Load images from trajectory and stash original .info into orig_info.
+
+    This prevents per-atom array data (e.g. forces, stress) in .info from
+    causing size mismatches when atoms are later added or removed (e.g. vacancy
+    mechanism in Dimer). Applied uniformly across all methods for consistency.
+    """
+    if j != i + 1:
+        images = list(traj[i:j])
+        for img in images:
+            img.info = {"orig_info": dict(img.info)}
+    else:
+        images = traj[i]
+        images.info = {"orig_info": dict(images.info)}
+    return images
+
+
+#==============================================================================
 ### FILE IO
 
 def save_ordered_traj_names(trajes_and_idxs):

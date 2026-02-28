@@ -20,7 +20,9 @@ def turn_into_supercell(atoms):
     elif 9 <= n_atoms <= 16:
         M[np.argmin(atoms.cell.lengths())] = 2
     if M != [1, 1, 1]:
+        saved_info = dict(atoms.info)
         atoms = make_supercell(atoms, np.diag(M))
+        atoms.info.update(saved_info)
     return atoms
 
 

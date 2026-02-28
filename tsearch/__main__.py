@@ -4,7 +4,7 @@ from ase.io import Trajectory
 from itertools import groupby
 from contextlib import nullcontext
 from tsearch.init_function import init_function
-from tsearch.tools import save_ordered_traj_names, read_ordered_traj_names, clean_up_files
+from tsearch.tools import save_ordered_traj_names, read_ordered_traj_names, clean_up_files, load_and_sanitize
 from tsearch.config import load_config, load_method, get_trajes_and_indices, create_results_directories, get_remaining_trajes, get_flux_resources
 
 
@@ -76,7 +76,7 @@ def main():
         for traj_name, group in groupby(trajes_and_idxs, key=lambda x: x[0]):
             traj = Trajectory(traj_name, 'r')
             for _, i, j in group:
-                images = list(traj[i:j]) if j!=i+1 else traj[i]
+                images = load_and_sanitize(traj, i, j)
                 try:
                     f = submitter(method, job_IDs[idx], config_dict, images)
                     if config_dict["Main"]["executorlib"]: futures.append(f)

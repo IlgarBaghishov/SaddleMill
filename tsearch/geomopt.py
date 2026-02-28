@@ -91,19 +91,19 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, executorlib_worker_id=
     temp_files = []
 
     with Trajectory(my_output_file, 'a') as writer:
-        parent_source_idx = atoms.info['src_index']
+        orig = atoms.info.get('orig_info', atoms.info)
+        parent_source_idx = orig['src_index']
         try:
-            if not atoms.info['converged']:
+            if not orig['converged']:
                 raise Exception("Input structure marked as unconverged.")
 
-            if 'eigenmode' not in atoms.info:
+            if 'eigenmode' not in orig:
                  raise Exception("Input structure missing 'eigenmode' in info.")
-            if 'src_index' not in atoms.info:
-                 raise Exception("Input structure missing 'eigenmode' in info.")
-
+            if 'src_index' not in orig:
+                 raise Exception("Input structure missing 'src_index' in info.")
 
             # Identify IDs
-            refined_eigenmode = atoms.info['eigenmode']
+            refined_eigenmode = orig['eigenmode']
 
             # --- PREPARE TS (Middle Image) ---
             ts_atoms = atoms.copy()
