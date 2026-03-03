@@ -37,8 +37,40 @@ def read_ordered_traj_names():
     return trajes_and_idxs
 
 
-def clean_up_files():
-    os.system("rm -rf neb_*.log neb_*.traj reactant_relaxation_*.log reactant_relaxation_*.traj product_relaxation_*.log product_relaxation_*.traj diffusion_barrier_*.png")
+def clean_up_files(method_name="NEB"):
+    """Remove leftover temp files from a previous interrupted run.
+
+    Each method writes its own set of temp files into the working directory.
+    On resume, these leftovers must be cleaned up so they don't collide with
+    new runs.
+    """
+    import glob as _glob
+    import shutil
+
+    patterns = {
+        "NEB": [
+            "neb_*.log", "neb_*.traj",
+            "reactant_relaxation_*.log", "reactant_relaxation_*.traj",
+            "product_relaxation_*.log", "product_relaxation_*.traj",
+            "diffusion_barrier_*.png",
+        ],
+        "Dimer": [
+            "dimer_control_*.log", "dimer_opt_*.log", "dimer_*.traj",
+        ],
+        "Minimization": [
+            "optimization_*.log", "optimization_*.traj",
+        ],
+        "DoubleMinimization": [
+            "optimization_*.log", "optimization_*.traj",
+        ],
+    }
+
+    for pat in patterns.get(method_name, []):
+        for f in _glob.glob(pat):
+            if os.path.isdir(f):
+                shutil.rmtree(f)
+            else:
+                os.remove(f)
     
 
 #==============================================================================
