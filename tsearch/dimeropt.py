@@ -39,14 +39,14 @@ def dimeropt(i, config_dict, atoms_orig, calc, executorlib_worker_id=None, **kwa
         slctd_indx = -1
         temp_files = []
 
-        try:
-            for attempt, (atoms, displacement_dict, slctd_indx) in enumerate(zip(*get_attempts(atoms_orig, config_dict))):
+        for attempt, (atoms, displacement_dict, slctd_indx) in enumerate(zip(*get_attempts(atoms_orig, config_dict))):
 
-                temp_log = f'dimer_control_{i}_{attempt}_{slctd_indx}.log'
-                temp_opt_log = f'dimer_opt_{i}_{attempt}_{slctd_indx}.log'
-                temp_traj = f'dimer_{i}_{attempt}_{slctd_indx}.traj'
-                temp_files = [temp_log, temp_opt_log, temp_traj]
+            temp_log = f'dimer_control_{i}_{attempt}_{slctd_indx}.log'
+            temp_opt_log = f'dimer_opt_{i}_{attempt}_{slctd_indx}.log'
+            temp_traj = f'dimer_{i}_{attempt}_{slctd_indx}.traj'
+            temp_files = [temp_log, temp_opt_log, temp_traj]
 
+            try:
                 atoms.calc = calc
 
                 # Handle constraints:
@@ -138,7 +138,7 @@ def dimeropt(i, config_dict, atoms_orig, calc, executorlib_worker_id=None, **kwa
                 atoms.wrap()
 
                 writer.write(atoms)
-                
+
                 log_status(attempt, slctd_indx, status)
 
                 # Clean up temp files
@@ -150,14 +150,14 @@ def dimeropt(i, config_dict, atoms_orig, calc, executorlib_worker_id=None, **kwa
                     for f_name in existing_files:
                         os.remove(f_name)
 
-        except Exception as e:
-            print(f"Rank {rank} FAILED on structure {i}: {e}")
-            print(f"\nTraceback details:\n{traceback.format_exc()}")
-            existing_files = [f for f in temp_files if os.path.exists(f)]
-            if existing_files and config_dict['Main']['zip']:
-                with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
+            except Exception as e:
+                print(f"Rank {rank} FAILED on structure {i}, attempt {attempt}: {e}")
+                print(f"\nTraceback details:\n{traceback.format_exc()}")
+                existing_files = [f for f in temp_files if os.path.exists(f)]
+                if existing_files and config_dict['Main']['zip']:
+                    with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
+                        for f_name in existing_files:
+                            zf.write(f_name, arcname=f"ERROR_{f_name}")
                     for f_name in existing_files:
-                        zf.write(f_name, arcname=f"ERROR_{f_name}")
-                for f_name in existing_files:
-                    os.remove(f_name)
-            log_status(attempt, slctd_indx, "error")
+                        os.remove(f_name)
+                log_status(attempt, slctd_indx, "error")
