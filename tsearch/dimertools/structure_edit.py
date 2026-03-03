@@ -8,17 +8,29 @@ from ase.build import make_supercell
 from ase.data import covalent_radii, atomic_numbers
 
 
-def turn_into_supercell(atoms):
+def turn_into_supercell(atoms, min_length=7.0):
+    """Ensure sufficient atoms AND cell dimensions to avoid self-interaction."""
     n_atoms = len(atoms)
+    lengths = atoms.cell.lengths()
     M = [1, 1, 1]
-    if n_atoms == 1: M = [3, 3, 3]
-    elif n_atoms <= 4: M = [2, 2, 2]
+
+    # Rule 1: Minimum atoms
+    if n_atoms == 1:
+        M = [3, 3, 3]
+    elif n_atoms <= 4:
+        M = [2, 2, 2]
     elif 5 <= n_atoms <= 8:
-        lengths = atoms.cell.lengths()
-        M[np.argsort(lengths)[0]] = 2
-        M[np.argsort(lengths)[1]] = 2
+        sorted_indices = np.argsort(lengths)
+        M[sorted_indices[0]] = 2
+        M[sorted_indices[1]] = 2
     elif 9 <= n_atoms <= 16:
-        M[np.argmin(atoms.cell.lengths())] = 2
+        M[np.argmin(lengths)] = 2
+
+    # Rule 2: Minimum length (ensures no self-interaction via PBC)
+    for i in range(3):
+        if lengths[i] > 1e-6 and lengths[i] * M[i] < min_length:
+            M[i] = int(np.ceil(min_length / lengths[i]))
+
     if M != [1, 1, 1]:
         saved_info = dict(atoms.info)
         atoms = make_supercell(atoms, np.diag(M))
@@ -173,6 +185,8 @@ def _sample_kickout_insert_element(atoms, sigma=0.2):
     host_radii = np.array([covalent_radii[z] for z in atoms.get_atomic_numbers()])
     r_avg = host_radii.mean()
     weights = np.exp(-(_KICKOUT_INSERT_POOL_RADII - r_avg) ** 2 / (2 * sigma ** 2))
+    if weights.sum() < 1e-12:
+        weights = np.ones_like(weights)
     weights /= weights.sum()
     idx = np.random.choice(len(_KICKOUT_INSERT_POOL_Z), p=weights)
     return _KICKOUT_INSERT_POOL_Z[idx]
@@ -319,7 +333,7 @@ def get_hop_reuse_attempts(atoms, num_attempts):
     atoms = turn_into_supercell(atoms)
     sites = find_interstitial_sites(atoms)
 
-    if len(sites) < 1:
+    if len(sites) == 0:
         warnings.warn("Found no interstitial sites; skipping hop_reuse.")
         return [], [], []
 
@@ -561,6 +575,7 @@ def _build_neighbor_dict(atoms, cutoff=3.5):
     i_idx, j_idx = neighbor_list('ij', atoms, cutoff)
     neighbors_dict = {}
     for i, j in zip(i_idx, j_idx):
+        if i == j: continue  # FIX: Skip self-interactions
         neighbors_dict.setdefault(int(i), []).append(int(j))
     return neighbors_dict
 
@@ -583,12 +598,12 @@ def _make_ring_attempt(atoms, neighbors_dict, cell, ring_size, reaction_type):
         # Add a perpendicular component so they dodge to OPPOSITE sides — otherwise
         # both atoms end up at the same midpoint and overlap.
         delta = mic(positions[ring[1]] - positions[ring[0]], cell)
-        delta_hat = delta / np.linalg.norm(delta)
+        delta_hat = _safe_normalize(delta)
         ref = np.array([1.0, 0.0, 0.0])
         if abs(np.dot(delta_hat, ref)) > 0.9:
             ref = np.array([0.0, 1.0, 0.0])
         perp = np.cross(delta_hat, ref)
-        perp = (perp / np.linalg.norm(perp)) * 0.15 * np.linalg.norm(delta) * random.choice([-1, 1])
+        perp = (_safe_normalize(perp)) * 0.15 * np.linalg.norm(delta) * random.choice([-1, 1])
         # ring[0] gets +perp, ring[1] gets -perp → they separate at the midpoint
         disp_vector[ring[0]] = 0.5 * delta + perp
         disp_vector[ring[1]] = -0.5 * delta - perp
@@ -616,6 +631,9 @@ def get_ring_attempts(atoms, config_dict, num_attempts):
         ring_sizes = [int(x) for x in ring_sizes.split()]
     else:
         ring_sizes = [int(x) for x in ring_sizes]
+
+    if not ring_sizes:
+        return [], [], []
 
     atoms = turn_into_supercell(atoms)
     neighbors_dict = _build_neighbor_dict(atoms)
@@ -686,6 +704,10 @@ def get_attempts(atoms, config_dict):
         adsorbate_indices = np.where(tags == 2)[0]
         if adsorbate_indices.shape[0] == 0:
             adsorbate_indices = np.where(tags == 1)[0]
+
+        if len(adsorbate_indices) == 0:
+            warnings.warn("No adsorbate atoms (tag 1 or 2) found for 'oc' dataset; skipping.")
+            return [], [], []
 
         neighbor_indices = set()
         for idx in adsorbate_indices:
