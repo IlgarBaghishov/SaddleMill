@@ -33,7 +33,7 @@ def main():
         if trajes_and_idxs != trajes_and_idxs_old:
             raise ValueError("Provided dirpath creates a different trajes_and_idxs. I can't resume.")
         job_IDs, trajes_and_idxs = get_remaining_trajes(trajes_and_idxs, config_dict)
-        clean_up_files(method_name)
+        clean_up_files(config_dict)
     else:
         job_IDs = list(range(len(trajes_and_idxs)))
         save_ordered_traj_names(trajes_and_idxs)

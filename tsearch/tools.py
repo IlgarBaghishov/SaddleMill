@@ -37,15 +37,18 @@ def read_ordered_traj_names():
     return trajes_and_idxs
 
 
-def clean_up_files(method_name="NEB"):
+def clean_up_files(config_dict):
     """Remove leftover temp files from a previous interrupted run.
 
     Each method writes its own set of temp files into the working directory.
     On resume, these leftovers must be cleaned up so they don't collide with
-    new runs.
+    new runs.  For VASP NEB, per-image directories (VASP_{job_id}_{image_idx}/)
+    are also removed.
     """
     import glob as _glob
     import shutil
+
+    method_name = config_dict["Main"]["method"]
 
     patterns = {
         "NEB": [
@@ -64,6 +67,10 @@ def clean_up_files(method_name="NEB"):
             "optimization_*.log", "optimization_*.traj",
         ],
     }
+
+    # VASP NEB creates per-image directories named VASP_{job_id}_{image_idx}/
+    if method_name == "NEB" and config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
+        patterns["NEB"].append("VASP_*_*/")
 
     for pat in patterns.get(method_name, []):
         for f in _glob.glob(pat):
