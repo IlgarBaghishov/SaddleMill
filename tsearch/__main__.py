@@ -5,7 +5,9 @@ from itertools import groupby
 from contextlib import nullcontext
 from tsearch.init_function import init_function
 from tsearch.tools import save_ordered_traj_names, read_ordered_traj_names, clean_up_files, load_and_sanitize
-from tsearch.config import load_config, load_method, get_trajes_and_indices, create_results_directories, get_remaining_trajes, get_flux_resources
+from tsearch.config import (load_config, load_method, get_trajes_and_indices,
+                            create_results_directories, get_remaining_trajes,
+                            get_flux_resources, archive_and_clean_csvs)
 
 
 def check_and_print_status(futures, total):
@@ -22,22 +24,18 @@ def main():
 
     method = load_method(config_dict)
     trajes_and_idxs = get_trajes_and_indices(config_dict)
-    method_name = config_dict["Main"]["method"]
-    status_dir = f"{method_name}_status_csvs"
-    import glob
-    can_resume = (config_dict["Main"]["resume"]
-                  and os.path.exists('traj_files_ordered.json')
-                  and glob.glob(os.path.join(status_dir, "*.csv")))
+    can_resume = os.path.exists('traj_files_ordered.json')
     if can_resume:
         trajes_and_idxs_old = read_ordered_traj_names()
         if trajes_and_idxs != trajes_and_idxs_old:
             raise ValueError("Provided dirpath creates a different trajes_and_idxs. I can't resume.")
         job_IDs, trajes_and_idxs = get_remaining_trajes(trajes_and_idxs, config_dict)
+        archive_and_clean_csvs(config_dict, job_IDs)
         clean_up_files(config_dict)
     else:
         job_IDs = list(range(len(trajes_and_idxs)))
         save_ordered_traj_names(trajes_and_idxs)
-        create_results_directories(config_dict, exist_ok=config_dict["Main"]["resume"])
+        create_results_directories(config_dict)
 
     if config_dict["Main"]["executorlib"]:
         from executorlib import FluxJobExecutor

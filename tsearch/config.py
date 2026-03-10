@@ -1,7 +1,9 @@
 import configparser
-import os, glob, copy, pathlib
+import os, glob, copy, pathlib, zipfile
 import pandas as pd
 from ase.io import Trajectory
+
+VALID_RUN_CATEGORIES = frozenset({"converged", "not_converged", "error", "not_started"})
 
 class ConfigManager:
     # 1. Define your Safe Defaults here
@@ -17,15 +19,10 @@ class ConfigManager:
             "device": 'cuda',
             "jobs_per_node": 1,  # this only used if device = 'cpu', otherwise jobs_per_gpu is used
             "jobs_per_gpu": 1,
-            "resume": True,
+            "run_jobs": "not_started",
             "zip": True,
             "max_consecutive_errors": 5,
             "restart_limit": 3,
-        },
-        "FAIRChemCalculator": {
-            "device": 'cuda',
-            "name_or_path": 'uma-s-1p1',
-            "task_name": None,  # requires user input
         },
         "ourMinimization": {
             "relax_cell": True,
@@ -81,6 +78,14 @@ class ConfigManager:
                 # Attempt to convert to int/float/bool, otherwise keep as string
                 parsed_value = self._parse_value(value)
                 self._config[section][key] = parsed_value
+
+        # Warn about unrecognized keys in sections we control
+        for section, defaults in self.DEFAULTS.items():
+            if section in self._config:
+                unknown = set(self._config[section]) - set(defaults)
+                for key in sorted(unknown):
+                    print(f"Warning: Unrecognized key '{key}' in [{section}]. "
+                          f"Valid keys: {sorted(defaults)}")
 
     def _parse_value(self, val):
         """
@@ -259,28 +264,126 @@ def create_results_directories(config_dict, exist_ok=False):
             if os.path.isdir(d) and os.listdir(d):
                 raise RuntimeError(
                     f"Directory '{d}' already contains files from a previous run. "
-                    f"Cannot start fresh with resume=True. Either delete the output "
-                    f"directories manually or fix traj_files_ordered.json.")
+                    f"Cannot start fresh. Delete output directories and "
+                    f"traj_files_ordered.json first.")
     for d in dirs:
         pathlib.Path(d).mkdir(exist_ok=exist_ok)
 
 
 def get_previous_job_status_df(config_dict):
     file_list = glob.glob(os.path.join(f"{config_dict['Main']['method']}_status_csvs/", "*.csv"))
-    dfs = [pd.read_csv(f, header=None) for f in file_list]
-    status_df = pd.concat(dfs, ignore_index=True)
-    return status_df
+    if not file_list:
+        return pd.DataFrame()
+    dfs = []
+    for f in file_list:
+        try:
+            dfs.append(pd.read_csv(f, header=None))
+        except pd.errors.EmptyDataError:
+            continue
+    if not dfs:
+        return pd.DataFrame()
+    return pd.concat(dfs, ignore_index=True)
+
+
+def _normalize_run_jobs(run_jobs_value):
+    """Convert parsed run_jobs config value into a set of job categories."""
+    if isinstance(run_jobs_value, str):
+        if run_jobs_value == "all":
+            return set(VALID_RUN_CATEGORIES)
+        cats = {run_jobs_value}
+    elif isinstance(run_jobs_value, list):
+        cats = {str(c) for c in run_jobs_value}
+    else:
+        raise ValueError(f"Invalid run_jobs value: {run_jobs_value!r}")
+    invalid = cats - VALID_RUN_CATEGORIES
+    if invalid:
+        raise ValueError(
+            f"Invalid run_jobs categories: {invalid}. "
+            f"Valid: {sorted(VALID_RUN_CATEGORIES)} or 'all'")
+    return cats
+
+
+def _categorize_job(statuses):
+    """Aggregate a list of status strings into a single job category."""
+    if any(s.startswith("converged") for s in statuses):
+        return "converged"
+    if all(s.startswith("error") for s in statuses):
+        return "error"
+    return "not_converged"
 
 
 def get_remaining_trajes(trajes_and_idxs, config_dict):
+    categories_to_run = _normalize_run_jobs(config_dict["Main"]["run_jobs"])
     status_df = get_previous_job_status_df(config_dict)
-    successful_jobs = status_df[status_df.iloc[:, -1] != "error"]
-    ids_to_skip = set(successful_jobs.iloc[:, 0])
-    remaining = [[i, item] for i, item in enumerate(trajes_and_idxs) if i not in ids_to_skip]
+
+    job_categories = {}
+    if not status_df.empty:
+        for job_id, group in status_df.groupby(status_df.iloc[:, 0]):
+            job_categories[job_id] = _categorize_job(
+                group.iloc[:, -1].astype(str).tolist()
+            )
+
+    remaining = []
+    for idx, item in enumerate(trajes_and_idxs):
+        if idx in job_categories:
+            if job_categories[idx] in categories_to_run:
+                remaining.append([idx, item])
+        else:
+            if "not_started" in categories_to_run:
+                remaining.append([idx, item])
+
     if not remaining:
         return [], []
-    job_IDs, trajes_and_idxs = zip(*remaining)
-    return list(job_IDs), list(trajes_and_idxs)
+    job_IDs, trajes_and_idxs_out = zip(*remaining)
+    return list(job_IDs), list(trajes_and_idxs_out)
+
+
+def archive_and_clean_csvs(config_dict, job_ids):
+    """Archive old CSVs and remove entries for jobs being re-run.
+
+    Only triggers if any of the job_ids actually have existing CSV entries.
+    Preserves all historical data in numbered zip archives while ensuring
+    the active CSVs only contain current results for correct future filtering.
+    """
+    if not job_ids:
+        return
+    status_dir = f"{config_dict['Main']['method']}_status_csvs"
+    csv_files = glob.glob(os.path.join(status_dir, "*.csv"))
+    if not csv_files:
+        return
+
+    # Read all CSVs and check if any job_ids have existing entries
+    job_ids_set = set(job_ids)
+    csv_data = {}  # filepath -> DataFrame
+    has_entries_to_clean = False
+    for f in csv_files:
+        try:
+            df = pd.read_csv(f, header=None)
+        except pd.errors.EmptyDataError:
+            continue
+        csv_data[f] = df
+        if df.iloc[:, 0].isin(job_ids_set).any():
+            has_entries_to_clean = True
+
+    if not has_entries_to_clean:
+        return  # All job_ids are not_started (no CSV entries) → pure append, skip archiving
+
+    # 1. Archive: zip all current CSVs as previous_{N}.zip
+    n = 0
+    while os.path.exists(os.path.join(status_dir, f"previous_{n}.zip")):
+        n += 1
+    archive_path = os.path.join(status_dir, f"previous_{n}.zip")
+    with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for f in csv_files:
+            zf.write(f, os.path.basename(f))
+
+    # 2. Clean: remove entries for redone jobs, keep the rest
+    for f, df in csv_data.items():
+        filtered = df[~df.iloc[:, 0].isin(job_ids_set)]
+        if filtered.empty:
+            os.remove(f)
+        else:
+            filtered.to_csv(f, header=False, index=False)
 
 
 def get_flux_resources(config_dict):

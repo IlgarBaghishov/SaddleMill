@@ -136,7 +136,7 @@ fmax = 0.05                 # Force convergence criterion (eV/A)
 steps = 6000                # Maximum optimization steps
 jobs_per_gpu = 1            # Number of concurrent jobs per GPU
 Calculator = FAIRChemCalculator  # FAIRChemCalculator | Vasp | VaspInteractive
-resume = False              # Resume from previous partial run
+run_jobs = not_started       # Which job categories to process (see below)
 zip = True                  # Compress debug files
 max_consecutive_errors = 5  # Kill worker after N consecutive structures all-error (0 = disabled)
 restart_limit = 3           # executorlib: max worker restarts before permanent death (0 = no restarts)
@@ -208,6 +208,33 @@ relax_cell = False
 [ourDoubleMinimization]
 relax_cell = False
 ```
+
+### `run_jobs` — Flexible Job Selection
+
+`run_jobs` specifies which categories of jobs to process. Fresh vs resume is determined implicitly by whether `traj_files_ordered.json` exists on disk.
+
+**4 job categories:**
+
+| Category | Meaning | CSV statuses that map here |
+|---|---|---|
+| `converged` | At least one attempt converged | `converged`, `converged_after_extension`, `converged_both`, `converged_min1`, `converged_min2` |
+| `not_converged` | Ran without convergence | `not_converged`, `not_converged_after_extension`, `not_converged_StopRun`, `unconverged` |
+| `error` | All attempts failed | `error`, `error: <message>` |
+| `not_started` | No CSV row for this job_id | (absence of rows) |
+
+**Examples:**
+```ini
+run_jobs = not_started                # Default. Fresh run: all jobs. Resume: continue unfinished.
+run_jobs = not_started error          # Resume + retry errors
+run_jobs = converged                  # Redo converged jobs (e.g., rerun with VASP)
+run_jobs = not_converged              # Redo unconverged jobs
+run_jobs = error                      # Retry only errors
+run_jobs = all                        # Redo everything
+```
+
+**CSV archiving**: When redoing jobs that have existing CSV entries, old CSVs are archived as `{method}_status_csvs/previous_{N}.zip` (incrementing N) and entries for those job IDs are removed from the active CSVs. Jobs with no prior entries (e.g., `not_started`) don't trigger archiving.
+
+**Fresh vs resume**: No explicit toggle — if `traj_files_ordered.json` doesn't exist, it's a fresh start; if it exists, it's a resume. To force a fresh start, delete the output directories and `traj_files_ordered.json`.
 
 ## Output Structure
 
