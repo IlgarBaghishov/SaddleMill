@@ -56,10 +56,10 @@ catsunami/ocpneb.py  (OCPNEB: batched NEB with swDNEB switching)
 4. **Output**: Extracts critical image (TS candidate) with tangent vector as eigenmode, barrier height, and reaction energetics. Generates band plot PNG.
 
 ### `catsunami/ocpneb.py` - Core NEB Engine
-- **`OCPNEB`** (extends DyNEB): Two modes controlled by `vasp` flag:
+- **`OCPNEB`** (extends BaseNEB): Two modes controlled by `vasp` flag:
   - **FAIRChem mode** (`vasp=False`): Batch-evaluates intermediate images via FAIRChemCalculator for efficiency. Caches forces between calls. fairchem imports are lazy (only loaded in this mode).
-  - **VASP mode** (`vasp=True`): Delegates to parent `DyNEB`/`BaseNEB` for standard per-image force evaluation. Each image has its own VASP calculator. No batching, no caching, no fairchem dependency at runtime.
-  - Both modes: Handles constraints (fixed atoms by tag=0 or explicit constraints). Supports dynamic relaxation (skipping converged images). Stores full `real_forces` array `(nimages, natoms, 3)` including endpoint forces for uniform access via `real_forces[imax]`.
+  - **VASP mode** (`vasp=True`): Delegates to parent `BaseNEB` for standard per-image force evaluation. Each image has its own VASP calculator. No batching, no caching, no fairchem dependency at runtime.
+  - Both modes: Handles constraints (fixed atoms by tag=0 or explicit constraints). Stores full `real_forces` array `(nimages, natoms, 3)` including endpoint forces for uniform access via `real_forces[imax]`.
 - **`swDNEB`** (NEBMethod subclass): Implements the switched Doubly Nudged Elastic Band method (works with both FAIRChem and VASP modes):
   - Uses improved tangent vectors (energy-weighted at extrema)
   - Adds perpendicular spring force component to straighten the band
@@ -185,12 +185,11 @@ vasp_ncore_endpoints = 8           # NCORE for endpoint relaxation VASP jobs
 vasp_command_intermediates = "srun --exclusive -n 16 vasp_std"
 vasp_ncore_intermediates = 4       # NCORE for intermediate image VASP jobs
 
-[DyNEB]
+[BaseNEB]
 k = 5                       # Spring constant (eV/A^2)
 method = improvedtangent     # improvedtangent | aseneb
 climb = True                 # Climbing image NEB
 allow_shared_calculator = True
-dynamic_relaxation = False   # Skip converged images during optimization
 
 [ourDimer]
 dataset_type = oc            # oc | bulk

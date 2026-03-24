@@ -126,7 +126,6 @@ pip install fairchem-data-oc
 pip install git+https://github.com/ulissigroup/vasp-interactive.git
 
 # This part below is only necessary for Vista (not for Lonestar6 or Perlmutter)
-pip uninstall torch
 pip install "torch==2.9.0+cu128" --index-url https://download.pytorch.org/whl/cu128
 
 ```

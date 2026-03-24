@@ -46,6 +46,7 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
         try:
             optimizable = FrechetCellFilter(atoms) if config_dict['our'+method_name]['relax_cell'] else atoms
             converged = relax_structure(config_dict, optimizable, temp_opt_log, temp_traj, Optimizer)
+            atoms.calc = SinglePointCalculator(atoms, energy=atoms.get_potential_energy(), forces=atoms.get_forces())
 
             if converged:
                 log_status("converged")

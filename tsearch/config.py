@@ -25,7 +25,7 @@ class ConfigManager:
             "restart_limit": 3,
         },
         "ourMinimization": {
-            "relax_cell": True,
+            "relax_cell": False,
         },
         "ourDoubleMinimization": {
             "relax_cell": False,
@@ -41,6 +41,8 @@ class ConfigManager:
             "num_frames": 10,
             "batch_size": 4,
             "DNEB": False,
+            "intermediate_minima": False,
+            "intermediate_minima_min_depth": 0.01,
         },
         "ourDimer": {
             "dataset_type": None,

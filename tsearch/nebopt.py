@@ -113,7 +113,7 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
                 images += [reactant.copy() for i in range(num_frames-2)]
                 images += [product]
 
-                neb0 = NEB(images, **config_dict["DyNEB"])
+                neb0 = NEB(images, **config_dict["BaseNEB"])
 
                 if interpolate_method[4:] == "idpp":
                     perform_aseidpp = True
@@ -147,17 +147,19 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
                 images[image_idx].calc = calc
 
         is_vasp = config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive")
-        dyneb_kwargs = dict(config_dict["DyNEB"])
+        neb_kwargs = dict(config_dict["BaseNEB"])
         if is_vasp:
-            dyneb_kwargs.setdefault("parallel", True)
-            dyneb_kwargs["allow_shared_calculator"] = False
+            neb_kwargs.setdefault("parallel", True)
+            neb_kwargs["allow_shared_calculator"] = False
 
         neb = OCPNEB(
             images,
             batch_size = config_dict["ourNEB"]["batch_size"], # If you get a memory error, try reducing it to 4
             dneb = config_dict["ourNEB"]["DNEB"],
             vasp = is_vasp,
-            **dyneb_kwargs,
+            intermediate_minima = config_dict["ourNEB"]["intermediate_minima"],
+            intermediate_minima_min_depth = config_dict["ourNEB"]["intermediate_minima_min_depth"],
+            **neb_kwargs,
         )
 
         opt = Optimizer[1](neb,
@@ -181,7 +183,7 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
 
         nebtools = NEBTools(neb.images)
         Ef, dE = nebtools.get_barrier()
-        max_forces = nebtools.get_fmax(**config_dict["DyNEB"])
+        max_forces = nebtools.get_fmax(**config_dict["BaseNEB"])
         fig = nebtools.plot_band()
         fig.savefig(temp_plot)
         plt.close(fig)

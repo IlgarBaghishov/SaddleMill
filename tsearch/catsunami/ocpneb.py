@@ -4,7 +4,7 @@ import logging
 import numpy as np
 from ase.optimize.precon import Precon, PreconImages
 
-from ase.mep.neb import DyNEB, NEBState
+from ase.mep.neb import BaseNEB, NEBState
 from ase.mep.neb import NEBMethod
 
 
@@ -52,67 +52,39 @@ class swDNEB(NEBMethod):
         imgforce += sw * (perp_spring_force - np.vdot(perp_spring_force, perp_pot_force) * perp_pot_force)
 
 
-class OCPNEB(DyNEB):
+class OCPNEB(BaseNEB):
     def __init__(
         self,
         images,
         k=5,
-        fmax=0.05,
         climb=False,
         parallel=False,
         remove_rotation_and_translation=False,
         world=None,
-        dynamic_relaxation=False,
-        scale_fmax=0.0,
         method="improvedtangent",
         allow_shared_calculator=True,
         precon=None,
         batch_size=8,
         dneb=False,
         vasp=False,
+        intermediate_minima=False,
+        intermediate_minima_min_depth=0.01,
     ):
-        """
-        Subclass of NEB that allows for scaled and dynamic optimizations of
-        images. This method, which only works in series, does not perform
-        force calls on images that are below the convergence criterion.
-        The convergence criteria can be scaled with a displacement metric
-        to focus the optimization on the saddle point region.
-
-        'Scaled and Dynamic Optimizations of Nudged Elastic Bands',
-        P. Lindgren, G. Kastlunger and A. A. Peterson,
-        J. Chem. Theory Comput. 15, 11, 5787-5793 (2019).
-
-        dynamic_relaxation: bool
-            True skips images with forces below the convergence criterion.
-            This is updated after each force call; if a previously converged
-            image goes out of tolerance (due to spring adjustments between
-            the image and its neighbors), it will be optimized again.
-            False reverts to the default NEB implementation.
-
-        fmax: float
-            Must be identical to the fmax of the optimizer.
-
-        scale_fmax: float
-            Scale convergence criteria along band based on the distance between
-            an image and the image with the highest potential energy. This
-            keyword determines how rapidly the convergence criteria are scaled.
-        """
         super().__init__(
             images,
             k=k,
             climb=climb,
-            fmax=fmax,
-            dynamic_relaxation=dynamic_relaxation,
             parallel=parallel,
             remove_rotation_and_translation=remove_rotation_and_translation,
             world=world,
             method=method,
             allow_shared_calculator=allow_shared_calculator,
             precon=precon,
-            scale_fmax=scale_fmax,
         )
         if dneb: self.neb_method = swDNEB(self)
         self.vasp = vasp
+        self.intermediate_minima = intermediate_minima
+        self.intermediate_minima_min_depth = abs(intermediate_minima_min_depth)
 
         if not self.vasp:
             from fairchem.core.common.utils import setup_imports, setup_logging
@@ -138,13 +110,25 @@ class OCPNEB(DyNEB):
 
 
     def get_forces(self):
-        if self.vasp:
+        if self.vasp and not self.intermediate_minima:
             return super().get_forces()
+        elif self.vasp:
+            # VASP + intermediate_minima: per-image evaluation + custom NEB forces
+            images = self.images[1:-1]
+            forces = np.array([img.get_forces() for img in images])
+            energies = np.empty(self.nimages)
+            energies[0] = self.images[0].get_potential_energy()
+            energies[-1] = self.images[-1].get_potential_energy()
+            for idx, img in enumerate(images):
+                energies[idx + 1] = img.get_potential_energy()
+            self.reactant_forces = self.images[0].get_forces()
+            self.product_forces = self.images[-1].get_forces()
+            forces = forces.reshape((len(images), self.natoms, 3))
+            return self.get_precon_forces(forces, energies, self.images)
         else:
             images = self.images[1:-1]
             if self.cached:
-                energies = self.intermediate_energies
-                forces = self.intermediate_forces
+                return self.intermediate_forces
             else:
                 energies_calcd = []
                 forces_calcd = []
@@ -171,7 +155,7 @@ class OCPNEB(DyNEB):
                 elif not np.equal(self.images[0].get_tags(), np.zeros(len(self.images[0]),int)).all():
                     fixed_atoms = np.array([idx for idx, tag in enumerate(self.images[0].get_tags()) if tag == 0])
                 else:
-                    fixed_atoms = np.array([],dtype=int) 
+                    fixed_atoms = np.array([],dtype=int)
 
                 for i in range(self.nimages - 2):
                     for fixed_atom in fixed_atoms:
@@ -184,65 +168,12 @@ class OCPNEB(DyNEB):
                 self.intermediate_energies = energies
                 self.cached = True
 
-            if not self.dynamic_relaxation:
                 return forces
-            """Get NEB forces and scale the convergence criteria to focus
-            optimization on saddle point region. The keyword scale_fmax
-            determines the rate of convergence scaling."""
-            n = self.natoms
-            for i in range(self.nimages - 2):
-                n1 = n * i
-                n2 = n1 + n
-                force = np.sqrt((forces[n1:n2] ** 2.0).sum(axis=1)).max()
-                n_imax = (self.imax - 1) * n  # Image with highest energy.
-
-                positions = self.get_positions()
-                pos_imax = positions[n_imax : n_imax + n]
-
-                """Scale convergence criteria based on distance between an
-                image and the image with the highest potential energy."""
-                rel_pos = np.sqrt(((positions[n1:n2] - pos_imax) ** 2).sum())
-                if force < self.fmax * (1 + rel_pos * self.scale_fmax):
-                    if i == self.imax - 1:
-                        # Keep forces at saddle point for the log file.
-                        pass
-                    else:
-                        # Set forces to zero before they are sent to optimizer.
-                        forces[n1:n2, :] = 0
-
-        return forces
 
     def set_positions(self, positions):
-        if self.vasp:
-            return super().set_positions(positions)
-        else:
+        if not self.vasp:
             self.cached = False
-            if not self.dynamic_relaxation:
-                return super().set_positions(positions)
-
-            n1 = 0
-            # old_positions = self.images[0].get_positions()
-            # tags_hier = [self.images[i].get_tags() for i in range(self.nimages)]
-            # tags = [x for l in tags_hier for x in l]
-            for i, image in enumerate(self.images[1:-1]):
-                if self.parallel:
-                    msg = (
-                        "Dynamic relaxation does not work efficiently "
-                        "when parallelizing over images. Try AutoNEB "
-                        "routine for freezing images in parallel."
-                    )
-                    raise ValueError(msg)
-                else:
-                    forces_dyn = self._fmax_all(self.images)
-                    if forces_dyn[i] < self.fmax:
-                        n1 += self.natoms
-                    else:
-                        n2 = n1 + self.natoms
-                        # new_positions = [old_positions[idx-n1] if tags[idx] == 0 else positions[idx] for idx in range(n1,n2)]
-                        # image.set_positions(new_positions)
-                        image.set_positions(positions[n1:n2])
-                        n1 = n2
-        return None
+        return super().set_positions(positions)
 
     def get_precon_forces(self, forces, energies, images):
         if self.precon is None or isinstance(self.precon, (str, Precon, list)):
@@ -261,9 +192,33 @@ class OCPNEB(DyNEB):
 
         state = NEBState(self, images, energies)
 
-        # Can we get rid of self.energies, self.imax, self.emax etc.?
-        self.imax = state.imax
-        self.emax = state.emax
+        # Determine climbing and intermediate minima image sets
+        imin_set = set()
+        if self.intermediate_minima:
+            for i in range(2, self.nimages - 2):  # exclude endpoint-adjacent images to ensure each segment has room for a CI
+                if (energies[i] < energies[i - 1] - self.intermediate_minima_min_depth and
+                        energies[i] < energies[i + 1] - self.intermediate_minima_min_depth):
+                    imin_set.add(i)
+        climbing_set = set()
+        if self.climb:
+            if imin_set:
+                # Per-segment climbing: highest energy interior image per segment
+                boundaries = sorted([0] + list(imin_set) + [self.nimages - 1])
+                for s in range(len(boundaries) - 1):
+                    inner = [idx for idx in range(boundaries[s] + 1, boundaries[s + 1])
+                             if idx not in imin_set]
+                    if inner:
+                        climbing_set.add(max(inner, key=lambda idx: energies[idx]))
+            else:
+                climbing_set.add(state.imax)
+
+        # Set imax to the global highest energy among climbing images (for result collection)
+        if climbing_set:
+            self.imax = max(climbing_set, key=lambda idx: energies[idx])
+            self.emax = energies[self.imax]
+        else:
+            self.imax = state.imax
+            self.emax = state.emax
 
         spring1 = state.spring(0)
 
@@ -278,13 +233,11 @@ class OCPNEB(DyNEB):
             # from now on we use the preconditioned forces (equal for precon=ID)
             imgforce = precon_forces[i - 1]
 
-            if i == self.imax and self.climb:
-                """The climbing image, imax, is not affected by the spring
-                forces. This image feels the full PES-derived force,
-                but the tangential component is inverted:
-                see Eq. 5 in paper II."""
+            if i in imin_set:
+                pass  # Full PES force, no spring force, no tangential modification
+            elif i in climbing_set:
                 if self.method == "aseneb":
-                    tangent_mag = np.vdot(tangent, tangent)  # For normalizing
+                    tangent_mag = np.vdot(tangent, tangent)
                     imgforce -= 2 * tangential_force / tangent_mag * tangent
                 else:
                     imgforce -= 2 * tangential_force * tangent
