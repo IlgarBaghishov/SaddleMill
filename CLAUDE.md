@@ -75,8 +75,8 @@ catsunami/ocpneb.py  (OCPNEB: batched NEB with swDNEB switching)
 - **Per-attempt error handling**: Each dimer attempt has its own try/except, so one failing attempt does not abort remaining attempts for the same structure
 - **Consecutive error tracking**: Tracks structure-level errors via `consecutive_errors` counter (passed from `init_function`). If all attempts for a structure fail, counter increments; any successful attempt resets it to 0. When counter reaches `max_consecutive_errors`, worker calls `sys.exit(1)` to trigger executorlib restart (see Worker Health section)
 
-### `dimertools/structure_edit.py` - Bulk Reaction Types for Dimer
-Bulk dimer mode supports 6 reaction types, configured via `reaction_types` (space-separated list):
+### `dimertools/structure_edit.py` - Reaction Types for Dimer
+Dimer mode supports 7 reaction types, configured via `reaction_types` (space-separated list):
 
 | Type | Function | Description | Atoms displaced |
 |------|----------|-------------|-----------------|
@@ -86,14 +86,15 @@ Bulk dimer mode supports 6 reaction types, configured via `reaction_types` (spac
 | `kickout_reuse` | `get_kickout_reuse_attempts()` | Existing atom placed at interstitial, kicks nearest lattice atom into another interstitial | 2 (vector) |
 | `kickout_insert` | `get_kickout_insert_attempts()` | New similar-sized atom inserted at interstitial, kicks nearest lattice atom | 2 (vector) |
 | `ring` | `get_ring_attempts()` | Ring of 2+ atoms rotate cooperatively; size randomly sampled from `ring_sizes` config. Use `ring_sizes = 2` for pairwise exchange. | N (vector) |
+| `initial_guess` | `get_initial_guess_attempts()` | No displacement — dimer starts from input geometry as-is. For pre-prepared TS guesses. Exclusive: ignores other types with warning. Always 1 attempt. Works with both `bulk` and `oc` dataset types. | 0 (none) |
 
 **Key infrastructure:**
 - `find_interstitial_sites(atoms)`: Voronoi tessellation on 3x3x3 periodic images → filter by min distance from atoms → cluster within 0.5 Å. Uses `scipy.spatial.Voronoi` and `scipy.cluster.hierarchy`.
 - `_mic_vector()` / `_nearest_site()`: Minimum image convention helpers for periodic distance calculations.
 - `_find_ring(neighbors_dict, seed, ring_size)`: Finds closed rings of connected atoms in the neighbor graph via constrained random walk. Ring size=2 handles pairwise exchange, ring size>=3 handles cooperative ring rotations.
 - Element sampling: `hop_insert` uses small atoms weighted by 1/covalent_radius (H heavily favored). `kickout_insert` uses Gaussian weight centered on host avg covalent radius (σ=0.2 Å) from a pool of 30 common metals/semiconductors.
-- `turn_into_supercell(atoms, min_length=7.0)`: Preserves `.info` across `make_supercell()` (ASE's `make_supercell` drops `.info`). Enforces minimum cell dimension of 7 Å in each periodic direction to avoid self-interaction artifacts through PBC (important for fairchem's radius graph which uses a 5 Å cutoff).
-- Dispatch: `_REACTION_TYPE_DISPATCH` dict maps type names to functions. `get_attempts()` iterates over configured types.
+- `turn_into_supercell(atoms, min_length=7.0)`: Preserves `.info` across `make_supercell()` (ASE's `make_supercell` drops `.info`). Enforces minimum cell dimension of 7 Å in each periodic direction to avoid self-interaction artifacts through PBC (important for fairchem's radius graph which uses a 5 Å cutoff). Called centrally in `get_attempts()` (controlled by `supercell` config option, default `True`).
+- Dispatch: `_REACTION_TYPE_DISPATCH` dict maps type names to functions. `get_attempts()` iterates over configured types. `initial_guess` is handled early (before bulk/oc branch) since it works with both dataset types.
 - `_safe_normalize(vec)`: Normalizes a vector; returns a random unit vector if norm is near zero (prevents division-by-zero in ring displacement calculations).
 - `_build_neighbor_dict(atoms)`: Builds neighbor graph; skips self-interactions (`i == j`) which can occur in small periodic cells.
 - Defensive guards throughout: zero-weight fallback in `_sample_kickout_insert_element`, empty `ring_sizes` early return, missing adsorbate atoms early return in OC mode.
@@ -194,9 +195,10 @@ allow_shared_calculator = True
 [ourDimer]
 dataset_type = oc            # oc | bulk
 num_attempts = 3             # Used for oc mode attempt count
-reaction_types = vacancy     # Space-separated: vacancy hop_reuse hop_insert kickout_reuse kickout_insert ring
+reaction_types = vacancy     # Space-separated: vacancy hop_reuse hop_insert kickout_reuse kickout_insert ring initial_guess
 num_attempts_per_type = 1    # Attempts per reaction type (bulk mode); total = len(types) * num_per_type
 ring_sizes = 3 4             # Ring sizes to sample from for 'ring' reaction type
+supercell = True             # Apply supercell expansion (min 7 Å) before generating attempts
 delocalization_threshold = 0.8
 extension_check_fmax = 0.4
 extension_check_curvature = -0.2

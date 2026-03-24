@@ -206,7 +206,6 @@ def get_vacancy_attempts(atoms, config_dict, num_attempts):
     With 10% probability, the directed displacement is replaced by Gaussian noise centred
     on the primary atom (allows the dimer to discover unexpected reaction paths).
     """
-    atoms = turn_into_supercell(atoms)
     cell = atoms.get_cell()
     i_idx, j_idx = neighbor_list('ij', atoms, 3.5)
 
@@ -330,7 +329,6 @@ def get_hop_reuse_attempts(atoms, num_attempts):
     With 10% probability, Gaussian noise is used instead to allow discovery of
     unexpected paths.
     """
-    atoms = turn_into_supercell(atoms)
     sites = find_interstitial_sites(atoms)
 
     if len(sites) == 0:
@@ -373,7 +371,6 @@ def get_hop_insert_attempts(atoms, num_attempts):
 
     With 10% probability, Gaussian noise is used instead.
     """
-    atoms = turn_into_supercell(atoms)
     sites = find_interstitial_sites(atoms)
 
     if len(sites) < 2:
@@ -427,7 +424,6 @@ def get_kickout_reuse_attempts(atoms, num_attempts):
     The original lattice structure is preserved in frame 0; only the displacement
     vectors encode the mechanism. With 10% probability, Gaussian noise is used instead.
     """
-    atoms = turn_into_supercell(atoms)
     sites = find_interstitial_sites(atoms)
 
     if len(sites) < 2:
@@ -486,7 +482,6 @@ def get_kickout_insert_attempts(atoms, num_attempts):
     5. Kicked atom displaced halfway toward site B.
     With 10% probability, Gaussian noise is used instead.
     """
-    atoms = turn_into_supercell(atoms)
     sites = find_interstitial_sites(atoms)
 
     if len(sites) < 2:
@@ -635,7 +630,6 @@ def get_ring_attempts(atoms, config_dict, num_attempts):
     if not ring_sizes:
         return [], [], []
 
-    atoms = turn_into_supercell(atoms)
     neighbors_dict = _build_neighbor_dict(atoms)
     cell = atoms.get_cell()
 
@@ -650,6 +644,21 @@ def get_ring_attempts(atoms, config_dict, num_attempts):
     return images, displacement_dicts, selected_indices
 
 
+# --- Initial guess (no displacement) ---
+
+def get_initial_guess_attempts(atoms):
+    """Return the structure as-is with a negligible displacement for eigenmode initialization.
+
+    Used when the input geometry is already a good TS guess and only dimer
+    refinement (rotation + translation) is needed — no random perturbation.
+    Always produces exactly 1 attempt.
+    """
+    atoms_new = atoms.copy()
+    atoms_new.info['reaction_type'] = 'initial_guess'
+    disp_vector = np.random.randn(len(atoms_new), 3) * 1e-10
+    return [atoms_new], [{"displacement_vector": disp_vector, "method": "vector"}], [-1]
+
+
 # --- Main dispatch ---
 
 _REACTION_TYPE_DISPATCH = {
@@ -659,6 +668,7 @@ _REACTION_TYPE_DISPATCH = {
     "kickout_reuse": lambda atoms, config_dict, n: get_kickout_reuse_attempts(atoms, n),
     "kickout_insert": lambda atoms, config_dict, n: get_kickout_insert_attempts(atoms, n),
     "ring": lambda atoms, config_dict, n: get_ring_attempts(atoms, config_dict, n),
+    "initial_guess": lambda atoms, config_dict, n: get_initial_guess_attempts(atoms),
 }
 
 
@@ -666,22 +676,55 @@ def get_attempts(atoms, config_dict):
 
     atoms = atoms.copy()
 
+    # Centralized supercell expansion (controlled by config, default True)
+    if config_dict["ourDimer"].get("supercell", True):
+        atoms = turn_into_supercell(atoms)
+
+    # --- Handle initial_guess early (works for both bulk and oc) ---
+    reaction_types = config_dict["ourDimer"].get("reaction_types")
+    if isinstance(reaction_types, str):
+        reaction_types_list = reaction_types.split() if ' ' in reaction_types else [reaction_types]
+    elif isinstance(reaction_types, list):
+        reaction_types_list = reaction_types
+    else:
+        reaction_types_list = []
+
+    if "initial_guess" in reaction_types_list:
+        other_types = [rt for rt in reaction_types_list if rt != "initial_guess"]
+        if other_types:
+            warnings.warn(f"'initial_guess' is exclusive — ignoring other reaction types: {other_types}")
+
+        dataset_type = config_dict["ourDimer"]["dataset_type"]
+        if dataset_type == "bulk":
+            num_per_type = config_dict["ourDimer"].get("num_attempts_per_type", 1)
+            if num_per_type is not None and num_per_type > 1:
+                warnings.warn(f"'initial_guess' always produces 1 attempt — ignoring num_attempts_per_type={num_per_type}")
+        elif dataset_type == "oc":
+            num_attempts = config_dict["ourDimer"].get("num_attempts", 1)
+            if num_attempts is not None and num_attempts > 1:
+                warnings.warn(f"'initial_guess' always produces 1 attempt — ignoring num_attempts={num_attempts}")
+            # Apply OC constraints (fix substrate atoms)
+            tags = atoms.get_tags()
+            indices = np.where(tags == 0)[0]
+            atoms.set_constraint(FixAtoms(indices=indices))
+
+        return get_initial_guess_attempts(atoms)
+
+    # --- Normal dispatch ---
+
     images = []
     displacement_dicts = []
     selected_indices = []
 
     if config_dict["ourDimer"]["dataset_type"] == "bulk":
 
-        reaction_types = config_dict["ourDimer"].get("reaction_types")
         if reaction_types is None:
             raise ValueError("Configuration error: 'ourDimer' -> 'reaction_types' is not set. "
                              "Please specify reaction types (e.g., 'vacancy') in config.ini")
-        if isinstance(reaction_types, str):
-            reaction_types = [reaction_types]
 
         num_per_type = config_dict["ourDimer"].get("num_attempts_per_type", 1)
 
-        for rtype in reaction_types:
+        for rtype in reaction_types_list:
             if rtype not in _REACTION_TYPE_DISPATCH:
                 supported = ", ".join(_REACTION_TYPE_DISPATCH.keys())
                 raise ValueError(f"Unknown reaction type: '{rtype}'. "
