@@ -22,7 +22,13 @@ def init_function(executorlib_worker_id=None):
                     break
                 else:
                     gpu_ID -= config_dict['Main']['jobs_per_gpu']*ngpus
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ID%ngpus)
+            physical_gpu = gpu_ID % ngpus
+            mps_pipe = f"/tmp/mps_{physical_gpu}"
+            if os.path.exists(os.path.join(mps_pipe, "control")):
+                os.environ["CUDA_MPS_PIPE_DIRECTORY"] = mps_pipe
+                os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(physical_gpu)
 
     # Print resource info for this worker
     hostname = socket.gethostname()
@@ -30,7 +36,8 @@ def init_function(executorlib_worker_id=None):
     print(f"Worker {executorlib_worker_id} started on node {hostname}", flush=True)
     print(f"  CPUs: {cpus}", flush=True)
     if is_gpu_job:
-        print(f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}", flush=True)
+        print(f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}"
+              f"  MPS: {os.environ.get('CUDA_MPS_PIPE_DIRECTORY', 'off')}", flush=True)
 
     calc = load_calculator(config_dict)
     if config_dict["Main"]["Calculator"] not in ("Vasp", "VaspInteractive"):  # Then initialize, store on device memory and share the calculator object between structures
