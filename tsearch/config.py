@@ -43,7 +43,8 @@ class ConfigManager:
             "batch_size": 4,
             "DNEB": False,
             "intermediate_minima": False,
-            "intermediate_minima_min_depth": 0.01,
+            "intermediate_minima_after_steps": 0,
+            "intermediate_minima_min_depth": 0.05,
         },
         "ourDimer": {
             "dataset_type": None,

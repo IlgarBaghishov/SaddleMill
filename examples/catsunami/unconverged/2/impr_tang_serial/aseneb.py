@@ -24,7 +24,6 @@ neb = NEB(
     climb=True,
     method="improvedtangent",
     allow_shared_calculator=False,
-    dynamic_relaxation=False,
 )
 
 neb.interpolate()

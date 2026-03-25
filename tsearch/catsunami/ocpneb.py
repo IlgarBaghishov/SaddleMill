@@ -68,7 +68,7 @@ class OCPNEB(BaseNEB):
         dneb=False,
         vasp=False,
         intermediate_minima=False,
-        intermediate_minima_min_depth=0.01,
+        intermediate_minima_min_depth=0.05,
     ):
         super().__init__(
             images,

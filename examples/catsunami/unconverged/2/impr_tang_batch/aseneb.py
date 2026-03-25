@@ -44,7 +44,6 @@ neb0 = NEB(
     climb=True,
     method=neb_method,
     allow_shared_calculator=False,
-    dynamic_relaxation=False,
 )
 neb0.interpolate(method=interpolate_method[4:], mic=True)
 
@@ -57,7 +56,6 @@ neb = OCPNEB(
     climb=True,
     method=neb_method,
     allow_shared_calculator=True,
-    dynamic_relaxation=False,
     batch_size=8, # If you get a memory error, try reducing it to 4
 )
 
@@ -82,7 +80,6 @@ max_force = nebtools.get_fmax(
     climb=True,
     method=neb_method,
     allow_shared_calculator=True,
-    dynamic_relaxation=False,
     )
 
 print(f'Diffusion barrier: {Ef:.3f} eV and {dE:.3f} eV')

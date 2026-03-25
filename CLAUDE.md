@@ -53,14 +53,15 @@ catsunami/ocpneb.py  (OCPNEB: batched NEB with swDNEB switching)
 1. **Continuation check**: If images carry `_continuation` flag in `orig_info` (set by `continue_from_result`), locally overrides `relax_endpoints = False` and `interpolate_method = False` — skips steps 2-3 below and goes straight to NEB optimization from the extracted band.
 2. **Endpoint relaxation** (optional): Relaxes reactant/product with configurable optimizer (e.g., LBFGS). For VaspInteractive, calculators are finalized after relaxation and endpoints are frozen with `SinglePointCalculator`.
 3. **Interpolation**: `ocp_idpp` (Meta's PBC-aware), `ase_idpp`, `ase_linear` (auto-falls back to IDPP on atom overlap), or `False` (use provided frames)
-4. **NEB optimization**: Uses `OCPNEB` class with MDMin optimizer. Supports climbing image. For VASP/VaspInteractive, each image gets its own calculator instance with separate working directories (`VASP_{job_id}_{image_idx}/`), separate `command`/`ncore` settings for endpoints vs intermediates, and WAVECAR/CHG/CHGCAR cleanup after completion.
+4. **NEB optimization**: Uses `OCPNEB` class with MDMin optimizer. Supports climbing image and intermediate minima detection (per-segment climbing). For VASP/VaspInteractive, each image gets its own calculator instance with separate working directories (`VASP_{job_id}_{image_idx}/`), separate `command`/`ncore` settings for endpoints vs intermediates, and WAVECAR/CHG/CHGCAR cleanup after completion. When `intermediate_minima_after_steps > 0`, the optimization runs in two phases: regular NEB first, then intermediate-minima-aware NEB if not yet converged.
 5. **Output**: Extracts critical image (TS candidate) with tangent vector as eigenmode, barrier height, and reaction energetics. Generates band plot PNG.
 
 ### `catsunami/ocpneb.py` - Core NEB Engine
 - **`OCPNEB`** (extends BaseNEB): Two modes controlled by `vasp` flag:
   - **FAIRChem mode** (`vasp=False`): Batch-evaluates intermediate images via FAIRChemCalculator for efficiency. Caches forces between calls. fairchem imports are lazy (only loaded in this mode).
-  - **VASP mode** (`vasp=True`): Delegates to parent `BaseNEB` for standard per-image force evaluation. Each image has its own VASP calculator. No batching, no caching, no fairchem dependency at runtime.
+  - **VASP mode** (`vasp=True`): Delegates to parent `BaseNEB` for standard per-image force evaluation. Each image has its own VASP calculator. No batching, no caching, no fairchem dependency at runtime. When `intermediate_minima=True`, VASP mode bypasses `BaseNEB.get_forces()` and evaluates images individually so it can route through the custom `get_precon_forces()` where the intermediate minima logic lives.
   - Both modes: Handles constraints (fixed atoms by tag=0 or explicit constraints). Stores full `real_forces` array `(nimages, natoms, 3)` including endpoint forces for uniform access via `real_forces[imax]`.
+- **Intermediate minima support**: When `intermediate_minima=True`, `get_precon_forces()` scans images 2 through `nimages-3` for local energy minima (energy lower than both neighbors by at least `intermediate_minima_min_depth`). Detected minima receive full PES forces (no spring forces, no tangent projection) so they relax freely into the energy basin. The band is split into segments at these minima, and each segment gets its own climbing image (highest-energy interior image in the segment). `imax` is set to the global highest-energy climbing image. Endpoint-adjacent images (1 and `nimages-2`) are excluded from minima detection to ensure each segment has room for a climbing image.
 - **`swDNEB`** (NEBMethod subclass): Implements the switched Doubly Nudged Elastic Band method (works with both FAIRChem and VASP modes):
   - Uses improved tangent vectors (energy-weighted at extrema)
   - Adds perpendicular spring force component to straighten the band
@@ -191,6 +192,9 @@ interpolate_method = ase_linear    # ocp_idpp | ase_idpp | ase_linear | False
 num_frames = 10                    # Number of NEB images
 batch_size = 8                     # Batch size for FAIRChem inference (ignored in VASP mode)
 DNEB = True                        # Enable switched DNEB
+intermediate_minima = True         # Detect intermediate minima and do per-segment climbing image NEB
+intermediate_minima_after_steps = 500  # Run regular NEB for N steps first, then enable intermediate minima if not converged (0 = from the start)
+intermediate_minima_min_depth = 0.05   # Min energy dip (eV) below both neighbors to count as intermediate minimum
 # VASP-only settings (required when Calculator = Vasp or VaspInteractive):
 vasp_command_endpoints = "srun --exclusive -n 64 vasp_std"
 vasp_ncore_endpoints = 8           # NCORE for endpoint relaxation VASP jobs

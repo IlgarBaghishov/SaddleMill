@@ -158,12 +158,16 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
             neb_kwargs.setdefault("parallel", True)
             neb_kwargs["allow_shared_calculator"] = False
 
+        use_intermediate_minima = config_dict["ourNEB"]["intermediate_minima"]
+        intermediate_minima_after_steps = config_dict["ourNEB"]["intermediate_minima_after_steps"]
+        total_steps = config_dict["Main"]["steps"]
+
         neb = OCPNEB(
             images,
             batch_size = config_dict["ourNEB"]["batch_size"], # If you get a memory error, try reducing it to 4
             dneb = config_dict["ourNEB"]["DNEB"],
             vasp = is_vasp,
-            intermediate_minima = config_dict["ourNEB"]["intermediate_minima"],
+            intermediate_minima = use_intermediate_minima and intermediate_minima_after_steps == 0,
             intermediate_minima_min_depth = config_dict["ourNEB"]["intermediate_minima_min_depth"],
             **neb_kwargs,
         )
@@ -173,7 +177,15 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
                            trajectory = temp_traj,
                            **config_dict[config_dict["Main"]["Optimizer"]],
                            )
-        converged = opt.run(fmax = config_dict["Main"]["fmax"], steps = config_dict["Main"]["steps"])
+
+        if use_intermediate_minima and intermediate_minima_after_steps > 0:
+            phase1_steps = min(intermediate_minima_after_steps, total_steps)
+            converged = opt.run(fmax = config_dict["Main"]["fmax"], steps = phase1_steps)
+            if not converged:
+                neb.intermediate_minima = True
+                converged = opt.run(fmax = config_dict["Main"]["fmax"], steps = total_steps - phase1_steps)
+        else:
+            converged = opt.run(fmax = config_dict["Main"]["fmax"], steps = total_steps)
 
         if config_dict["Main"]["Calculator"] == "VaspInteractive":
             for img in neb.images[1:-1]:
