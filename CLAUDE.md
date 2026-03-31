@@ -46,7 +46,7 @@ catsunami/ocpneb.py  (OCPNEB: batched NEB with swDNEB switching)
 - `load_calculator()`: Returns calculator class/callable based on config (`FAIRChemCalculator`, `Vasp`, or `VaspInteractive`). For FAIRChem, returns `from_model_checkpoint` method; for VASP calculators, returns the class itself. Instantiation is deferred to `init_function.py` (for FAIRChem) or `nebopt.py` (for VASP, per-image).
 - `load_method()`: Imports the correct optimization function
 - `load_optimizer()`: Returns optimizer class(es) - for NEB returns (endpoint_optimizer, neb_optimizer)
-- `get_trajes_and_indices()`: Scans dir_path for .traj files, splits into job batches
+- `get_trajes_and_indices()`: Recursively scans dir_path (including subdirectories) for .traj files, splits into job batches
 - Resume support: `get_remaining_trajes()` skips completed jobs
 
 ### `nebopt.py` - NEB Workflow

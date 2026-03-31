@@ -206,7 +206,7 @@ done
 
 ### Running tsearch
 
-Create a `config.ini` in your working directory (see `CLAUDE.md` for full reference), place your input `.traj` files in `dir_path`, then launch:
+Create a `config.ini` in your working directory (see `CLAUDE.md` for full reference), place your input `.traj` files in `dir_path` (subdirectories are scanned recursively), then launch:
 
 ```bash
 # Distributed (multi-node, multi-GPU)
