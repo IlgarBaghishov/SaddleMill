@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH -J lematbulk_ls6_undone
+#SBATCH -J lematbulk_pm_undone
 #SBATCH --account=m1883_g
 #SBATCH --constraint=gpu
 #SBATCH --gpus-per-node=4
@@ -35,7 +35,7 @@ flux start -o,--config-path='"$PWD"' python -u -m tsearch
 
 # Stop MPS daemons
 for i in 0 1 2 3; do
-    CUDA_MPS_PIPE_DIRECTORY=/tmp/mps_$i echo quit | nvidia-cuda-mps-control 2>/dev/null
+    echo quit | CUDA_MPS_PIPE_DIRECTORY=/tmp/mps_$i nvidia-cuda-mps-control 2>/dev/null
 done
 '
 

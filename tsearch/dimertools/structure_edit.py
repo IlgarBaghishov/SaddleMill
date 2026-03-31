@@ -686,11 +686,7 @@ def get_attempts(atoms, config_dict):
 
     atoms = atoms.copy()
 
-    # Centralized supercell expansion (controlled by config, default True)
-    if config_dict["ourDimer"].get("supercell", True):
-        atoms = turn_into_supercell(atoms)
-
-    # --- Handle initial_guess early (works for both bulk and oc) ---
+    # --- Handle initial_guess early (no supercell, works for both bulk and oc) ---
     reaction_types = config_dict["ourDimer"].get("reaction_types")
     if isinstance(reaction_types, str):
         reaction_types_list = reaction_types.split() if ' ' in reaction_types else [reaction_types]
@@ -719,6 +715,10 @@ def get_attempts(atoms, config_dict):
             atoms.set_constraint(FixAtoms(indices=indices))
 
         return get_initial_guess_attempts(atoms)
+
+    # Centralized supercell expansion (controlled by config, default True)
+    if config_dict["ourDimer"].get("supercell", True):
+        atoms = turn_into_supercell(atoms)
 
     # --- Normal dispatch ---
 

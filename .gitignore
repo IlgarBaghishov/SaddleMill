@@ -28,4 +28,4 @@ examples/dimeropt_executorlib/
 # examples/dimeropt_lematbulk/
 examples/nebopt_vasp_oc20neb/*
 !examples/nebopt_vasp_oc20neb/config.ini
-!**/*.sh
+!examples/**/*.sh

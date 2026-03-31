@@ -40,11 +40,13 @@ class ConfigManager:
             "endpoint_relax_steps": 500,
             "interpolate_method": "ase_linear",
             "num_frames": 10,
+            "max_num_frames": None,
             "batch_size": 4,
             "DNEB": False,
             "intermediate_minima": False,
-            "intermediate_minima_after_steps": 0,
+            "intermediate_minima_check_interval": 100,
             "intermediate_minima_min_depth": 0.05,
+            "add_images_check_interval": 100,
         },
         "ourDimer": {
             "dataset_type": None,
@@ -261,18 +263,11 @@ def get_trajes_and_indices(config_dict):
     return trajes_and_idxs
 
 
-def create_results_directories(config_dict, exist_ok=False):
+def create_results_directories(config_dict):
     method_name = config_dict["Main"]["method"]
     dirs = [f"{method_name}_status_csvs", f"{method_name}_trajes", f"{method_name}_debug_zips"]
-    if exist_ok:
-        for d in dirs:
-            if os.path.isdir(d) and os.listdir(d):
-                raise RuntimeError(
-                    f"Directory '{d}' already contains files from a previous run. "
-                    f"Cannot start fresh. Delete output directories and "
-                    f"traj_files_ordered.json first.")
     for d in dirs:
-        pathlib.Path(d).mkdir(exist_ok=exist_ok)
+        pathlib.Path(d).mkdir(exist_ok=False)
 
 
 def get_previous_job_status_df(config_dict):
@@ -309,7 +304,10 @@ def _normalize_run_jobs(run_jobs_value):
 
 
 def _categorize_job(statuses):
-    """Aggregate a list of status strings into a single job category."""
+    """Aggregate a list of status strings into a single job category.
+
+    converged_only_CI maps to the converged category for resume purposes.
+    """
     if any(s.startswith("converged") for s in statuses):
         return "converged"
     if all(s.startswith("error") for s in statuses):

@@ -2,10 +2,11 @@ import os
 import sys
 import shutil
 import traceback
+import warnings
+import zipfile
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import zipfile, os
 import numpy as np
 from ase.data import covalent_radii
 from ase.calculators.singlepoint import SinglePointCalculator
@@ -13,6 +14,97 @@ from ase.io import Trajectory
 from ase.mep.neb import NEB, NEBTools, NEBState
 from tsearch.catsunami.ocpneb import OCPNEB
 from tsearch.tools import backup_flux_logs
+
+
+def _find_segment_ci(seg_start, seg_end, climbing_set, energies):
+    """Find the climbing-image index for a segment [seg_start, seg_end].
+
+    Returns the CI index, or None if the segment has no interior images.
+    """
+    for ci_idx in climbing_set:
+        if seg_start < ci_idx < seg_end:
+            return ci_idx
+    interior = [j for j in range(seg_start + 1, seg_end)]
+    if interior:
+        return max(interior, key=lambda idx: energies[idx])
+    return None
+
+
+def _expand_band(neb, fmax_threshold, max_num_frames, num_frames, calc):
+    """Insert midpoint images into unconverged segments (doubles each segment).
+
+    For each segment whose CI has effective fmax >= fmax_threshold, inserts one
+    new image between every consecutive pair (n -> 2n-1 images in that segment).
+    Skips a segment if doubling it would exceed num_frames per segment or
+    push the total band past max_num_frames.
+
+    Returns new images list, or None if no images could be added.
+    """
+    imin_set = neb._imin_set
+    climbing_set = neb._climbing_set
+    boundaries = sorted([0] + list(imin_set) + [neb.nimages - 1])
+
+    expand_gaps = set()
+    current_total = len(neb.images)
+
+    for s in range(len(boundaries) - 1):
+        seg_start = boundaries[s]
+        seg_end = boundaries[s + 1]
+        seg_size = seg_end - seg_start + 1
+
+        seg_ci = _find_segment_ci(seg_start, seg_end, climbing_set, neb.energies)
+        if seg_ci is None:
+            continue
+
+        if neb.image_fmax[seg_ci] < fmax_threshold:
+            continue
+
+        # Per-segment cap: doubling would give 2*seg_size - 1
+        if 2 * seg_size - 1 > num_frames:
+            continue
+
+        images_to_add = seg_end - seg_start  # number of gaps in segment
+        if current_total + images_to_add > max_num_frames:
+            continue
+
+        for gap_left in range(seg_start, seg_end):
+            expand_gaps.add(gap_left)
+        current_total += images_to_add
+
+    if not expand_gaps:
+        return None
+
+    # Build new image list with IDPP-interpolated midpoints
+    # Same logic as initial band setup: linear + MIC, check overlaps, fall back to IDPP
+    radii = np.array([covalent_radii[z] for z in neb.images[0].numbers])
+    radii_sum = radii[:, None] + radii[None, :]
+
+    new_images = [neb.images[0]]
+    for img_idx in range(1, len(neb.images)):
+        if (img_idx - 1) in expand_gaps:
+            prev = neb.images[img_idx - 1]
+            curr = neb.images[img_idx]
+            mini_images = [prev.copy(), prev.copy(), curr.copy()]
+            mini_neb = NEB(mini_images)
+            mini_neb.interpolate(method='linear', mic=True)
+            # Check for atom overlap; fall back to IDPP if needed
+            dists = mini_images[1].get_all_distances(mic=True)
+            np.fill_diagonal(dists, np.inf)
+            if np.any(dists < 0.6 * radii_sum):
+                try:
+                    mini_neb.interpolate(method='idpp', mic=True)
+                except Exception:
+                    warnings.warn(
+                        f"IDPP interpolation failed for midpoint between images "
+                        f"{img_idx - 1} and {img_idx}, and the linear midpoint "
+                        f"has overlapping atoms. Keeping it anyway."
+                    )
+            midpoint = mini_images[1]
+            midpoint.calc = calc
+            new_images.append(midpoint)
+        new_images.append(neb.images[img_idx])
+
+    return new_images
 
 
 def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, executorlib_worker_id=None):
@@ -49,9 +141,30 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
     if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
         temp_files.extend([f"VASP_{i}_{image_idx}" for image_idx in range(num_frames)])
 
-    def log_status(status_msg):
+    def log_status(status_msg, sub_band_id=0):
         with open(status_file, 'a') as f:
-            f.write(f"{i},{rank},{status_msg}\n")
+            f.write(f"{i},{rank},{sub_band_id},{status_msg}\n")
+
+    def _cleanup_temp_files():
+        if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
+            for image_idx in range(num_frames):
+                for vasp_heavy_files in [f'VASP_{i}_{image_idx}/WAVECAR',f'VASP_{i}_{image_idx}/CHG',f'VASP_{i}_{image_idx}/CHGCAR']:
+                    if os.path.exists(vasp_heavy_files): os.remove(vasp_heavy_files)
+        existing_files = [f for f in temp_files if os.path.exists(f)]
+        if existing_files and config_dict['Main']['zip']:
+            with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
+                for f_name in existing_files:
+                    if os.path.isdir(f_name):
+                        for root, dirs, files in os.walk(f_name):
+                            for file in files:
+                                zf.write(os.path.join(root, file))
+                    else:
+                        zf.write(f_name, arcname=f_name)
+            for f_name in existing_files:
+                if os.path.isdir(f_name):
+                    shutil.rmtree(f_name)
+                else:
+                    os.remove(f_name)
 
     try:
         reactant = images[0]
@@ -159,97 +272,131 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
             neb_kwargs["allow_shared_calculator"] = False
 
         use_intermediate_minima = config_dict["ourNEB"]["intermediate_minima"]
-        intermediate_minima_after_steps = config_dict["ourNEB"]["intermediate_minima_after_steps"]
         total_steps = config_dict["Main"]["steps"]
+        fmax = config_dict["Main"]["fmax"]
+        max_num_frames = config_dict["ourNEB"]["max_num_frames"]
+        if max_num_frames is None:
+            max_num_frames = num_frames
+        can_add_images = not is_vasp and max_num_frames > num_frames
+        add_images_check_interval = config_dict["ourNEB"]["add_images_check_interval"]
+        optimizer_kwargs = config_dict[config_dict["Main"]["Optimizer"]]
 
         neb = OCPNEB(
             images,
-            batch_size = config_dict["ourNEB"]["batch_size"], # If you get a memory error, try reducing it to 4
-            dneb = config_dict["ourNEB"]["DNEB"],
-            vasp = is_vasp,
-            intermediate_minima = use_intermediate_minima and intermediate_minima_after_steps == 0,
-            intermediate_minima_min_depth = config_dict["ourNEB"]["intermediate_minima_min_depth"],
+            batch_size=config_dict["ourNEB"]["batch_size"],
+            dneb=config_dict["ourNEB"]["DNEB"],
+            vasp=is_vasp,
+            intermediate_minima=use_intermediate_minima,
+            intermediate_minima_min_depth=config_dict["ourNEB"]["intermediate_minima_min_depth"],
+            intermediate_minima_check_interval=config_dict["ourNEB"]["intermediate_minima_check_interval"],
             **neb_kwargs,
         )
 
-        opt = Optimizer[1](neb,
-                           logfile = temp_log,
-                           trajectory = temp_traj,
-                           **config_dict[config_dict["Main"]["Optimizer"]],
-                           )
+        opt = Optimizer[1](neb, logfile=temp_log, trajectory=temp_traj, **optimizer_kwargs)
 
-        if use_intermediate_minima and intermediate_minima_after_steps > 0:
-            phase1_steps = min(intermediate_minima_after_steps, total_steps)
-            converged = opt.run(fmax = config_dict["Main"]["fmax"], steps = phase1_steps)
-            if not converged:
-                neb.intermediate_minima = True
-                converged = opt.run(fmax = config_dict["Main"]["fmax"], steps = total_steps - phase1_steps)
+        # Optimization loop with optional image addition
+        if can_add_images:
+            remaining_steps = total_steps
+            converged = False
+            while remaining_steps > 0 and not converged:
+                run_for = min(add_images_check_interval, remaining_steps)
+                nsteps_before = opt.nsteps
+                converged = opt.run(fmax=fmax, steps=run_for)
+                remaining_steps -= (opt.nsteps - nsteps_before)
+                if converged or remaining_steps <= 0:
+                    break
+                if len(neb.images) < max_num_frames:
+                    new_images = _expand_band(neb, fmax, max_num_frames, num_frames, calc)
+                    if new_images is not None:
+                        neb = OCPNEB(
+                            new_images,
+                            batch_size=config_dict["ourNEB"]["batch_size"],
+                            dneb=config_dict["ourNEB"]["DNEB"],
+                            vasp=is_vasp,
+                            intermediate_minima=use_intermediate_minima,
+                            intermediate_minima_min_depth=config_dict["ourNEB"]["intermediate_minima_min_depth"],
+                            intermediate_minima_check_interval=config_dict["ourNEB"]["intermediate_minima_check_interval"],
+                            **neb_kwargs,
+                        )
+                        opt = Optimizer[1](neb, logfile=temp_log, trajectory=temp_traj,
+                                          append_trajectory=True, **optimizer_kwargs)
+                        print(f"Rank {rank}, structure {i}: added images, band now has {len(neb.images)} images", flush=True)
         else:
-            converged = opt.run(fmax = config_dict["Main"]["fmax"], steps = total_steps)
+            converged = opt.run(fmax=fmax, steps=total_steps)
 
         if config_dict["Main"]["Calculator"] == "VaspInteractive":
             for img in neb.images[1:-1]:
                 img.calc.finalize()
 
-        ci_image = neb.images[neb.imax].copy()
-        energy = neb.energies[neb.imax]
-        forces = neb.real_forces[neb.imax]
+        # --- Result extraction: per-subband ---
+        imin_set = neb._imin_set
+        climbing_set = neb._climbing_set
+        boundaries = sorted([0] + list(imin_set) + [neb.nimages - 1])
         state = NEBState(neb, neb.images, neb.energies)
-        spring1 = state.spring(neb.imax-1)
-        spring2 = state.spring(neb.imax)
-        tangent = neb.neb_method.get_tangent(state, spring1, spring2, neb.imax)
 
         nebtools = NEBTools(neb.images)
-        Ef, dE = nebtools.get_barrier()
-        max_forces = nebtools.get_fmax(**config_dict["BaseNEB"])
         fig = nebtools.plot_band()
         fig.savefig(temp_plot)
         plt.close(fig)
 
-        with Trajectory(my_output_file, 'a') as writer:
-            ci_image.info['eigenmode'] = tangent
-            ci_image.calc = SinglePointCalculator(ci_image, energy=energy, forces=forces)
-            ci_image.info['converged'] = 1 if converged else 0
-            ci_image.info['src_index'] = i
-            ci_image.info['barrier'] = Ef
-            ci_image.info['dE'] = dE
-            ci_image.info['max_forces'] = max_forces
-            ci_image.info['reactant_positions'] = neb.images[0].positions
-            ci_image.info['product_positions'] = neb.images[-1].positions
-            ci_image.info['interpolation_method'] = interpolate_method
-            if isinstance(interpolate_method, str) and interpolate_method.startswith("ase_") and perform_aseidpp:
-                ci_image.info['interpolation_method'] = "ase_idpp"
-            ci_image.wrap()
-            writer.write(ci_image)
+        interp_method_out = interpolate_method
+        if isinstance(interpolate_method, str) and interpolate_method.startswith("ase_") and perform_aseidpp:
+            interp_method_out = "ase_idpp"
 
-        if converged:
-            log_status("converged")
-        else:
-            log_status("not_converged")
+        with Trajectory(my_output_file, 'a') as writer:
+            for seg_idx in range(len(boundaries) - 1):
+                seg_start = boundaries[seg_idx]
+                seg_end = boundaries[seg_idx + 1]
+
+                seg_ci = _find_segment_ci(seg_start, seg_end, climbing_set, neb.energies)
+                if seg_ci is None:
+                    continue
+
+                ci_image = neb.images[seg_ci].copy()
+                energy = neb.energies[seg_ci]
+                forces = neb.real_forces[seg_ci]
+
+                spring1 = state.spring(seg_ci - 1)
+                spring2 = state.spring(seg_ci)
+                tangent = neb.neb_method.get_tangent(state, spring1, spring2, seg_ci)
+
+                seg_barrier = float(neb.energies[seg_ci] - neb.energies[seg_start])
+                seg_dE = float(neb.energies[seg_end] - neb.energies[seg_start])
+                seg_positions = np.array([neb.images[j].positions for j in range(seg_start, seg_end + 1)])
+                seg_energies = [float(neb.energies[j]) for j in range(seg_start, seg_end + 1)]
+                seg_fmax = [float(neb.image_fmax[j]) for j in range(seg_start, seg_end + 1)]
+
+                ci_below_fmax = neb.image_fmax[seg_ci] < fmax
+                all_below_fmax = all(neb.image_fmax[j] < fmax for j in range(seg_start, seg_end + 1))
+
+                ci_image.info['eigenmode'] = tangent
+                ci_image.calc = SinglePointCalculator(ci_image, energy=energy, forces=forces)
+                ci_image.info['converged'] = 1 if all_below_fmax else 0
+                ci_image.info['ci_converged'] = 1 if ci_below_fmax else 0
+                ci_image.info['src_index'] = i
+                ci_image.info['segment_id'] = seg_idx
+                ci_image.info['barrier'] = seg_barrier
+                ci_image.info['dE'] = seg_dE
+                ci_image.info['NEB_images'] = seg_positions
+                ci_image.info['image_energies'] = seg_energies
+                ci_image.info['image_fmax'] = seg_fmax
+                ci_image.info['nimages'] = len(neb.images)
+                ci_image.info['interpolation_method'] = interp_method_out
+                ci_image.wrap()
+                writer.write(ci_image)
+
+                # Per-subband status
+                if all_below_fmax:
+                    log_status("converged", sub_band_id=seg_idx)
+                elif ci_below_fmax:
+                    log_status("converged_only_CI", sub_band_id=seg_idx)
+                else:
+                    log_status("not_converged", sub_band_id=seg_idx)
 
         if consecutive_errors is not None:
             consecutive_errors[0] = 0
 
-        # Clean up temp files
-        if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
-            for image_idx in range(num_frames):
-                for vasp_heavy_files in [f'VASP_{i}_{image_idx}/WAVECAR',f'VASP_{i}_{image_idx}/CHG',f'VASP_{i}_{image_idx}/CHGCAR']:
-                    if os.path.exists(vasp_heavy_files): os.remove(vasp_heavy_files)
-        existing_files = [f for f in temp_files if os.path.exists(f)]
-        if existing_files and config_dict['Main']['zip']:
-            with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
-                for f_name in existing_files:
-                    if os.path.isdir(f_name):
-                        for root, dirs, files in os.walk(f_name):
-                            for file in files:
-                                zf.write(os.path.join(root, file))
-                    else:
-                        zf.write(f_name, arcname=f_name)
-            for f_name in existing_files:
-                if os.path.isdir(f_name):
-                    shutil.rmtree(f_name)
-                else:
-                    os.remove(f_name)
+        _cleanup_temp_files()
 
     except Exception as e:
         print(f"Rank {rank} FAILED on structure {i}: {e}", flush=True)
@@ -261,24 +408,6 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
             for image in images:
                 if isinstance(image.calc, VaspInteractive):
                     image.calc.finalize()
-        if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
-            for image_idx in range(num_frames):
-                for vasp_heavy_files in [f'VASP_{i}_{image_idx}/WAVECAR',f'VASP_{i}_{image_idx}/CHG',f'VASP_{i}_{image_idx}/CHGCAR']:
-                    if os.path.exists(vasp_heavy_files): os.remove(vasp_heavy_files)
-        existing_files = [f for f in temp_files if os.path.exists(f)]
-        if existing_files and config_dict['Main']['zip']:
-            with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
-                for f_name in existing_files:
-                    if os.path.isdir(f_name):
-                        for root, dirs, files in os.walk(f_name):
-                            for file in files:
-                                zf.write(os.path.join(root, file))
-                    else:
-                        zf.write(f_name, arcname=f_name)
-            for f_name in existing_files:
-                if os.path.isdir(f_name):
-                    shutil.rmtree(f_name)
-                else:
-                    os.remove(f_name)
+        _cleanup_temp_files()
         log_status("error")
 

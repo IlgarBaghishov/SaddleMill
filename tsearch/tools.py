@@ -149,17 +149,23 @@ def _extract_neb_band(job_id, num_frames, debug_zip_index):
     """Extract the final NEB band (all images) from debug traj files.
 
     Looks for neb_{job_id}.traj first as a loose file, then in debug zips.
-    Returns a list of num_frames Atoms objects, or None if not found.
+    Detects the actual band size from the last frame's 'nimages' metadata
+    (handles variable-size bands from image addition). Falls back to num_frames.
+    Returns a list of Atoms objects, or None if not found.
     """
     traj_name = f"neb_{job_id}.traj"
+
+    def _read_final_band(traj):
+        n = len(traj)
+        actual_frames = traj[-1].info.get('nimages', num_frames)
+        if n >= actual_frames:
+            return [traj[idx] for idx in range(n - actual_frames, n)]
+        return None
 
     # Try loose file first
     if os.path.exists(traj_name):
         with Trajectory(traj_name, 'r') as traj:
-            n = len(traj)
-            if n >= num_frames:
-                return [traj[idx] for idx in range(n - num_frames, n)]
-        return None
+            return _read_final_band(traj)
 
     # Try debug zips
     zip_path = debug_zip_index.get(traj_name)
@@ -171,10 +177,7 @@ def _extract_neb_band(job_id, num_frames, debug_zip_index):
             zf.extract(traj_name, tmpdir)
         extracted = os.path.join(tmpdir, traj_name)
         with Trajectory(extracted, 'r') as traj:
-            n = len(traj)
-            if n >= num_frames:
-                return [traj[idx] for idx in range(n - num_frames, n)]
-    return None
+            return _read_final_band(traj)
 
 
 def _extract_dimer_attempts(job_id, output_traj_index):

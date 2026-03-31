@@ -64,11 +64,9 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
             # Clean up temp files
             existing_files = [f for f in temp_files if os.path.exists(f)]
             if existing_files and config_dict['Main']['zip']:
-                #if not converged:
-                if True:  # converged or unconverged
-                    with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
-                        for f_name in existing_files:
-                            zf.write(f_name, arcname=f"{f_name}")
+                with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
+                    for f_name in existing_files:
+                        zf.write(f_name, arcname=f"{f_name}")
                 for f_name in existing_files:
                     os.remove(f_name)
 

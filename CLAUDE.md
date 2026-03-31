@@ -53,15 +53,16 @@ catsunami/ocpneb.py  (OCPNEB: batched NEB with swDNEB switching)
 1. **Continuation check**: If images carry `_continuation` flag in `orig_info` (set by `continue_from_result`), locally overrides `relax_endpoints = False` and `interpolate_method = False` — skips steps 2-3 below and goes straight to NEB optimization from the extracted band.
 2. **Endpoint relaxation** (optional): Relaxes reactant/product with configurable optimizer (e.g., LBFGS). For VaspInteractive, calculators are finalized after relaxation and endpoints are frozen with `SinglePointCalculator`.
 3. **Interpolation**: `ocp_idpp` (Meta's PBC-aware), `ase_idpp`, `ase_linear` (auto-falls back to IDPP on atom overlap), or `False` (use provided frames)
-4. **NEB optimization**: Uses `OCPNEB` class with MDMin optimizer. Supports climbing image and intermediate minima detection (per-segment climbing). For VASP/VaspInteractive, each image gets its own calculator instance with separate working directories (`VASP_{job_id}_{image_idx}/`), separate `command`/`ncore` settings for endpoints vs intermediates, and WAVECAR/CHG/CHGCAR cleanup after completion. When `intermediate_minima_after_steps > 0`, the optimization runs in two phases: regular NEB first, then intermediate-minima-aware NEB if not yet converged.
-5. **Output**: Extracts critical image (TS candidate) with tangent vector as eigenmode, barrier height, and reaction energetics. Generates band plot PNG.
+4. **NEB optimization**: Uses `OCPNEB` class with MDMin optimizer. Supports climbing image and intermediate minima detection (per-segment climbing). For VASP/VaspInteractive, each image gets its own calculator instance with separate working directories (`VASP_{job_id}_{image_idx}/`), separate `command`/`ncore` settings for endpoints vs intermediates, and WAVECAR/CHG/CHGCAR cleanup after completion. Intermediate minima reclassification is periodic (every `intermediate_minima_check_interval` steps), not per-step, to prevent oscillation. Automatic image addition: when `max_num_frames > num_frames`, the optimization periodically checks for unconverged segments and doubles their images (FAIRChem only).
+5. **Output**: For each sub-band (segment between intermediate minima), extracts the climbing image (TS candidate) with tangent vector as eigenmode, per-segment barrier/dE, and full sub-band data (`NEB_images` positions, `image_energies`, `image_fmax`). Generates band plot PNG. Per-image effective fmax is tracked throughout optimization and stored in debug trajs.
 
 ### `catsunami/ocpneb.py` - Core NEB Engine
 - **`OCPNEB`** (extends BaseNEB): Two modes controlled by `vasp` flag:
   - **FAIRChem mode** (`vasp=False`): Batch-evaluates intermediate images via FAIRChemCalculator for efficiency. Caches forces between calls. fairchem imports are lazy (only loaded in this mode).
   - **VASP mode** (`vasp=True`): Delegates to parent `BaseNEB` for standard per-image force evaluation. Each image has its own VASP calculator. No batching, no caching, no fairchem dependency at runtime. When `intermediate_minima=True`, VASP mode bypasses `BaseNEB.get_forces()` and evaluates images individually so it can route through the custom `get_precon_forces()` where the intermediate minima logic lives.
   - Both modes: Handles constraints (fixed atoms by tag=0 or explicit constraints). Stores full `real_forces` array `(nimages, natoms, 3)` including endpoint forces for uniform access via `real_forces[imax]`.
-- **Intermediate minima support**: When `intermediate_minima=True`, `get_precon_forces()` scans images 2 through `nimages-3` for local energy minima (energy lower than both neighbors by at least `intermediate_minima_min_depth`). Detected minima receive full PES forces (no spring forces, no tangent projection) so they relax freely into the energy basin. The band is split into segments at these minima, and each segment gets its own climbing image (highest-energy interior image in the segment). `imax` is set to the global highest-energy climbing image. Endpoint-adjacent images (1 and `nimages-2`) are excluded from minima detection to ensure each segment has room for a climbing image.
+- **Intermediate minima support**: When `intermediate_minima=True`, `get_precon_forces()` periodically (every `intermediate_minima_check_interval` force calls) scans images 2 through `nimages-3` for local energy minima (energy lower than both neighbors by at least `intermediate_minima_min_depth`). Between checks, the classification is frozen. Detected minima receive full PES forces (no spring forces, no tangent projection) so they relax freely into the energy basin. The band is split into segments at these minima, and each segment gets its own climbing image (highest-energy interior image in the segment, recomputed every step from current energies). `imax` is set to the global highest-energy climbing image. Endpoint-adjacent images (1 and `nimages-2`) are excluded from minima detection to ensure each segment has room for a climbing image.
+- **Per-image effective fmax**: After applying NEB force modifications in `get_precon_forces()`, computes `max|F|` for each image (regular: NEB-modified force with spring; climbing: PES force with doubled reversed tangential; imin: pure PES force). Stored in `self.image_fmax` (array) and on each `image.info['effective_fmax']` (float, written to debug traj for history tracking).
 - **`swDNEB`** (NEBMethod subclass): Implements the switched Doubly Nudged Elastic Band method (works with both FAIRChem and VASP modes):
   - Uses improved tangent vectors (energy-weighted at extrema)
   - Adds perpendicular spring force component to straighten the band
@@ -89,14 +90,14 @@ Dimer mode supports 7 reaction types, configured via `reaction_types` (space-sep
 | `kickout_reuse` | `get_kickout_reuse_attempts()` | Existing atom placed at interstitial, kicks nearest lattice atom into another interstitial | 2 (vector) |
 | `kickout_insert` | `get_kickout_insert_attempts()` | New similar-sized atom inserted at interstitial, kicks nearest lattice atom | 2 (vector) |
 | `ring` | `get_ring_attempts()` | Ring of 2+ atoms rotate cooperatively; size randomly sampled from `ring_sizes` config. Use `ring_sizes = 2` for pairwise exchange. | N (vector) |
-| `initial_guess` | `get_initial_guess_attempts()` | No displacement — dimer starts from input geometry as-is. For pre-prepared TS guesses. Exclusive: ignores other types with warning. Always 1 attempt. Works with both `bulk` and `oc` dataset types. If the input structure has an eigenmode (in `atoms.info['eigenmode']` or `atoms.info['orig_info']['eigenmode']`), it is passed to `MinModeAtoms` to seed the dimer instead of a random guess. | 0 (none) |
+| `initial_guess` | `get_initial_guess_attempts()` | No displacement — dimer starts from input geometry as-is (supercell expansion is skipped). For pre-prepared TS guesses. Exclusive: ignores other types with warning. Always 1 attempt. Works with both `bulk` and `oc` dataset types. If the input structure has an eigenmode (in `atoms.info['eigenmode']` or `atoms.info['orig_info']['eigenmode']`), it is passed to `MinModeAtoms` to seed the dimer instead of a random guess. | 0 (none) |
 
 **Key infrastructure:**
 - `find_interstitial_sites(atoms)`: Voronoi tessellation on 3x3x3 periodic images → filter by min distance from atoms → cluster within 0.5 Å. Uses `scipy.spatial.Voronoi` and `scipy.cluster.hierarchy`.
 - `_mic_vector()` / `_nearest_site()`: Minimum image convention helpers for periodic distance calculations.
 - `_find_ring(neighbors_dict, seed, ring_size)`: Finds closed rings of connected atoms in the neighbor graph via constrained random walk. Ring size=2 handles pairwise exchange, ring size>=3 handles cooperative ring rotations.
 - Element sampling: `hop_insert` uses small atoms weighted by 1/covalent_radius (H heavily favored). `kickout_insert` uses Gaussian weight centered on host avg covalent radius (σ=0.2 Å) from a pool of 30 common metals/semiconductors.
-- `turn_into_supercell(atoms, min_length=7.0)`: Preserves `.info` across `make_supercell()` (ASE's `make_supercell` drops `.info`). Enforces minimum cell dimension of 7 Å in each periodic direction to avoid self-interaction artifacts through PBC (important for fairchem's radius graph which uses a 5 Å cutoff). Called centrally in `get_attempts()` (controlled by `supercell` config option, default `True`).
+- `turn_into_supercell(atoms, min_length=7.0)`: Preserves `.info` across `make_supercell()` (ASE's `make_supercell` drops `.info`). Enforces minimum cell dimension of 7 Å in each periodic direction to avoid self-interaction artifacts through PBC (important for fairchem's radius graph which uses a 5 Å cutoff). Called centrally in `get_attempts()` for all reaction types except `initial_guess` (controlled by `supercell` config option, default `True`).
 - Dispatch: `_REACTION_TYPE_DISPATCH` dict maps type names to functions. `get_attempts()` iterates over configured types. `initial_guess` is handled early (before bulk/oc branch) since it works with both dataset types.
 - `_safe_normalize(vec)`: Normalizes a vector; returns a random unit vector if norm is near zero (prevents division-by-zero in ring displacement calculations).
 - `_build_neighbor_dict(atoms)`: Builds neighbor graph; skips self-interactions (`i == j`) which can occur in small periodic cells.
@@ -123,7 +124,7 @@ Dimer mode supports 7 reaction types, configured via `reaction_types` (space-sep
 
 ### `init_function.py` - Worker Initialization
 - Assigns GPU to worker based on executorlib_worker_id and jobs_per_gpu
-- Sets `CUDA_VISIBLE_DEVICES` for multi-job-per-GPU scenarios (skipped for VASP calculators)
+- For multi-job-per-GPU (`jobs_per_gpu > 1`): auto-detects per-GPU MPS daemons (`/tmp/mps_{gpu}/control`). If MPS is running, sets `CUDA_MPS_PIPE_DIRECTORY` and `CUDA_VISIBLE_DEVICES=0`; otherwise falls back to direct `CUDA_VISIBLE_DEVICES` assignment. Skipped for VASP calculators.
 - For FAIRChem: instantiates calculator once (stored on GPU, shared across structures)
 - For VASP/VaspInteractive: returns the class itself (instantiation deferred to per-image in `nebopt.py`)
 - Returns `{calc, Optimizer, consecutive_errors}` dict passed to method functions. `consecutive_errors` is `[0]` (mutable list used as an in-memory counter); resets naturally on worker restart (fresh process)
@@ -193,8 +194,10 @@ num_frames = 10                    # Number of NEB images
 batch_size = 8                     # Batch size for FAIRChem inference (ignored in VASP mode)
 DNEB = True                        # Enable switched DNEB
 intermediate_minima = True         # Detect intermediate minima and do per-segment climbing image NEB
-intermediate_minima_after_steps = 500  # Run regular NEB for N steps first, then enable intermediate minima if not converged (0 = from the start)
+intermediate_minima_check_interval = 100  # Re-evaluate intermediate minima classification every N force calls (first check always runs on the very first force call)
 intermediate_minima_min_depth = 0.05   # Min energy dip (eV) below both neighbors to count as intermediate minimum
+max_num_frames = 80                # Max total band size (enables automatic image addition if > num_frames, FAIRChem only)
+add_images_check_interval = 100    # Check for image addition every N optimizer steps
 # VASP-only settings (required when Calculator = Vasp or VaspInteractive):
 vasp_command_endpoints = "srun --exclusive -n 64 vasp_std"
 vasp_ncore_endpoints = 8           # NCORE for endpoint relaxation VASP jobs
@@ -233,7 +236,7 @@ relax_cell = False
 
 | Category | Meaning | CSV statuses that map here |
 |---|---|---|
-| `converged` | At least one attempt converged | `converged`, `converged_after_extension`, `converged_both`, `converged_min1`, `converged_min2` |
+| `converged` | At least one attempt converged | `converged`, `converged_after_extension`, `converged_both`, `converged_min1`, `converged_min2`, `converged_only_CI` |
 | `not_converged` | Ran without convergence | `not_converged`, `not_converged_after_extension`, `not_converged_StopRun`, `unconverged` |
 | `error` | All attempts failed | `error`, `error: <message>` |
 | `not_started` | No CSV row for this job_id | (absence of rows) |
@@ -297,18 +300,22 @@ continue_from_result = False
 
 For method `NEB`:
 ```
-NEB_status_csvs/status_rank_*.csv    # job_id,rank,status (converged/not_converged/error)
-NEB_trajes/collected_ts_rank_*.traj  # TS candidates with metadata in atoms.info
-NEB_debug_zips/                      # Compressed log/traj/plot files
+NEB_status_csvs/status_rank_*.csv    # job_id,rank,sub_band_id,status (converged/converged_only_CI/not_converged/error)
+NEB_trajes/collected_ts_rank_*.traj  # TS candidates (one per sub-band) with metadata in atoms.info
+NEB_debug_zips/                      # Compressed log/traj/plot files (images have effective_fmax in .info)
 ```
 
-Each TS image in the output trajectory contains:
+Each TS image (one per sub-band/segment) in the output trajectory contains:
 - `eigenmode`: Tangent vector at saddle point
-- `barrier`: Forward barrier (eV)
-- `dE`: Reaction energy (eV)
-- `max_forces`: Max forces on each image
-- `converged`: 1 or 0
-- `reactant_positions` / `product_positions`
+- `barrier`: Forward barrier within segment (eV)
+- `dE`: Reaction energy within segment (eV)
+- `converged`: 1 if all images in sub-band below fmax, 0 otherwise
+- `ci_converged`: 1 if this CI specifically below fmax, 0 otherwise
+- `segment_id`: Sub-band index (0 when no intermediate minima)
+- `NEB_images`: 3D array `(n_subband_images, natoms, 3)` — positions of all images in the sub-band
+- `image_energies`: List of floats — per-image energies in the sub-band
+- `image_fmax`: List of floats — per-image effective fmax in the sub-band
+- `nimages`: Total band size (for continue_from_result extraction)
 - `reaction_type`: (Dimer only) vacancy, hop_reuse, hop_insert, kickout_reuse, kickout_insert, ring, or unknown
 - `orig_info`: Original `.info` dict from the input trajectory (stashed by `load_and_sanitize` to prevent per-atom array size mismatches)
 

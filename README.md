@@ -239,7 +239,7 @@ tsearch automatically handles resume if a job times out or is interrupted:
 
 ### Dimer: `initial_guess` Reaction Type
 
-The `initial_guess` reaction type is for running the dimer method on a **pre-prepared TS guess** from an external source (another code, a database, or a different tsearch method like NEB). It starts the dimer from the input geometry as-is with no displacement. If the input structure has an eigenmode in `atoms.info['eigenmode']`, it is used to seed the dimer instead of a random guess.
+The `initial_guess` reaction type is for running the dimer method on a **pre-prepared TS guess** from an external source (another code, a database, or a different tsearch method like NEB). It starts the dimer from the input geometry as-is with no displacement and no supercell expansion (even if `supercell = True`). If the input structure has an eigenmode in `atoms.info['eigenmode']`, it is used to seed the dimer instead of a random guess.
 
 ```ini
 [ourDimer]

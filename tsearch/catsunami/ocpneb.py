@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import numpy as np
 from ase.optimize.precon import Precon, PreconImages
 
@@ -69,6 +68,7 @@ class OCPNEB(BaseNEB):
         vasp=False,
         intermediate_minima=False,
         intermediate_minima_min_depth=0.05,
+        intermediate_minima_check_interval=100,
     ):
         super().__init__(
             images,
@@ -85,6 +85,12 @@ class OCPNEB(BaseNEB):
         self.vasp = vasp
         self.intermediate_minima = intermediate_minima
         self.intermediate_minima_min_depth = abs(intermediate_minima_min_depth)
+        self.intermediate_minima_check_interval = intermediate_minima_check_interval
+        self._force_call_count = 0
+        self._check_imin_first_call = True
+        self._imin_set = set()
+        self._climbing_set = set()
+        self.image_fmax = np.zeros(self.nimages)
 
         if not self.vasp:
             from fairchem.core.common.utils import setup_imports, setup_logging
@@ -104,7 +110,6 @@ class OCPNEB(BaseNEB):
             self.product_energy = self.images[-1].get_potential_energy()
             self.product_forces = self.images[-1].get_forces()
 
-            self.intermediate_energies = []
             self.intermediate_forces = []
             self.cached = False
 
@@ -165,7 +170,6 @@ class OCPNEB(BaseNEB):
                 forces = self.get_precon_forces(forces, energies, self.images)
 
                 self.intermediate_forces = forces
-                self.intermediate_energies = energies
                 self.cached = True
 
                 return forces
@@ -191,18 +195,30 @@ class OCPNEB(BaseNEB):
         self.real_forces[-1] = self.product_forces
 
         state = NEBState(self, images, energies)
+        self._force_call_count += 1
 
-        # Determine climbing and intermediate minima image sets
-        imin_set = set()
-        if self.intermediate_minima:
+        # Evaluate intermediate minima periodically (frozen between checks)
+        should_check_imin = (self.intermediate_minima and
+                             (self._check_imin_first_call or
+                              self._force_call_count % self.intermediate_minima_check_interval == 0))
+        if should_check_imin:
+            self._check_imin_first_call = False
+            imin_set = set()
             for i in range(2, self.nimages - 2):  # exclude endpoint-adjacent images to ensure each segment has room for a CI
                 if (energies[i] < energies[i - 1] - self.intermediate_minima_min_depth and
                         energies[i] < energies[i + 1] - self.intermediate_minima_min_depth):
                     imin_set.add(i)
+            self._imin_set = imin_set
+        elif not self.intermediate_minima:
+            self._imin_set = set()
+        # else: reuse frozen self._imin_set from last check
+
+        imin_set = self._imin_set
+
+        # Always recompute climbing set from current energies and current imin_set
         climbing_set = set()
         if self.climb:
             if imin_set:
-                # Per-segment climbing: highest energy interior image per segment
                 boundaries = sorted([0] + list(imin_set) + [self.nimages - 1])
                 for s in range(len(boundaries) - 1):
                     inner = [idx for idx in range(boundaries[s] + 1, boundaries[s + 1])
@@ -211,6 +227,7 @@ class OCPNEB(BaseNEB):
                         climbing_set.add(max(inner, key=lambda idx: energies[idx]))
             else:
                 climbing_set.add(state.imax)
+        self._climbing_set = climbing_set
 
         # Set imax to the global highest energy among climbing images (for result collection)
         if climbing_set:
@@ -250,5 +267,21 @@ class OCPNEB(BaseNEB):
                 self.residuals.append(residual)
 
             spring1 = spring2
+
+        # Compute per-image effective fmax (max force magnitude across atoms)
+        for img_i in range(1, self.nimages - 1):
+            effective_force = precon_forces[img_i - 1]  # (natoms, 3), already modified in-place
+            self.image_fmax[img_i] = float(np.sqrt((effective_force**2).sum(axis=1)).max())
+            images[img_i].info['effective_fmax'] = self.image_fmax[img_i]
+        # Endpoints: PES force only
+        self.image_fmax[0] = float(np.sqrt((self.real_forces[0]**2).sum(axis=1)).max())
+        self.image_fmax[-1] = float(np.sqrt((self.real_forces[-1]**2).sum(axis=1)).max())
+        images[0].info['effective_fmax'] = self.image_fmax[0]
+        images[-1].info['effective_fmax'] = self.image_fmax[-1]
+        # Store band metadata for debug traj (on all images so any frame can be used for extraction)
+        for img_i in range(self.nimages):
+            images[img_i].info['nimages'] = self.nimages
+        images[0].info['imin_set'] = sorted(self._imin_set)
+        images[0].info['climbing_set'] = sorted(self._climbing_set)
 
         return precon_forces.reshape((-1, 3))
