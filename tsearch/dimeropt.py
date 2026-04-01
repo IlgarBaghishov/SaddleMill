@@ -4,7 +4,6 @@ import traceback
 import random
 import zipfile
 import numpy as np
-import pandas as pd
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from ase.neighborlist import natural_cutoffs, neighbor_list
@@ -201,7 +200,7 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                             zf.write(f_name, arcname=f"ERROR_{f_name}")
                     for f_name in existing_files:
                         os.remove(f_name)
-                log_status(attempt, slctd_indx, "error")
+                log_status(attempt, slctd_indx, f"error: {str(e)}")
 
     # Track consecutive structure-level errors for worker health
     if consecutive_errors is not None:

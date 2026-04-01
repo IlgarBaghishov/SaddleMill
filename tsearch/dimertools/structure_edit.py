@@ -867,7 +867,7 @@ def get_initial_guess_attempts(atoms):
     atoms_new.info['reaction_type'] = 'initial_guess'
 
     # Propagate eigenmode from orig_info if present
-    orig = atoms.info.get('orig_info', atoms.info)
+    orig = atoms.info.get('orig_info', {})
     if 'eigenmode' in orig:
         atoms_new.info['eigenmode'] = np.array(orig['eigenmode'])
 

@@ -151,11 +151,11 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
             initial_imin_set = set()
             for sid in sorted(continuation_data.keys()):
                 for img in continuation_data[sid]:
-                    iidx = img.info.get('image_idx')
+                    iidx = img.info.get('orig_info', {}).get('image_idx')
                     if iidx not in seen_image_idx:
                         seen_image_idx.add(iidx)
                         all_imgs.append(img)
-                        orig = img.info.get('orig_info', img.info)
+                        orig = img.info.get('orig_info', {})
                         if orig.get('image_type') == 'intermediate_minimum':
                             initial_imin_set.add(len(all_imgs) - 1)
             runs.append((None, all_imgs, initial_imin_set or None))
@@ -184,24 +184,24 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
         temp_react_relax = f'reactant_relaxation_{i}{suffix}.traj'
         temp_prod_relax = f'product_relaxation_{i}{suffix}.traj'
         temp_files = [temp_log, temp_traj, temp_plot, temp_react_relax_log, temp_prod_relax_log, temp_react_relax, temp_prod_relax]
-        if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
-            temp_files.extend([f"VASP_{i}{suffix}_{image_idx}" for image_idx in range(num_images)])
 
-        def _cleanup_temp_files():
+        def _cleanup_temp_files(error=False):
             if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
                 for image_idx in range(num_images):
                     for vasp_heavy_files in [f'VASP_{i}{suffix}_{image_idx}/WAVECAR',f'VASP_{i}{suffix}_{image_idx}/CHG',f'VASP_{i}{suffix}_{image_idx}/CHGCAR']:
                         if os.path.exists(vasp_heavy_files): os.remove(vasp_heavy_files)
             existing_files = [f for f in temp_files if os.path.exists(f)]
             if existing_files and config_dict['Main']['zip']:
+                prefix = "ERROR_" if error else ""
                 with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
                     for f_name in existing_files:
                         if os.path.isdir(f_name):
                             for root, dirs, files in os.walk(f_name):
                                 for file in files:
-                                    zf.write(os.path.join(root, file))
+                                    filepath = os.path.join(root, file)
+                                    zf.write(filepath, arcname=f"{prefix}{filepath}")
                         else:
-                            zf.write(f_name, arcname=f_name)
+                            zf.write(f_name, arcname=f"{prefix}{f_name}")
                 for f_name in existing_files:
                     if os.path.isdir(f_name):
                         shutil.rmtree(f_name)
@@ -209,30 +209,32 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
                         os.remove(f_name)
 
         try:
+            need_interpolation = default_interp and num_images <= 2
+
             reactant = images[0]
             if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
                 reactant.calc = calc(
-                    directory=f"VASP_{i}_{0}",
+                    directory=f"VASP_{i}{suffix}_{0}",
                     command=config_dict["ourNEB"]["vasp_command_endpoints"],
                     ncore=int(config_dict["ourNEB"]["vasp_ncore_endpoints"]),
                     **config_dict["Vasp"],
                     )
             else:
                 reactant.calc = calc
-    
+
             product = images[-1]
             if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
                 product.calc = calc(
-                    directory=f"VASP_{i}_{num_images-1}",
+                    directory=f"VASP_{i}{suffix}_{num_images-1}",
                     command=config_dict["ourNEB"]["vasp_command_endpoints"],
                     ncore=int(config_dict["ourNEB"]["vasp_ncore_endpoints"]),
                     **config_dict["Vasp"],
                     )
             else:
                 product.calc = calc
-    
+
             if default_relax:
-                if not default_interp: print("Are you sure you want to relax end points while keeping the intermediate images from your traj?", flush=True)
+                if not need_interpolation: print("Are you sure you want to relax end points while keeping the intermediate images from your traj?", flush=True)
                 if config_dict["ourNEB"]["endpoint_relax_Optimizer"] is None:
                     endpoint_relax_optimizer_name = config_dict["Main"]["Optimizer"]
                 else:
@@ -252,9 +254,6 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
             if config_dict["Main"]["Calculator"] == "VaspInteractive": product.calc.finalize()
             product.calc = SinglePointCalculator(product, energy=energy, forces=forces)
     
-            # Interpolate only when we need new intermediate images (≤2 images provided).
-            # When continuing from extracted images (>2), skip interpolation.
-            need_interpolation = default_interp and num_images <= 2
             if need_interpolation:
                 if default_interp == "ocp_idpp":
                     # `interpolate` function Meta implemented is very similar to idpp but not sensative to periodic boundary crossings.
@@ -301,10 +300,13 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
 
                 num_images = len(images)
 
+            if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
+                temp_files.extend([f"VASP_{i}{suffix}_{image_idx}" for image_idx in range(num_images)])
+
             for image_idx in range(1, num_images-1):
                 if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
                     images[image_idx].calc = calc(
-                        directory=f"VASP_{i}_{image_idx}",
+                        directory=f"VASP_{i}{suffix}_{image_idx}",
                         command=config_dict["ourNEB"]["vasp_command_intermediates"],
                         ncore=int(config_dict["ourNEB"]["vasp_ncore_intermediates"]),
                         **config_dict["Vasp"],
@@ -473,6 +475,6 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
                 for image in images:
                     if isinstance(image.calc, VaspInteractive):
                         image.calc.finalize()
-            _cleanup_temp_files()
-            log_status("error")
+            _cleanup_temp_files(error=True)
+            log_status(f"error: {str(e)}", sub_band_id=subband_idx_override if subband_idx_override is not None else 0)
 

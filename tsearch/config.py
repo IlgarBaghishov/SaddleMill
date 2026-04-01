@@ -51,7 +51,6 @@ class ConfigManager:
         },
         "ourDimer": {
             "dataset_type": None,
-            "num_attempts": 3,
             "reaction_types": None, # Bulk: vacancy hop_reuse hop_insert kickout_reuse kickout_insert ring initial_guess
                                    # OC: adsorbate_atom adsorbate_atom_neighbors adsorbate diffusion rotation adsorbate_surface surface custom initial_guess
             "num_attempts_per_type": 1,

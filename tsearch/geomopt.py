@@ -25,6 +25,10 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
         backup_flux_logs(rank)
         sys.exit(1)
 
+    continuation_data = kwargs.get('continuation_data')
+    if continuation_data is not None and config_dict["Main"]["continue_from_result"]:
+        atoms = continuation_data
+
     atoms.calc = calc
 
     method_name = config_dict["Main"]["method"]
@@ -55,6 +59,7 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
                 log_status("not_converged")
                 atoms.info['converged'] = 0
             atoms.info['src_index'] = i
+            atoms.wrap()
 
             writer.write(atoms)
 
@@ -82,7 +87,7 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
                         zf.write(f_name, arcname=f"ERROR_{f_name}")
                 for f_name in existing_files:
                     os.remove(f_name)
-            log_status("error")
+            log_status(f"error: {str(e)}")
 
 
 def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, executorlib_worker_id=None, **kwargs):
@@ -111,7 +116,7 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
     continuation_data = kwargs.get('continuation_data')  # {side: Atoms} or None
     entries_to_run = kwargs.get('entries_to_run')        # set of side_ids (-1, 1) or None
     with Trajectory(my_output_file, 'a') as writer:
-        orig = atoms.info.get('orig_info', atoms.info)
+        orig = atoms.info.get('orig_info', {})
         parent_source_idx = orig['src_index']
         try:
             if not orig['converged']:
@@ -162,7 +167,7 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
                     if not (continuation_data and side in continuation_data):
                         raise ValueError(f"Missing continuation data for kept side={side}")
                     min_atoms = continuation_data[side].copy()
-                    conv = bool(min_atoms.info.get('orig_info', min_atoms.info).get('converged'))
+                    conv = bool(min_atoms.info.get('orig_info', {}).get('converged'))
 
                 min_atoms.info['side'] = side
                 min_atoms.info['parent_ts_index'] = parent_source_idx
@@ -212,6 +217,9 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
             ts_atoms.info['src_index'] = i
 
             # --- WRITE FRAMES (Min1, TS, Min2) ---
+            min1.wrap()
+            ts_atoms.wrap()
+            min2.wrap()
             writer.write(min1)
             writer.write(ts_atoms)
             writer.write(min2)

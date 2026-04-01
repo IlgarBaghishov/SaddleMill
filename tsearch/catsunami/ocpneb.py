@@ -124,8 +124,8 @@ class OCPNEB(BaseNEB):
             images = self.images[1:-1]
             forces = np.array([img.get_forces() for img in images])
             energies = np.empty(self.nimages)
-            energies[0] = self.reactant_energy
-            energies[-1] = self.product_energy
+            energies[0] = self.images[0].get_potential_energy()
+            energies[-1] = self.images[-1].get_potential_energy()
             for idx, img in enumerate(images):
                 energies[idx + 1] = img.get_potential_energy()
             self.reactant_forces = self.images[0].get_forces()
