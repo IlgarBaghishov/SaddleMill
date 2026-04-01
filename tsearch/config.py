@@ -391,7 +391,7 @@ def _get_subunit_config(method_name):
     elif method_name == "NEB":
         return 2, "subband_idx"
     elif method_name == "DoubleMinimization":
-        return 3, "side"
+        return 2, "side"
     return None, None
 
 

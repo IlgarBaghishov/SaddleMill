@@ -54,7 +54,7 @@ catsunami/ocpneb.py  (OCPNEB: batched NEB with swDNEB switching)
 2. **Endpoint relaxation** (optional): Relaxes reactant/product with configurable optimizer (e.g., LBFGS). For VaspInteractive, calculators are finalized after relaxation and endpoints are frozen with `SinglePointCalculator`.
 3. **Interpolation**: `ocp_idpp` (Meta's PBC-aware), `ase_idpp`, `ase_linear` (auto-falls back to IDPP on atom overlap), or `False` (use provided frames)
 4. **NEB optimization**: Uses `OCPNEB` class with MDMin optimizer. Supports climbing image and intermediate minima detection (per-segment climbing). For VASP/VaspInteractive, each image gets its own calculator instance with separate working directories (`VASP_{job_id}_{image_idx}/`), separate `command`/`ncore` settings for endpoints vs intermediates, and WAVECAR/CHG/CHGCAR cleanup after completion. Intermediate minima reclassification is periodic (every `intermediate_minima_check_interval` steps), not per-step, to prevent oscillation. Automatic image addition: when `max_num_frames > num_frames`, the optimization periodically checks for unconverged segments and doubles their images (FAIRChem only).
-5. **Output**: Writes ALL band images as separate frames to the output trajectory. Each image gets `src_index`, `band_idx`, `subband_idx`, `image_type` (endpoint/intermediate_minimum/climbing/regular), `effective_fmax`, `image_converged`, `band_converged`, `band_converged_CI`. CI images additionally get `eigenmode`, `barrier`, `dE`. Intermediate minima images are duplicated so each sub-band is self-contained. Generates band plot PNG. Per-sub-band NEB runs use temp files with `_sub{subband_idx}` suffix.
+5. **Output**: Writes ALL band images as separate frames to the output trajectory. Each image gets `src_index`, `image_idx`, `subband_idx`, `image_type` (endpoint/intermediate_minimum/climbing/regular), `effective_fmax`, `image_converged`, `band_converged`, `band_converged_CI`. CI images additionally get `eigenmode`, `barrier`, `dE`. Intermediate minima images are duplicated so each sub-band is self-contained. Generates band plot PNG. Per-sub-band NEB runs use temp files with `_sub{subband_idx}` suffix.
 
 ### `catsunami/ocpneb.py` - Core NEB Engine
 - **`OCPNEB`** (extends BaseNEB): Two modes controlled by `vasp` flag:
@@ -135,7 +135,7 @@ Adsorbate atoms are identified by tag=2 (fallback tag=1). Substrate atoms (tag=0
 - `load_and_sanitize(traj, i, j)`: Loads atoms from trajectory and stashes original `.info` into `atoms.info = {"orig_info": <original_info>}`. This prevents per-atom array data (e.g. `forces`, `stress`) from causing size mismatches when atoms are later added/removed (e.g. vacancy in Dimer). Called in `__main__.py` for all methods uniformly.
 - `clean_up_files(config_dict)`: Removes leftover temp files on resume. Method-aware: cleans NEB files (`neb_*.log`, `neb_*.traj`, `reactant_relaxation_*`, `product_relaxation_*`, `diffusion_barrier_*.png`), Dimer files (`dimer_control_*.log`, `dimer_opt_*.log`, `dimer_*.traj`), or Minimization files (`optimization_*.log`, `optimization_*.traj`). For VASP NEB, also removes `VASP_*_*/` per-image directories.
 - **Previous result extraction** (used by `__main__.py` when redoing previously-run jobs):
-  - `extract_previous_results(job_ids, config_dict, redo_info)`: Unified extraction from output trajs for ALL methods. Returns `{job_id: continuation_data}` where continuation_data is: Dimer `{attempt_id: Atoms}`, NEB `{subband_idx: [Atoms sorted by band_idx]}`, DoubleMinimization `{side: Atoms}`, Minimization `Atoms`.
+  - `extract_previous_results(job_ids, config_dict, redo_info)`: Unified extraction from output trajs for ALL methods. Returns `{job_id: continuation_data}` where continuation_data is: Dimer `{attempt_id: Atoms}`, NEB `{subband_idx: [Atoms sorted by image_idx]}`, DoubleMinimization `{side: Atoms}`, Minimization `Atoms`.
   - `_build_output_traj_index(method_name)`: Scans output trajectories, builds `{src_index: [Atoms]}` map.
   - `_sanitize_with_continuation(atoms)`: Wraps `.info` into `orig_info` (like `load_and_sanitize`) for extracted results.
 - Bond detection via ASE neighbor_list with natural cutoffs
@@ -259,8 +259,8 @@ relax_cell = False
 
 | Category | CSV statuses that map here |
 |---|---|
-| `converged` | `converged`, `converged_after_extension`, `converged_only_CI` |
-| `not_converged` | `not_converged`, `not_converged_after_extension`, `not_converged_StopRun`, `unconverged` |
+| `converged` | `converged`, `converged_after_extension`, `converged_CI` |
+| `not_converged` | `not_converged`, `not_converged_after_extension`, `not_converged_StopRun` |
 | `errored` | `error`, `error: <message>` |
 | `remaining` | No CSV row for this job_id |
 
@@ -271,7 +271,7 @@ relax_cell = False
 run_jobs = remaining                  # Default. Fresh run: all jobs. Resume: continue unfinished.
 run_jobs = remaining errored          # Resume + retry errors
 run_jobs = converged                  # Redo converged entries (e.g., refine with VASP)
-run_jobs = not_converged              # Redo unconverged entries
+run_jobs = not_converged              # Redo not-converged entries
 run_jobs = errored                    # Retry only errors
 run_jobs = all                        # Redo everything
 ```
@@ -302,7 +302,7 @@ Continuation is handled **per-entry** inside each method function — no global 
 |---|---|---|---|
 | Dimer | per-attempt | Continue from extracted attempt structure with its eigenmode | Generate fresh attempt at same `attempt_id` (same reaction type, new random displacement) |
 | NEB | per-sub-band | Continue from extracted sub-band images | Partial: re-interpolate between sub-band endpoints. All sub-bands: use original input |
-| DoubleMinimization | per-side | Continue unconverged side from extracted last state | Re-displace from TS (ts ± eigenmode) |
+| DoubleMinimization | per-side | Continue not-converged side from extracted last state | Re-displace from TS (ts ± eigenmode) |
 | Minimization | per-job | Continue from extracted relaxed structure | Use original input |
 
 All methods extract from output trajs uniformly via `extract_previous_results`. Errored entries always fall back to fresh (no output to extract).
@@ -311,7 +311,7 @@ All methods extract from output trajs uniformly via `extract_previous_results`. 
 
 **Examples:**
 ```ini
-# Continue unconverged NEB jobs with more steps
+# Continue not-converged NEB jobs with more steps
 run_jobs = not_converged
 steps = 10000
 
@@ -328,14 +328,14 @@ continue_from_result = False
 
 For method `NEB`:
 ```
-NEB_status_csvs/status_rank_*.csv    # job_id,rank,sub_band_id,status (converged/converged_only_CI/not_converged/error)
+NEB_status_csvs/status_rank_*.csv    # job_id,rank,sub_band_id,status (converged/converged_CI/not_converged/error)
 NEB_trajes/collected_ts_rank_*.traj  # All band images (full band, one frame per image) with metadata in atoms.info
 NEB_debug_zips/                      # Compressed log/traj/plot files
 ```
 
 Each band image in the output trajectory contains:
 - `src_index`: Job ID
-- `band_idx`: Position in full band (0 to N-1)
+- `image_idx`: Position in full band (0 to N-1)
 - `subband_idx`: Which sub-band this image belongs to (0, 1, 2, ...)
 - `image_type`: `"endpoint"` / `"intermediate_minimum"` / `"climbing"` / `"regular"`
 - `effective_fmax`: Per-image force max (float)
@@ -353,7 +353,7 @@ Intermediate minima images are duplicated so each sub-band is self-contained (ha
 
 For method `Dimer`, each output frame contains: `eigenmode`, `converged`, `src_index`, `attempt_id`, `stoprun`, `selected_index`, `reaction_type`, `orig_info`.
 
-For method `DoubleMinimization`, each output frame contains: `side` (-1=min1, 0=ts, 1=min2), `parent_ts_index`, `converged`, `src_index`, `is_reaction`, `n_formed_bonds`, `n_broken_bonds`, `orig_info`. CSV writes 2 lines per job (one per side): `{job_id},{rank},{parent_ts_idx},{side_id},{status}`.
+For method `DoubleMinimization`, each output frame contains: `side` (-1=min1, 0=ts, 1=min2), `parent_ts_index`, `converged`, `src_index`, `is_reaction`, `n_formed_bonds`, `n_broken_bonds`, `orig_info`. CSV writes 2 lines per job (one per side): `{job_id},{rank},{side_id},{parent_ts_idx},{status}`.
 
 ## Execution Modes
 

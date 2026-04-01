@@ -140,7 +140,7 @@ def extract_previous_results(job_ids, config_dict, redo_info):
 
     Returns {job_id: continuation_data} where continuation_data is:
       - Dimer: {attempt_id: Atoms} for attempts that have output
-      - NEB: {subband_idx: [Atoms sorted by band_idx]}
+      - NEB: {subband_idx: [Atoms sorted by image_idx]}
       - DoubleMinimization: {side: Atoms} for all sides (-1, 0, 1)
       - Minimization: Atoms
 
@@ -170,9 +170,9 @@ def extract_previous_results(job_ids, config_dict, redo_info):
                 grouped.setdefault(subunit_id, []).append(f)
 
             if method_name == "NEB":
-                # Sort each subband's images by band_idx
+                # Sort each subband's images by image_idx
                 for sid in grouped:
-                    grouped[sid].sort(key=lambda a: a.info.get('band_idx', 0))
+                    grouped[sid].sort(key=lambda a: a.info.get('image_idx', 0))
 
             if method_name == "Dimer":
                 # Flatten: each attempt_id maps to a single Atoms

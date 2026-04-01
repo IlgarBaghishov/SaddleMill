@@ -146,13 +146,13 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
                     runs.append((sb_idx, [sb_imgs[0], sb_imgs[-1]], len(sb_imgs), False, default_interp))
         elif continue_from_result:
             # All sub-bands, continue: reconstruct full band (de-dup imin at boundaries)
-            seen_band_idx = set()
+            seen_image_idx = set()
             all_imgs = []
             for sid in sorted(continuation_data.keys()):
                 for img in continuation_data[sid]:
-                    bidx = img.info.get('band_idx')
-                    if bidx not in seen_band_idx:
-                        seen_band_idx.add(bidx)
+                    iidx = img.info.get('image_idx')
+                    if iidx not in seen_image_idx:
+                        seen_image_idx.add(iidx)
                         all_imgs.append(img)
             runs.append((None, all_imgs, len(all_imgs), False, False))
         # else: all sub-bands + continue=False → fall through to fresh
@@ -415,7 +415,7 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
                             image_type = "regular"
     
                         img.info['src_index'] = i
-                        img.info['band_idx'] = j
+                        img.info['image_idx'] = j
                         img.info['subband_idx'] = subband_idx_override if subband_idx_override is not None else seg_idx
                         img.info['image_type'] = image_type
                         img.info['effective_fmax'] = float(neb.image_fmax[j])
@@ -438,7 +438,7 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
                     if all_below_fmax:
                         log_status("converged", sub_band_id=out_seg_idx)
                     elif ci_below_fmax:
-                        log_status("converged_only_CI", sub_band_id=out_seg_idx)
+                        log_status("converged_CI", sub_band_id=out_seg_idx)
                     else:
                         log_status("not_converged", sub_band_id=out_seg_idx)
     

@@ -102,9 +102,9 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
     my_output_file = f"{method_name}_trajes/collected_opt_rank_{rank}.traj"
     zip_name = f"{method_name}_debug_zips/structure_rank_{rank}_data.zip"
 
-    def log_status(parent_source_idx, side_id, status_msg):
+    def log_status(side_id, parent_source_idx, status_msg):
         with open(status_file, 'a') as f:
-            f.write(f"{i},{rank},{parent_source_idx},{side_id},{status_msg}\n")
+            f.write(f"{i},{rank},{side_id},{parent_source_idx},{status_msg}\n")
 
     # 3. Initialize list to track temp files from BOTH optimizations
     temp_files = []
@@ -218,7 +218,7 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
 
             for side, (_, conv) in mins.items():
                 if entries_to_run is None or side in entries_to_run:
-                    log_status(parent_source_idx, side, "converged" if conv else "not_converged")
+                    log_status(side, parent_source_idx, "converged" if conv else "not_converged")
 
             if consecutive_errors is not None:
                 consecutive_errors[0] = 0
@@ -240,7 +240,7 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
                 consecutive_errors[0] += 1
             for side in [-1, 1]:
                 if entries_to_run is None or side in entries_to_run:
-                    log_status(parent_source_idx, side, f"error: {str(e)}")
+                    log_status(side, parent_source_idx, f"error: {str(e)}")
 
             existing_files = [f for f in temp_files if os.path.exists(f)]
             if existing_files and config_dict['Main']['zip']:
