@@ -69,6 +69,7 @@ class OCPNEB(BaseNEB):
         intermediate_minima=False,
         intermediate_minima_min_depth=0.05,
         intermediate_minima_check_interval=100,
+        initial_imin_set=None,
     ):
         super().__init__(
             images,
@@ -87,8 +88,9 @@ class OCPNEB(BaseNEB):
         self.intermediate_minima_min_depth = abs(intermediate_minima_min_depth)
         self.intermediate_minima_check_interval = intermediate_minima_check_interval
         self._force_call_count = 0
-        self._check_imin_first_call = True
-        self._imin_set = set()
+        self._check_imin_first_call = True if initial_imin_set is None else False
+        self._imin_set = set(initial_imin_set) if initial_imin_set else set()
+        self._imin_seeded = initial_imin_set is not None
         self._climbing_set = set()
         self.image_fmax = np.zeros(self.nimages)
 
@@ -115,15 +117,15 @@ class OCPNEB(BaseNEB):
 
 
     def get_forces(self):
-        if self.vasp and not self.intermediate_minima:
+        if self.vasp and not self.intermediate_minima and not self._imin_set:
             return super().get_forces()
         elif self.vasp:
             # VASP + intermediate_minima: per-image evaluation + custom NEB forces
             images = self.images[1:-1]
             forces = np.array([img.get_forces() for img in images])
             energies = np.empty(self.nimages)
-            energies[0] = self.images[0].get_potential_energy()
-            energies[-1] = self.images[-1].get_potential_energy()
+            energies[0] = self.reactant_energy
+            energies[-1] = self.product_energy
             for idx, img in enumerate(images):
                 energies[idx + 1] = img.get_potential_energy()
             self.reactant_forces = self.images[0].get_forces()
@@ -209,9 +211,9 @@ class OCPNEB(BaseNEB):
                         energies[i] < energies[i + 1] - self.intermediate_minima_min_depth):
                     imin_set.add(i)
             self._imin_set = imin_set
-        elif not self.intermediate_minima:
+        elif not self.intermediate_minima and not self._imin_seeded:
             self._imin_set = set()
-        # else: reuse frozen self._imin_set from last check
+        # else: reuse frozen self._imin_set from last check (or seeded set)
 
         imin_set = self._imin_set
 

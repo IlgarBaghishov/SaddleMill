@@ -125,7 +125,7 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
     default_interp = config_dict["ourNEB"]["interpolate_method"]
     default_num_frames = config_dict["ourNEB"]["num_frames"]
 
-    # Build list of runs: [(subband_idx_override, run_images, num_frames, relax, interp)]
+    # Build list of runs: [(subband_idx_override, run_images, initial_imin_set)]
     # Fresh run: one run with original images and default params.
     # All sub-bands + continue=False: same as fresh (use original input).
     # All sub-bands + continue=True: full band continuation from extracted images.
@@ -141,24 +141,28 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
                     continue
                 sb_imgs = continuation_data[sb_idx]
                 if continue_from_result:
-                    runs.append((sb_idx, sb_imgs, len(sb_imgs), False, False))
+                    runs.append((sb_idx, sb_imgs, None))
                 else:
-                    runs.append((sb_idx, [sb_imgs[0], sb_imgs[-1]], len(sb_imgs), False, default_interp))
+                    runs.append((sb_idx, [sb_imgs[0], sb_imgs[-1]], None))
         elif continue_from_result:
             # All sub-bands, continue: reconstruct full band (de-dup imin at boundaries)
             seen_image_idx = set()
             all_imgs = []
+            initial_imin_set = set()
             for sid in sorted(continuation_data.keys()):
                 for img in continuation_data[sid]:
                     iidx = img.info.get('image_idx')
                     if iidx not in seen_image_idx:
                         seen_image_idx.add(iidx)
                         all_imgs.append(img)
-            runs.append((None, all_imgs, len(all_imgs), False, False))
+                        orig = img.info.get('orig_info', img.info)
+                        if orig.get('image_type') == 'intermediate_minimum':
+                            initial_imin_set.add(len(all_imgs) - 1)
+            runs.append((None, all_imgs, initial_imin_set or None))
         # else: all sub-bands + continue=False → fall through to fresh
 
     if not runs:
-        runs.append((None, images, default_num_frames, default_relax, default_interp))
+        runs.append((None, images, None))
 
     zip_name = f"{config_dict['Main']['method']}_debug_zips/structure_rank_{rank}_data.zip"
     status_file = f"{config_dict['Main']['method']}_status_csvs/status_rank_{rank}.csv"
@@ -168,8 +172,9 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
         with open(status_file, 'a') as f:
             f.write(f"{i},{rank},{sub_band_id},{status_msg}\n")
 
-    for subband_idx_override, images, num_frames, relax_endpoints, interpolate_method in runs:
+    for subband_idx_override, images, initial_imin_set in runs:
         perform_aseidpp = False
+        num_images = len(images)
         suffix = f"_sub{subband_idx_override}" if subband_idx_override is not None else ""
         temp_log = f'neb_{i}{suffix}.log'
         temp_traj = f'neb_{i}{suffix}.traj'
@@ -180,11 +185,11 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
         temp_prod_relax = f'product_relaxation_{i}{suffix}.traj'
         temp_files = [temp_log, temp_traj, temp_plot, temp_react_relax_log, temp_prod_relax_log, temp_react_relax, temp_prod_relax]
         if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
-            temp_files.extend([f"VASP_{i}{suffix}_{image_idx}" for image_idx in range(num_frames)])
+            temp_files.extend([f"VASP_{i}{suffix}_{image_idx}" for image_idx in range(num_images)])
 
         def _cleanup_temp_files():
             if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
-                for image_idx in range(num_frames):
+                for image_idx in range(num_images):
                     for vasp_heavy_files in [f'VASP_{i}{suffix}_{image_idx}/WAVECAR',f'VASP_{i}{suffix}_{image_idx}/CHG',f'VASP_{i}{suffix}_{image_idx}/CHGCAR']:
                         if os.path.exists(vasp_heavy_files): os.remove(vasp_heavy_files)
             existing_files = [f for f in temp_files if os.path.exists(f)]
@@ -218,7 +223,7 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
             product = images[-1]
             if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
                 product.calc = calc(
-                    directory=f"VASP_{i}_{num_frames-1}",
+                    directory=f"VASP_{i}_{num_images-1}",
                     command=config_dict["ourNEB"]["vasp_command_endpoints"],
                     ncore=int(config_dict["ourNEB"]["vasp_ncore_endpoints"]),
                     **config_dict["Vasp"],
@@ -226,8 +231,8 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
             else:
                 product.calc = calc
     
-            if relax_endpoints:
-                if not interpolate_method: print("Are you sure you want to relax end points while keeping the intermediate images from your traj?", flush=True)
+            if default_relax:
+                if not default_interp: print("Are you sure you want to relax end points while keeping the intermediate images from your traj?", flush=True)
                 if config_dict["ourNEB"]["endpoint_relax_Optimizer"] is None:
                     endpoint_relax_optimizer_name = config_dict["Main"]["Optimizer"]
                 else:
@@ -247,51 +252,56 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
             if config_dict["Main"]["Calculator"] == "VaspInteractive": product.calc.finalize()
             product.calc = SinglePointCalculator(product, energy=energy, forces=forces)
     
-            if interpolate_method:
-                if interpolate_method == "ocp_idpp":
-                    # `interpolate` function Meta implemented is very similar to idpp but not sensative to periodic boundary crossings. 
-                    # Alternatively you can adopt whatever interpolation scheme you prefer. The `interpolate` function lacks some of the extra protections implemented 
+            # Interpolate only when we need new intermediate images (≤2 images provided).
+            # When continuing from extracted images (>2), skip interpolation.
+            need_interpolation = default_interp and num_images <= 2
+            if need_interpolation:
+                if default_interp == "ocp_idpp":
+                    # `interpolate` function Meta implemented is very similar to idpp but not sensative to periodic boundary crossings.
+                    # Alternatively you can adopt whatever interpolation scheme you prefer. The `interpolate` function lacks some of the extra protections implemented
                     # in the `interpolate_and_correct_frames` which is used in the CatTSunami enumeration workflow. Care should be taken to ensure the results are reasonable.
-                    # 
-                    # IMPORTANT NOTES: 
+                    #
+                    # IMPORTANT NOTES:
                     # 1. Make sure the indices in the initial and final frame map to the same atoms
                     # 2. Ensure you have the proper constraints on subsurface atoms
-                    # 
+                    #
                     """
                     The approach uses ase, so you must provide ase.Atoms objects
                     with the appropriate constraints (i.e. fixed subsurface atoms).
                     """
                     from tsearch.catsunami.autoframe import interpolate
-                    images = interpolate(reactant, product, num_frames)
-    
-                elif interpolate_method[:4] == "ase_":
+                    images = interpolate(reactant, product, default_num_frames)
+
+                elif default_interp[:4] == "ase_":
                     images = [reactant]
-                    images += [reactant.copy() for i in range(num_frames-2)]
+                    images += [reactant.copy() for ii in range(default_num_frames-2)]
                     images += [product]
-    
+
                     neb0 = NEB(images, **config_dict["BaseNEB"])
-    
-                    if interpolate_method[4:] == "idpp":
+
+                    if default_interp[4:] == "idpp":
                         perform_aseidpp = True
                     else:
                         neb0.interpolate(method="linear", mic=True)
-    
+
                         # Array of covalent radii for the system
                         radii = np.array([covalent_radii[z] for z in reactant.numbers])
                         radii_sum = radii[:, None] + radii[None, :]
-    
+
                         for atoms in neb0.images[1:-1]:
                             dists = atoms.get_all_distances(mic=True)
                             np.fill_diagonal(dists, np.inf)
-    
+
                             if np.any(dists < 0.6 * radii_sum):
                                 perform_aseidpp = True
                                 break
-    
+
                     if perform_aseidpp:
                         neb0.interpolate(method="idpp", mic=True)
-    
-            for image_idx in range(1,num_frames-1):
+
+                num_images = len(images)
+
+            for image_idx in range(1, num_images-1):
                 if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
                     images[image_idx].calc = calc(
                         directory=f"VASP_{i}_{image_idx}",
@@ -307,17 +317,22 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
             if is_vasp:
                 neb_kwargs.setdefault("parallel", True)
                 neb_kwargs["allow_shared_calculator"] = False
-    
-            use_intermediate_minima = config_dict["ourNEB"]["intermediate_minima"] if subband_idx_override is None else False
+
+            # Intermediate minima: only detect new ones on fresh full-band runs.
+            # Sub-band reruns and full-band continue=True use seeded imin (initial_imin_set).
+            use_intermediate_minima = config_dict["ourNEB"]["intermediate_minima"] if (subband_idx_override is None and initial_imin_set is None) else False
             total_steps = config_dict["Main"]["steps"]
             fmax = config_dict["Main"]["fmax"]
             max_num_frames = config_dict["ourNEB"]["max_num_frames"]
             if max_num_frames is None:
-                max_num_frames = num_frames
-            can_add_images = not is_vasp and max_num_frames > num_frames
+                max_num_frames = default_num_frames
+            # Sub-band runs: cap total at default_num_frames (one sub-band shouldn't exceed num_frames)
+            if subband_idx_override is not None:
+                max_num_frames = min(max_num_frames, default_num_frames)
+            can_add_images = not is_vasp and max_num_frames > num_images
             add_images_check_interval = config_dict["ourNEB"]["add_images_check_interval"]
             optimizer_kwargs = config_dict[config_dict["Main"]["Optimizer"]]
-    
+
             neb = OCPNEB(
                 images,
                 batch_size=config_dict["ourNEB"]["batch_size"],
@@ -326,11 +341,12 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
                 intermediate_minima=use_intermediate_minima,
                 intermediate_minima_min_depth=config_dict["ourNEB"]["intermediate_minima_min_depth"],
                 intermediate_minima_check_interval=config_dict["ourNEB"]["intermediate_minima_check_interval"],
+                initial_imin_set=initial_imin_set,
                 **neb_kwargs,
             )
-    
+
             opt = Optimizer[1](neb, logfile=temp_log, trajectory=temp_traj, **optimizer_kwargs)
-    
+
             # Optimization loop with optional image addition
             if can_add_images:
                 remaining_steps = total_steps
@@ -343,7 +359,7 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
                     if converged or remaining_steps <= 0:
                         break
                     if len(neb.images) < max_num_frames:
-                        new_images = _expand_band(neb, fmax, max_num_frames, num_frames, calc)
+                        new_images = _expand_band(neb, fmax, max_num_frames, default_num_frames, calc)
                         if new_images is not None:
                             neb = OCPNEB(
                                 new_images,
@@ -376,8 +392,8 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
             fig.savefig(temp_plot)
             plt.close(fig)
     
-            interp_method_out = interpolate_method
-            if isinstance(interpolate_method, str) and interpolate_method.startswith("ase_") and perform_aseidpp:
+            interp_method_out = default_interp if need_interpolation else False
+            if isinstance(interp_method_out, str) and interp_method_out.startswith("ase_") and perform_aseidpp:
                 interp_method_out = "ase_idpp"
     
             with Trajectory(my_output_file, 'a') as writer:
