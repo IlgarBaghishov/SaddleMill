@@ -223,17 +223,17 @@ tsearch automatically handles resume if a job times out or is interrupted:
 
 - **Resume unfinished jobs**: Just resubmit with the same `config.ini`. By default (`run_jobs = remaining`), only jobs that never ran are picked up. Already-completed jobs are skipped.
 
-- **Redo specific categories**: Set `run_jobs` to target specific job outcomes:
+- **Redo specific categories**: Set `run_jobs` to target specific outcomes. Selection is per-line: a job with mixed results (e.g., 3 converged + 3 not_converged Dimer attempts) is selectable by both categories. Only matching entries are redone; the rest stay.
   ```ini
-  run_jobs = not_converged    # Redo unconverged jobs
-  run_jobs = converged        # Redo converged jobs (e.g., refine with VASP)
-  run_jobs = errored          # Retry errored jobs
+  run_jobs = not_converged    # Redo unconverged attempts/sub-bands/sides
+  run_jobs = converged        # Redo converged entries (e.g., refine with VASP)
+  run_jobs = errored          # Retry errored entries
   run_jobs = all              # Redo everything
   ```
 
-- **Continue from previous result** (`continue_from_result = True`, default): When re-running previously completed jobs, tsearch extracts the last result and starts from there instead of from scratch. For NEB, the full band is extracted from debug files. For Dimer, each individual attempt is continued with its original eigenmode and reaction type. For errored jobs (no output), it falls back to the original input automatically. Set `continue_from_result = False` to force a fresh start.
+- **Continue from previous result** (`continue_from_result = True`, default): When re-running, tsearch extracts the last result from output trajs and continues optimization from there. For Dimer, each matching attempt continues with its eigenmode. For NEB, matching sub-bands continue from their extracted images. For DoubleMinimization, unconverged sides continue from their last state. Errored entries fall back to fresh generation. Set `continue_from_result = False` to generate fresh replacements (same reaction types / same sub-band endpoints).
 
-- **CSV archiving**: When re-running jobs that have existing results, old status CSVs are archived as `{method}_status_csvs/previous_{N}.zip` and entries for those job IDs are removed from the active CSVs before the new run begins.
+- **Archiving**: Old files are fully backed up as `previous_{N}.zip`. Only matching entries are removed from active CSVs and output trajectories (per-attempt for Dimer, per-sub-band for NEB, per-side for DoubleMinimization).
 
 - **Fresh start**: Delete `traj_files_ordered.json` and the output directories to start completely from scratch.
 

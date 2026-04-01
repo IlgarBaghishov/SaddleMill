@@ -2,7 +2,7 @@ import numpy as np
 import json, os, glob, shutil, tempfile, zipfile
 from ase.neighborlist import neighbor_list, natural_cutoffs
 from ase.io import Trajectory
-from tsearch.config import VALID_RUN_CATEGORIES, _RUN_CATEGORY_ALIASES
+from tsearch.config import VALID_RUN_CATEGORIES, _RUN_CATEGORY_ALIASES, _get_subunit_config
 
 
 #==============================================================================
@@ -106,30 +106,11 @@ def clean_up_files(config_dict):
 #==============================================================================
 ### PREVIOUS RESULT EXTRACTION (for continue-from-result on resume)
 
-def _build_debug_zip_index(method_name):
-    """Build a map: internal_filename -> zip_path for all debug zips."""
-    index = {}
-    zip_dir = f"{method_name}_debug_zips"
-    for zip_path in glob.glob(os.path.join(zip_dir, "*.zip")):
-        if os.path.basename(zip_path).startswith("previous_"):
-            continue
-        try:
-            with zipfile.ZipFile(zip_path, 'r') as zf:
-                for name in zf.namelist():
-                    index[name] = zip_path
-        except zipfile.BadZipFile:
-            continue
-    return index
-
-
 def _build_output_traj_index(method_name):
     """Scan output trajectories and build a map: src_index -> list of Atoms.
 
     Stores the deserialized Atoms objects directly so that extraction
     functions can return them without re-reading from disk.
-
-    Works for both Dimer (collected_ts_rank_*.traj) and Minimization
-    (collected_opt_rank_*.traj) output files.
     """
     index = {}
     traj_dir = f"{method_name}_trajes"
@@ -146,117 +127,67 @@ def _build_output_traj_index(method_name):
     return index
 
 
-def _extract_neb_band(job_id, num_frames, debug_zip_index):
-    """Extract the final NEB band (all images) from debug traj files.
-
-    Looks for neb_{job_id}.traj first as a loose file, then in debug zips.
-    Detects the actual band size from the last frame's 'nimages' metadata
-    (handles variable-size bands from image addition). Falls back to num_frames.
-    Returns a list of Atoms objects, or None if not found.
-    """
-    traj_name = f"neb_{job_id}.traj"
-
-    def _read_final_band(traj):
-        n = len(traj)
-        actual_frames = traj[-1].info.get('nimages', num_frames)
-        if n >= actual_frames:
-            return [traj[idx] for idx in range(n - actual_frames, n)]
-        return None
-
-    # Try loose file first
-    if os.path.exists(traj_name):
-        with Trajectory(traj_name, 'r') as traj:
-            return _read_final_band(traj)
-
-    # Try debug zips
-    zip_path = debug_zip_index.get(traj_name)
-    if zip_path is None:
-        return None
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            zf.extract(traj_name, tmpdir)
-        extracted = os.path.join(tmpdir, traj_name)
-        with Trajectory(extracted, 'r') as traj:
-            return _read_final_band(traj)
-
-
-def _extract_dimer_attempts(job_id, output_traj_index):
-    """Extract all successful attempt results for a Dimer job_id.
-
-    Returns a list of Atoms objects (one per attempt that produced output),
-    or None if no results found. Each Atoms retains its original .info
-    metadata (eigenmode, reaction_type, selected_index, etc.).
-    """
-    entries = output_traj_index.get(job_id, [])
-    return entries if entries else None
-
-
-def _extract_minimization_structure(job_id, output_traj_index):
-    """Extract the relaxed structure for a job_id from output trajectories."""
-    entries = output_traj_index.get(job_id, [])
-    return entries[0] if entries else None
-
-
 def _sanitize_with_continuation(atoms):
-    """Wrap .info with orig_info (like load_and_sanitize) and mark as continuation."""
-    info = dict(atoms.info)
-    info["_continuation"] = True
-    atoms.info = {"orig_info": info}
+    """Wrap .info with orig_info (like load_and_sanitize) for extracted results."""
+    atoms.info = {"orig_info": dict(atoms.info)}
     return atoms
 
 
-def extract_previous_results(job_ids, config_dict):
-    """Extract previous results for the given job_ids.
+def extract_previous_results(job_ids, config_dict, redo_info):
+    """Extract previous results from output trajs for continuation.
 
-    Returns a dict: job_id -> images.
-      - NEB: list of Atoms (the band)
-      - Dimer: list of Atoms (one per successful attempt)
-      - Minimization: single Atoms
-    Each extracted result has _continuation=True in orig_info.
+    All methods extract from {method}_trajes/ uniformly.
+
+    Returns {job_id: continuation_data} where continuation_data is:
+      - Dimer: {attempt_id: Atoms} for attempts that have output
+      - NEB: {subband_idx: [Atoms sorted by band_idx]}
+      - DoubleMinimization: {side: Atoms} for all sides (-1, 0, 1)
+      - Minimization: Atoms
+
+    All extracted Atoms are wrapped with _sanitize_with_continuation.
     Jobs with no extractable result are omitted (falls back to original input).
     """
     method_name = config_dict["Main"]["method"]
+    _, info_key = _get_subunit_config(method_name)
+    output_traj_index = _build_output_traj_index(method_name)
     results = {}
 
-    if method_name == "NEB":
-        num_frames = config_dict["ourNEB"]["num_frames"]
-        debug_zip_index = _build_debug_zip_index(method_name)
-        for job_id in job_ids:
-            band = _extract_neb_band(job_id, num_frames, debug_zip_index)
-            if band is not None:
-                for img in band:
-                    _sanitize_with_continuation(img)
-                results[job_id] = band
+    for job_id in job_ids:
+        if job_id not in redo_info:
+            continue
+        frames = output_traj_index.get(job_id, [])
+        if not frames:
+            continue
 
-    elif method_name == "Dimer":
-        output_traj_index = _build_output_traj_index(method_name)
-        # Filter attempts to match run_jobs categories
-        run_jobs = config_dict["Main"]["run_jobs"]
-        cats = set(run_jobs) if isinstance(run_jobs, list) else (
-            set(VALID_RUN_CATEGORIES) if run_jobs == "all" else {run_jobs})
-        cats = {_RUN_CATEGORY_ALIASES.get(c, c) for c in cats}
-        keep_conv = "converged" in cats
-        keep_nconv = "not_converged" in cats
-        for job_id in job_ids:
-            attempts = _extract_dimer_attempts(job_id, output_traj_index)
-            if attempts is not None:
-                if not (keep_conv and keep_nconv):
-                    attempts = [a for a in attempts
-                                if (a.info.get('converged') == 1 and keep_conv) or
-                                   (a.info.get('converged') != 1 and keep_nconv)]
-                if attempts:
-                    for atoms in attempts:
+        if method_name == "Minimization":
+            _sanitize_with_continuation(frames[0])
+            results[job_id] = frames[0]
+        else:
+            # Group frames by subunit_id
+            grouped = {}
+            for f in frames:
+                subunit_id = f.info.get(info_key)
+                grouped.setdefault(subunit_id, []).append(f)
+
+            if method_name == "NEB":
+                # Sort each subband's images by band_idx
+                for sid in grouped:
+                    grouped[sid].sort(key=lambda a: a.info.get('band_idx', 0))
+
+            if method_name == "Dimer":
+                # Flatten: each attempt_id maps to a single Atoms
+                grouped = {sid: atoms_list[0] for sid, atoms_list in grouped.items()
+                           if atoms_list}
+
+            # Sanitize all frames
+            for sid, data in grouped.items():
+                if isinstance(data, list):
+                    for atoms in data:
                         _sanitize_with_continuation(atoms)
-                    results[job_id] = attempts
+                else:
+                    _sanitize_with_continuation(data)
 
-    elif method_name == "Minimization":
-        output_traj_index = _build_output_traj_index(method_name)
-        for job_id in job_ids:
-            atoms = _extract_minimization_structure(job_id, output_traj_index)
-            if atoms is not None:
-                _sanitize_with_continuation(atoms)
-                results[job_id] = atoms
+            results[job_id] = grouped
 
     return results
 

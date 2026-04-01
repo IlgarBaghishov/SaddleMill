@@ -19,23 +19,6 @@ class StopRun(Exception):
     pass
 
 
-def _continuation_iter(continuation_atoms_list):
-    """Convert continuation Atoms into (attempt, (atoms, disp_dict, selected_index)) tuples.
-
-    Each Atoms carries its previous run's metadata in orig_info (set by
-    _sanitize_with_continuation). The loop body reads eigenmode and
-    reaction_type from orig_info when not found at the top level.
-    The displacement is negligible (structure is already near the saddle point).
-    """
-    for atoms in continuation_atoms_list:
-        orig = atoms.info.get("orig_info", atoms.info)
-        attempt = orig.get("attempt_id", 0)
-        slctd_indx = orig.get("selected_index", -1)
-
-        atoms_new = atoms.copy()
-        disp_dict = {"displacement_vector": np.random.randn(len(atoms_new), 3) * 1e-10, "method": "vector"}
-        yield attempt, (atoms_new, disp_dict, slctd_indx)
-
 
 def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executorlib_worker_id=None, **kwargs):
 
@@ -61,18 +44,26 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
     # --- MAIN LOOP ---
     any_attempt_succeeded = False
 
+    continuation_data = kwargs.get('continuation_data')  # {attempt_id: Atoms} or None
+    entries_to_run = kwargs.get('entries_to_run')        # set of attempt_ids or None
+
     with Trajectory(my_output_file, 'a') as writer:
 
         attempt = "init"
         slctd_indx = -1
         temp_files = []
 
-        if isinstance(atoms_orig, list):
-            attempts_iter = _continuation_iter(atoms_orig)
-        else:
-            attempts_iter = enumerate(zip(*get_attempts(atoms_orig, config_dict)))
+        attempts_iter = enumerate(zip(*get_attempts(atoms_orig, config_dict)))
 
         for attempt, (atoms, displacement_dict, slctd_indx) in attempts_iter:
+
+            if entries_to_run is not None and attempt not in entries_to_run:
+                continue
+
+            # Use continuation structure if available for this attempt
+            if continuation_data and attempt in continuation_data:
+                atoms = continuation_data[attempt]
+                displacement_dict = {"displacement_vector": np.random.randn(len(atoms), 3) * 1e-10, "method": "vector"}
 
             temp_log = f'dimer_control_{i}_{attempt}_{slctd_indx}.log'
             temp_opt_log = f'dimer_opt_{i}_{attempt}_{slctd_indx}.log'

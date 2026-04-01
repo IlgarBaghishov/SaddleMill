@@ -9,7 +9,7 @@ from tsearch.tools import (save_ordered_traj_names, read_ordered_traj_names,
 from tsearch.config import (load_config, load_method, get_trajes_and_indices,
                             create_results_directories, get_remaining_trajes,
                             get_flux_resources, archive_and_clean_csvs,
-                            archive_and_clean_outputs)
+                            archive_and_clean_outputs, build_redo_info)
 
 
 def check_and_print_status(futures, total):
@@ -28,33 +28,29 @@ def main():
     trajes_and_idxs = get_trajes_and_indices(config_dict)
     can_resume = os.path.exists('traj_files_ordered.json')
     previous_results = {}
+    redo_info = {}
     if can_resume:
         trajes_and_idxs_old = read_ordered_traj_names()
         if trajes_and_idxs != trajes_and_idxs_old:
             raise ValueError("Provided dirpath creates a different trajes_and_idxs. I can't resume.")
         job_IDs, trajes_and_idxs = get_remaining_trajes(trajes_and_idxs, config_dict)
 
-        # Extract previous results BEFORE archiving (output files still intact)
-        if config_dict["Main"]["continue_from_result"] and job_IDs:
-            method_name = config_dict["Main"]["method"]
-            if method_name == "DoubleMinimization":
-                raise ValueError("continue_from_result is not supported for DoubleMinimization.")
+        # Build per-job redo info (which subunits to redo)
+        redo_info = build_redo_info(job_IDs, config_dict)
 
-            # Only extract for jobs that have been previously run (not remaining)
-            from tsearch.config import get_previous_job_status_df
-            status_df = get_previous_job_status_df(config_dict)
-            previously_run = set()
-            if not status_df.empty:
-                previously_run = set(status_df.iloc[:, 0].unique())
-            jobs_with_results = [jid for jid in job_IDs if jid in previously_run]
+        # Extract previous output BEFORE archiving (output files still intact).
+        # Always extract when redoing subunits: NEB needs sub-band endpoints,
+        # DoubleMinimization needs the kept side for reaction check,
+        # Dimer needs previous structures only when continue_from_result=True.
+        if redo_info:
+            print(f"Extracting previous results for {len(redo_info)} jobs...", flush=True)
+            previous_results = extract_previous_results(list(redo_info.keys()), config_dict, redo_info)
+            print(f"  Extracted {len(previous_results)} of {len(redo_info)} results.", flush=True)
 
-            if jobs_with_results:
-                print(f"Extracting previous results for {len(jobs_with_results)} jobs...", flush=True)
-                previous_results = extract_previous_results(jobs_with_results, config_dict)
-                print(f"  Extracted {len(previous_results)} of {len(jobs_with_results)} results.", flush=True)
-
-        archive_and_clean_csvs(config_dict, job_IDs)
-        archive_and_clean_outputs(config_dict, job_IDs)
+        from tsearch.config import _normalize_run_jobs
+        categories_to_clean = _normalize_run_jobs(config_dict["Main"]["run_jobs"])
+        cleaned = archive_and_clean_csvs(config_dict, job_IDs, categories_to_clean)
+        archive_and_clean_outputs(config_dict, cleaned)
         clean_up_files(config_dict)
     else:
         job_IDs = list(range(len(trajes_and_idxs)))
@@ -100,12 +96,11 @@ def main():
             traj = Trajectory(traj_name, 'r')
             for _, i, j in group:
                 job_id = job_IDs[idx]
-                if job_id in previous_results:
-                    images = previous_results[job_id]
-                else:
-                    images = load_and_sanitize(traj, i, j)
+                images = load_and_sanitize(traj, i, j)
                 try:
-                    f = submitter(method, job_id, config_dict, images)
+                    f = submitter(method, job_id, config_dict, images,
+                                  continuation_data=previous_results.get(job_id),
+                                  entries_to_run=redo_info.get(job_id))
                     if config_dict["Main"]["executorlib"]: futures.append(f)
                 except Exception as e:
                     print(f"CRITICAL ERROR on job {idx} ({traj_name}): {e}")

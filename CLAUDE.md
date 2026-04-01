@@ -50,11 +50,11 @@ catsunami/ocpneb.py  (OCPNEB: batched NEB with swDNEB switching)
 - Resume support: `get_remaining_trajes()` skips completed jobs
 
 ### `nebopt.py` - NEB Workflow
-1. **Continuation check**: If images carry `_continuation` flag in `orig_info` (set by `continue_from_result`), locally overrides `relax_endpoints = False` and `interpolate_method = False` — skips steps 2-3 below and goes straight to NEB optimization from the extracted band.
+1. **Continuation/sub-band check**: If `entries_to_run` is set (per-sub-band redo), overrides images and parameters from `continuation_data`. If `continue_from_result=True`, uses extracted sub-band images directly. If `False`, re-interpolates between sub-band endpoints. For full-band continuation (all sub-bands selected + `continue_from_result=True`), reconstructs the full band from extracted sub-band images. For all sub-bands + `False`, falls through to fresh run with original input.
 2. **Endpoint relaxation** (optional): Relaxes reactant/product with configurable optimizer (e.g., LBFGS). For VaspInteractive, calculators are finalized after relaxation and endpoints are frozen with `SinglePointCalculator`.
 3. **Interpolation**: `ocp_idpp` (Meta's PBC-aware), `ase_idpp`, `ase_linear` (auto-falls back to IDPP on atom overlap), or `False` (use provided frames)
 4. **NEB optimization**: Uses `OCPNEB` class with MDMin optimizer. Supports climbing image and intermediate minima detection (per-segment climbing). For VASP/VaspInteractive, each image gets its own calculator instance with separate working directories (`VASP_{job_id}_{image_idx}/`), separate `command`/`ncore` settings for endpoints vs intermediates, and WAVECAR/CHG/CHGCAR cleanup after completion. Intermediate minima reclassification is periodic (every `intermediate_minima_check_interval` steps), not per-step, to prevent oscillation. Automatic image addition: when `max_num_frames > num_frames`, the optimization periodically checks for unconverged segments and doubles their images (FAIRChem only).
-5. **Output**: For each sub-band (segment between intermediate minima), extracts the climbing image (TS candidate) with tangent vector as eigenmode, per-segment barrier/dE, and full sub-band data (`NEB_images` positions, `image_energies`, `image_fmax`). Generates band plot PNG. Per-image effective fmax is tracked throughout optimization and stored in debug trajs.
+5. **Output**: Writes ALL band images as separate frames to the output trajectory. Each image gets `src_index`, `band_idx`, `subband_idx`, `image_type` (endpoint/intermediate_minimum/climbing/regular), `effective_fmax`, `image_converged`, `band_converged`, `band_converged_CI`. CI images additionally get `eigenmode`, `barrier`, `dE`. Intermediate minima images are duplicated so each sub-band is self-contained. Generates band plot PNG. Per-sub-band NEB runs use temp files with `_sub{subband_idx}` suffix.
 
 ### `catsunami/ocpneb.py` - Core NEB Engine
 - **`OCPNEB`** (extends BaseNEB): Two modes controlled by `vasp` flag:
@@ -78,7 +78,7 @@ catsunami/ocpneb.py  (OCPNEB: batched NEB with swDNEB switching)
 - Writes `reaction_type` to `atoms.info` for each attempt
 - **Per-attempt error handling**: Each dimer attempt has its own try/except, so one failing attempt does not abort remaining attempts for the same structure
 - **Consecutive error tracking**: Tracks structure-level errors via `consecutive_errors` counter (passed from `init_function`). If all attempts for a structure fail, counter increments; any successful attempt resets it to 0. When counter reaches `max_consecutive_errors`, worker calls `sys.exit(1)` to trigger executorlib restart (see Worker Health section)
-- **Continuation mode**: When `atoms_orig` is a list (from `continue_from_result`), `dimeropt` bypasses `get_attempts()` and uses `_continuation_iter()` instead. This generator extracts each attempt's `attempt_id` and `selected_index` from `orig_info` for the yield tuple, builds a negligible displacement, and yields `(attempt, (atoms, disp_dict, selected_index))` tuples. The atoms pass through with `orig_info` intact (following the `.info` handling rule). The loop body reads eigenmode and reaction_type from `orig_info` when not found at the top level.
+- **Per-attempt execution**: `dimeropt` accepts `entries_to_run` (set of attempt_ids) and `continuation_data` (dict: attempt_id → Atoms) via kwargs. Always calls `get_attempts()` on the original input, then for each attempt: skips if not in `entries_to_run`, uses `continuation_data[attempt_id]` if available (with near-zero displacement), otherwise runs the fresh-generated attempt. Eigenmode and reaction_type are read from top-level `.info` first, then `orig_info` fallback (following the `.info` handling rule).
 
 ### `dimertools/structure_edit.py` - Reaction Types for Dimer
 Dimer mode supports named reaction types, configured via `reaction_types` (space-separated list). Bulk and OC dataset types have separate type sets dispatched via `_BULK_REACTION_TYPE_DISPATCH` and `_OC_REACTION_TYPE_DISPATCH` respectively.
@@ -129,19 +129,15 @@ Adsorbate atoms are identified by tag=2 (fallback tag=1). Substrate atoms (tag=0
 
 ### `geomopt.py` - Geometry Optimization
 - `geomopt()`: Standard relaxation with optional cell relaxation (FrechetCellFilter)
-- `doublegeomopt()`: Takes converged TS with eigenmode, displaces +/- 0.25*eigenmode, relaxes both directions, detects bond breaking/forming via `check_reaction()`. Reads `eigenmode`, `converged`, `src_index` from `atoms.info['orig_info']` (with fallback to `atoms.info` for backward compatibility).
+- `doublegeomopt()`: Takes converged TS with eigenmode, displaces +/- 0.25*eigenmode, relaxes both directions, detects bond breaking/forming via `check_reaction()`. Reads `eigenmode`, `converged`, `src_index` from `atoms.info['orig_info']` (with fallback to `atoms.info`). Each frame gets `side` in `.info` (-1=min1, 0=ts, 1=min2). Writes 2 CSV status lines per job (one per side). Accepts `entries_to_run` (set of side_ids) and `continuation_data` (dict: side → Atoms) for per-side execution — skips converged sides and uses them from `continuation_data` for reaction check.
 
 ### `tools.py` - Utilities
 - `load_and_sanitize(traj, i, j)`: Loads atoms from trajectory and stashes original `.info` into `atoms.info = {"orig_info": <original_info>}`. This prevents per-atom array data (e.g. `forces`, `stress`) from causing size mismatches when atoms are later added/removed (e.g. vacancy in Dimer). Called in `__main__.py` for all methods uniformly.
 - `clean_up_files(config_dict)`: Removes leftover temp files on resume. Method-aware: cleans NEB files (`neb_*.log`, `neb_*.traj`, `reactant_relaxation_*`, `product_relaxation_*`, `diffusion_barrier_*.png`), Dimer files (`dimer_control_*.log`, `dimer_opt_*.log`, `dimer_*.traj`), or Minimization files (`optimization_*.log`, `optimization_*.traj`). For VASP NEB, also removes `VASP_*_*/` per-image directories.
-- **Continue-from-result extraction** (used by `__main__.py` when `continue_from_result = True`):
-  - `extract_previous_results(job_ids, config_dict)`: Dispatcher that calls method-specific extractors. Returns `{job_id: images}` dict. Jobs with no extractable result are omitted (fall back to original input).
-  - `_extract_neb_band(job_id, num_frames, debug_zip_index)`: Extracts the final NEB band (last `num_frames` frames) from debug traj — tries loose file first, then searches debug zips.
-  - `_extract_dimer_attempts(job_id, output_traj_index)`: Extracts ALL successful attempt results for a job_id from output trajectories (one Atoms per attempt that produced output).
-  - `_extract_minimization_structure(job_id, output_traj_index)`: Extracts the relaxed structure from output trajectory.
-  - `_build_debug_zip_index(method_name)`: Scans all debug zips once, builds `{filename: zip_path}` map.
-  - `_build_output_traj_index(method_name)`: Scans output trajectories, builds `{src_index: [(traj_path, frame_idx, info), ...]}` map.
-  - `_sanitize_with_continuation(atoms)`: Wraps `.info` into `orig_info` (like `load_and_sanitize`) and sets `_continuation = True` flag so method functions can detect continuation images.
+- **Previous result extraction** (used by `__main__.py` when redoing previously-run jobs):
+  - `extract_previous_results(job_ids, config_dict, redo_info)`: Unified extraction from output trajs for ALL methods. Returns `{job_id: continuation_data}` where continuation_data is: Dimer `{attempt_id: Atoms}`, NEB `{subband_idx: [Atoms sorted by band_idx]}`, DoubleMinimization `{side: Atoms}`, Minimization `Atoms`.
+  - `_build_output_traj_index(method_name)`: Scans output trajectories, builds `{src_index: [Atoms]}` map.
+  - `_sanitize_with_continuation(atoms)`: Wraps `.info` into `orig_info` (like `load_and_sanitize`) for extracted results.
 - Bond detection via ASE neighbor_list with natural cutoffs
 - `check_reaction()` / `check_adsorbate_reaction()`: Compare connectivity between structures
 
@@ -259,54 +255,59 @@ relax_cell = False
 
 `run_jobs` specifies which categories of jobs to process. Fresh vs resume is determined implicitly by whether `traj_files_ordered.json` exists on disk.
 
-**4 job categories:**
+**4 categories** (each CSV status line is independently categorized):
 
-| Category | Meaning | CSV statuses that map here |
-|---|---|---|
-| `converged` | At least one attempt converged | `converged`, `converged_after_extension`, `converged_both`, `converged_min1`, `converged_min2`, `converged_only_CI` |
-| `not_converged` | Ran without convergence | `not_converged`, `not_converged_after_extension`, `not_converged_StopRun`, `unconverged` |
-| `errored` | All attempts failed | `error`, `error: <message>` |
-| `remaining` | No CSV row for this job_id | (absence of rows) |
+| Category | CSV statuses that map here |
+|---|---|
+| `converged` | `converged`, `converged_after_extension`, `converged_only_CI` |
+| `not_converged` | `not_converged`, `not_converged_after_extension`, `not_converged_StopRun`, `unconverged` |
+| `errored` | `error`, `error: <message>` |
+| `remaining` | No CSV row for this job_id |
+
+**Per-line selection**: A job is included if ANY of its CSV lines match the requested categories. This means a Dimer job with 3 converged + 3 not_converged attempts is selectable by both `run_jobs = converged` and `run_jobs = not_converged`. Only the matching attempts/sub-bands/sides are redone; the rest stay in the active output.
 
 **Examples:**
 ```ini
 run_jobs = remaining                  # Default. Fresh run: all jobs. Resume: continue unfinished.
 run_jobs = remaining errored          # Resume + retry errors
-run_jobs = converged                  # Redo converged jobs (e.g., rerun with VASP)
-run_jobs = not_converged              # Redo unconverged jobs
+run_jobs = converged                  # Redo converged entries (e.g., refine with VASP)
+run_jobs = not_converged              # Redo unconverged entries
 run_jobs = errored                    # Retry only errors
 run_jobs = all                        # Redo everything
 ```
 
-**Archiving on resume**: When redoing jobs that have existing results, all output files are archived and cleaned:
-- **CSVs**: Archived as `{method}_status_csvs/previous_{N}.zip`, entries for re-run job IDs removed from active CSVs.
-- **Output trajectories**: Archived as `{method}_trajes/previous_{N}.zip`, frames for re-run job IDs removed (filtered by `src_index`).
-- **Debug zips**: Archived as `{method}_debug_zips/previous_{N}.zip`, entries for re-run job IDs removed (filtered by job_id in filename via regex).
+**Archiving on resume**: Archive is always a full backup. Cleaning is per-entry:
+- **CSVs**: Archived as `{method}_status_csvs/previous_{N}.zip`. Only CSV lines matching `run_jobs` categories are removed from active CSVs (per-line cleaning).
+- **Output trajectories**: Archived as `{method}_trajes/previous_{N}.zip`. Only frames matching cleaned entries are removed (by `attempt_id` for Dimer, `subband_idx` for NEB, `src_index` for Minimization). For DoubleMinimization, all 3 frames (min1+TS+min2) are removed and re-written together since they share reaction check metadata.
+- **Debug zips**: Archived as `{method}_debug_zips/previous_{N}.zip`. Per-entry cleaning where filenames contain subunit info (Dimer: `attempt_id`, DoubleMinimization: side via `-0`/`-1` suffix, NEB sub-band reruns: `_sub{idx}` suffix). NEB full-band debug files (no `_sub` suffix) are removed as a whole when any sub-band is redone since they lack per-sub-band granularity.
 
-Jobs with no prior entries (e.g., `remaining`) don't trigger archiving. The `previous_*.zip` archives in debug_zips are excluded from extraction scans (`_build_debug_zip_index` skips them).
+Jobs with no prior entries (e.g., `remaining`) don't trigger archiving.
 
 **Fresh vs resume**: No explicit toggle — if `traj_files_ordered.json` doesn't exist, it's a fresh start; if it exists, it's a resume. To force a fresh start, delete the output directories and `traj_files_ordered.json`.
 
 ### `continue_from_result` — Continue from Previous Result
 
-When `continue_from_result = True` (default) and re-running previously completed jobs (any `run_jobs` category except `remaining`), the system extracts previous results and uses them as starting points instead of the original input trajectories.
+When re-running previously completed entries (any `run_jobs` category except `remaining`), the system always extracts previous results from output trajs (needed for sub-band endpoints, kept sides, etc.). The `continue_from_result` flag controls how extracted data is used:
 
-Continuation is handled **per-job** inside each method function — no global config mutation. This means fresh jobs (`remaining`) and continuation jobs can coexist in the same batch without interference.
+- `True` (default): continue optimization from the extracted structure.
+- `False`: start fresh. For Dimer: generates fresh attempts at the same `attempt_id` positions (same reaction types). For NEB partial sub-bands: re-interpolates between sub-band endpoints. For NEB all sub-bands: uses original input. For DoubleMinimization: re-displaces from TS.
+
+Errored entries always fall back to fresh generation (no output to continue from).
+
+Continuation is handled **per-entry** inside each method function — no global config mutation. Fresh jobs (`remaining`) and continuation jobs coexist in the same batch.
 
 **How it works per method:**
 
-| Method | What is extracted | What happens |
-|---|---|---|
-| NEB | Full band from debug traj (`neb_{job_id}.traj` in debug zips) | `nebopt` detects `_continuation` flag, locally skips endpoint relaxation and interpolation, continues NEB optimization from the extracted band |
-| Dimer | All successful attempt results from output traj (one per attempt) | `dimeropt` detects list input, bypasses `get_attempts()`, continues each attempt from its previous structure with its original eigenmode and reaction_type |
-| Minimization | Relaxed structure from output traj | Optimizer continues from previous positions |
-| DoubleMinimization | Not supported (raises error) | — |
+| Method | Granularity | `continue_from_result=True` | `continue_from_result=False` |
+|---|---|---|---|
+| Dimer | per-attempt | Continue from extracted attempt structure with its eigenmode | Generate fresh attempt at same `attempt_id` (same reaction type, new random displacement) |
+| NEB | per-sub-band | Continue from extracted sub-band images | Partial: re-interpolate between sub-band endpoints. All sub-bands: use original input |
+| DoubleMinimization | per-side | Continue unconverged side from extracted last state | Re-displace from TS (ts ± eigenmode) |
+| Minimization | per-job | Continue from extracted relaxed structure | Use original input |
 
-**Dimer per-attempt continuation**: Each attempt that produced output (converged or not_converged) is continued individually. The original `reaction_type` (e.g., `"vacancy"`) is preserved in the output — not replaced with `"initial_guess"`. The previous eigenmode is passed to `MinModeAtoms` to seed the dimer. Errored attempts (which have no output frame) are skipped. The configured `reaction_types` in `[ourDimer]` is ignored for continuation jobs.
+All methods extract from output trajs uniformly via `extract_previous_results`. Errored entries always fall back to fresh (no output to extract).
 
-**Fallback**: If previous results cannot be extracted (missing debug files, all attempts errored), the job silently falls back to the original input and runs from scratch. In `__main__.py`, this happens naturally: jobs missing from `previous_results` dict use `load_and_sanitize()` to load the original input.
-
-**`initial_guess` vs `continue_from_result`**: These are separate features. `initial_guess` is a Dimer reaction type for fresh runs with **external** TS guesses (from another code, a database, or a different tsearch method like NEB→Dimer). It requires the user to set `reaction_types = initial_guess` and provide input `.traj` files. `continue_from_result` is an automatic internal mechanism that extracts results from a **previous tsearch run** and feeds them back. It bypasses `get_attempts()` entirely and does not use `initial_guess`. Use `initial_guess` when you bring a TS from outside tsearch; use `continue_from_result` when you want tsearch to pick up where it left off.
+**`initial_guess` vs `continue_from_result`**: These are separate features. `initial_guess` is a Dimer reaction type for fresh runs with **external** TS guesses (from another code, a database, or a different tsearch method like NEB→Dimer). `continue_from_result` is an automatic internal mechanism that extracts results from a **previous tsearch run**. Use `initial_guess` when you bring a TS from outside tsearch; use `continue_from_result` when you want tsearch to pick up where it left off.
 
 **Examples:**
 ```ini
@@ -328,23 +329,31 @@ continue_from_result = False
 For method `NEB`:
 ```
 NEB_status_csvs/status_rank_*.csv    # job_id,rank,sub_band_id,status (converged/converged_only_CI/not_converged/error)
-NEB_trajes/collected_ts_rank_*.traj  # TS candidates (one per sub-band) with metadata in atoms.info
-NEB_debug_zips/                      # Compressed log/traj/plot files (images have effective_fmax in .info)
+NEB_trajes/collected_ts_rank_*.traj  # All band images (full band, one frame per image) with metadata in atoms.info
+NEB_debug_zips/                      # Compressed log/traj/plot files
 ```
 
-Each TS image (one per sub-band/segment) in the output trajectory contains:
-- `eigenmode`: Tangent vector at saddle point
-- `barrier`: Forward barrier within segment (eV)
-- `dE`: Reaction energy within segment (eV)
-- `converged`: 1 if all images in sub-band below fmax, 0 otherwise
-- `ci_converged`: 1 if this CI specifically below fmax, 0 otherwise
-- `segment_id`: Sub-band index (0 when no intermediate minima)
-- `NEB_images`: 3D array `(n_subband_images, natoms, 3)` — positions of all images in the sub-band
-- `image_energies`: List of floats — per-image energies in the sub-band
-- `image_fmax`: List of floats — per-image effective fmax in the sub-band
-- `nimages`: Total band size (for continue_from_result extraction)
-- `reaction_type`: (Dimer only) Bulk: vacancy, hop_reuse, hop_insert, kickout_reuse, kickout_insert, ring. OC: adsorbate_atom, adsorbate_atom_neighbors, adsorbate, diffusion, rotation, adsorbate_surface, surface, custom. Both: initial_guess, desorption (overrides initialization type when desorption check triggers), unknown (fallback)
-- `orig_info`: Original `.info` dict from the input trajectory (stashed by `load_and_sanitize` to prevent per-atom array size mismatches)
+Each band image in the output trajectory contains:
+- `src_index`: Job ID
+- `band_idx`: Position in full band (0 to N-1)
+- `subband_idx`: Which sub-band this image belongs to (0, 1, 2, ...)
+- `image_type`: `"endpoint"` / `"intermediate_minimum"` / `"climbing"` / `"regular"`
+- `effective_fmax`: Per-image force max (float)
+- `image_converged`: Whether this image's fmax < threshold (bool)
+- `band_converged`: Whether all images in this sub-band converged (bool)
+- `band_converged_CI`: Whether the CI of this sub-band converged (bool)
+- `nimages`: Total band size
+- `interpolation_method`: Interpolation method used
+- `eigenmode`: (CI images only) Tangent vector at saddle point
+- `barrier`: (CI images only) Forward barrier within segment (eV)
+- `dE`: (CI images only) Reaction energy within segment (eV)
+- `orig_info`: Original `.info` dict from the input trajectory
+
+Intermediate minima images are duplicated so each sub-band is self-contained (has its own endpoints). Per-sub-band redo temp files use `_sub{subband_idx}` suffix.
+
+For method `Dimer`, each output frame contains: `eigenmode`, `converged`, `src_index`, `attempt_id`, `stoprun`, `selected_index`, `reaction_type`, `orig_info`.
+
+For method `DoubleMinimization`, each output frame contains: `side` (-1=min1, 0=ts, 1=min2), `parent_ts_index`, `converged`, `src_index`, `is_reaction`, `n_formed_bonds`, `n_broken_bonds`, `orig_info`. CSV writes 2 lines per job (one per side): `{job_id},{rank},{parent_ts_idx},{side_id},{status}`.
 
 ## Execution Modes
 

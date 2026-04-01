@@ -306,16 +306,18 @@ def _normalize_run_jobs(run_jobs_value):
     return cats
 
 
-def _categorize_job(statuses):
-    """Aggregate a list of status strings into a single job category.
-
-    converged_only_CI maps to the converged category for resume purposes.
-    """
-    if any(s.startswith("converged") for s in statuses):
+def _categorize_status(status):
+    """Categorize a single status string into a run_jobs category."""
+    if status.startswith("converged"):
         return "converged"
-    if all(s.startswith("error") for s in statuses):
+    if status.startswith("error"):
         return "errored"
     return "not_converged"
+
+
+def _categorize_statuses(statuses):
+    """Return the set of categories present in a list of status strings."""
+    return {_categorize_status(s) for s in statuses}
 
 
 def get_remaining_trajes(trajes_and_idxs, config_dict):
@@ -325,14 +327,14 @@ def get_remaining_trajes(trajes_and_idxs, config_dict):
     job_categories = {}
     if not status_df.empty:
         for job_id, group in status_df.groupby(status_df.iloc[:, 0]):
-            job_categories[job_id] = _categorize_job(
+            job_categories[job_id] = _categorize_statuses(
                 group.iloc[:, -1].astype(str).tolist()
             )
 
     remaining = []
     for idx, item in enumerate(trajes_and_idxs):
         if idx in job_categories:
-            if job_categories[idx] in categories_to_run:
+            if job_categories[idx] & categories_to_run:
                 remaining.append([idx, item])
         else:
             if "remaining" in categories_to_run:
@@ -344,23 +346,74 @@ def get_remaining_trajes(trajes_and_idxs, config_dict):
     return list(job_IDs), list(trajes_and_idxs_out)
 
 
-def archive_and_clean_csvs(config_dict, job_ids):
-    """Archive old CSVs and remove entries for jobs being re-run.
+def build_redo_info(job_ids, config_dict):
+    """Determine which subunits to redo for each job based on CSV status.
 
-    Only triggers if any of the job_ids actually have existing CSV entries.
-    Preserves all historical data in numbered zip archives while ensuring
-    the active CSVs only contain current results for correct future filtering.
+    Returns {job_id: set of subunit_ids} where subunit_id is:
+      - Dimer: attempt_id (int)
+      - NEB: sub_band_id (int)
+      - DoubleMinimization: side_id (int, -1 or 1)
+      - Minimization: None
+    Only jobs with at least one matching status line are included.
+    """
+    categories_to_run = _normalize_run_jobs(config_dict["Main"]["run_jobs"])
+    method_name = config_dict["Main"]["method"]
+    subunit_col, _ = _get_subunit_config(method_name)
+    status_df = get_previous_job_status_df(config_dict)
+
+    job_ids_set = set(job_ids)
+    redo_info = {}
+
+    if status_df.empty:
+        return redo_info
+
+    for _, row in status_df.iterrows():
+        jid = row.iloc[0]
+        if jid not in job_ids_set:
+            continue
+        status = str(row.iloc[-1])
+        if _categorize_status(status) in categories_to_run:
+            subunit_id = int(row.iloc[subunit_col]) if subunit_col is not None else None
+            redo_info.setdefault(jid, set()).add(subunit_id)
+
+    return redo_info
+
+
+def _get_subunit_config(method_name):
+    """Return (csv_column_index, info_key) for the sub-unit identifier per method.
+
+    The csv column holds the sub-unit id (attempt_id, sub_band_id, side_id).
+    The info_key is the corresponding key in output traj frame .info.
+    Returns (None, None) for methods without sub-units (Minimization).
+    """
+    if method_name == "Dimer":
+        return 2, "attempt_id"
+    elif method_name == "NEB":
+        return 2, "subband_idx"
+    elif method_name == "DoubleMinimization":
+        return 3, "side"
+    return None, None
+
+
+def archive_and_clean_csvs(config_dict, job_ids, categories_to_clean):
+    """Archive old CSVs and remove only entries matching the requested categories.
+
+    Per-line cleaning: for each CSV row belonging to a selected job_id,
+    categorize its status. Only remove if the category is in categories_to_clean.
+    Returns {job_id: set of sub-unit ids} that were cleaned, for use by
+    archive_and_clean_outputs.
     """
     if not job_ids:
-        return
-    status_dir = f"{config_dict['Main']['method']}_status_csvs"
+        return {}
+    method_name = config_dict['Main']['method']
+    status_dir = f"{method_name}_status_csvs"
     csv_files = glob.glob(os.path.join(status_dir, "*.csv"))
     if not csv_files:
-        return
+        return {}
 
-    # Read all CSVs and check if any job_ids have existing entries
+    subunit_col, _ = _get_subunit_config(method_name)
     job_ids_set = set(job_ids)
-    csv_data = {}  # filepath -> DataFrame
+    csv_data = {}
     has_entries_to_clean = False
     for f in csv_files:
         try:
@@ -372,7 +425,7 @@ def archive_and_clean_csvs(config_dict, job_ids):
             has_entries_to_clean = True
 
     if not has_entries_to_clean:
-        return  # All job_ids are remaining (no CSV entries) → pure append, skip archiving
+        return {}
 
     # 1. Archive: zip all current CSVs as previous_{N}.zip
     n = 0
@@ -383,52 +436,111 @@ def archive_and_clean_csvs(config_dict, job_ids):
         for f in csv_files:
             zf.write(f, os.path.basename(f))
 
-    # 2. Clean: remove entries for redone jobs, keep the rest
+    # 2. Clean: remove only rows whose status category matches categories_to_clean
+    cleaned = {}  # {job_id: set of subunit_ids}
     for f, df in csv_data.items():
-        filtered = df[~df.iloc[:, 0].isin(job_ids_set)]
-        if filtered.empty:
-            os.remove(f)
-        else:
-            filtered.to_csv(f, header=False, index=False)
+        to_remove = []
+        for row_idx, row in df.iterrows():
+            jid = row.iloc[0]
+            if jid not in job_ids_set:
+                continue
+            status = str(row.iloc[-1])
+            if _categorize_status(status) in categories_to_clean:
+                to_remove.append(row_idx)
+                subunit_id = int(row.iloc[subunit_col]) if subunit_col is not None else None
+                cleaned.setdefault(jid, set()).add(subunit_id)
+        if to_remove:
+            filtered = df.drop(to_remove)
+            if filtered.empty:
+                os.remove(f)
+            else:
+                filtered.to_csv(f, header=False, index=False)
+
+    return cleaned
 
 
 def _get_debug_filename_patterns(method_name):
-    """Return compiled regex patterns that capture job_id from debug filenames."""
+    """Return compiled regex patterns that capture (job_id, subunit_id) from debug filenames.
+
+    Each pattern should have group(1)=job_id. Group(2), if present, is the subunit_id.
+    """
     if method_name == "NEB":
         return [
-            re.compile(r'^(?:ERROR_)?neb_(\d+)\.'),
-            re.compile(r'^(?:ERROR_)?(?:reactant|product)_relaxation_(\d+)\.'),
-            re.compile(r'^(?:ERROR_)?diffusion_barrier_(\d+)\.'),
-            re.compile(r'^VASP_(\d+)_'),
+            re.compile(r'^(?:ERROR_)?neb_(\d+)(?:_sub(\d+))?\.'),
+            re.compile(r'^(?:ERROR_)?(?:reactant|product)_relaxation_(\d+)(?:_sub(\d+))?\.'),
+            re.compile(r'^(?:ERROR_)?diffusion_barrier_(\d+)(?:_sub(\d+))?\.'),
+            re.compile(r'^VASP_(\d+)(?:_sub(\d+))?_'),
         ]
     elif method_name == "Dimer":
-        return [re.compile(r'^(?:ERROR_)?dimer_(?:control_|opt_)?(\d+)_')]
-    elif method_name in ("Minimization", "DoubleMinimization"):
+        return [re.compile(r'^(?:ERROR_)?dimer_(?:control_|opt_)?(\d+)_(\d+)_')]
+    elif method_name == "DoubleMinimization":
+        return [re.compile(r'^(?:ERROR_)?optimization_r\d+_(\d+)-(\d+)')]
+    elif method_name == "Minimization":
         return [re.compile(r'^(?:ERROR_)?optimization_r\d+_(\d+)')]
     return []
 
 
-def _extract_job_id(filename, patterns):
-    """Extract integer job_id from a debug filename. Returns int or None."""
+def _extract_debug_ids(filename, patterns):
+    """Extract (job_id, subunit_id) from a debug filename.
+
+    Returns (int, int) or (int, None) or (None, None).
+    For Dimer: subunit_id is the attempt_id.
+    For NEB: subunit_id is the subband_idx (from _sub{N} suffix), or None for full-band files.
+    For DoubleMinimization: subunit_id is the file_idx (0→side=-1, 1→side=1).
+    """
     for pat in patterns:
         m = pat.match(filename)
         if m:
-            return int(m.group(1))
-    return None
+            job_id = int(m.group(1))
+            subunit_id = int(m.group(2)) if m.lastindex >= 2 and m.group(2) is not None else None
+            return job_id, subunit_id
+    return None, None
 
 
-def archive_and_clean_outputs(config_dict, job_ids):
-    """Archive output trajectories and debug zips, remove entries for re-run jobs.
+def _should_remove_debug(filename, patterns, cleaned, method_name):
+    """Check if a debug file should be removed based on cleaned entries."""
+    job_id, subunit_id = _extract_debug_ids(filename, patterns)
+    if job_id is None or job_id not in cleaned:
+        return False
+    if method_name == "Minimization":
+        return True  # No subunit, remove all for job
+    if method_name == "DoubleMinimization":
+        # file_idx 0 → side=-1, file_idx 1 → side=1
+        if subunit_id is not None:
+            side = -1 if subunit_id == 0 else 1
+            return side in cleaned[job_id]
+        return True  # Can't determine side, remove to be safe
+    # Dimer and NEB: subunit_id directly matches
+    if subunit_id is not None:
+        return subunit_id in cleaned[job_id]
+    # No subunit in filename (e.g., full-band NEB file) — remove if job matches
+    return True
 
-    Mirrors archive_and_clean_csvs: archive all current files into previous_{N}.zip,
-    then filter out entries belonging to the re-run job_ids. Only triggers if
-    stale entries actually exist (skips for pure remaining jobs).
+
+def _should_remove_frame(img, cleaned, info_key, remove_all_sides=False):
+    """Check if an output traj frame matches a cleaned entry."""
+    jid = img.info.get('src_index')
+    if jid not in cleaned:
+        return False
+    if info_key is None or remove_all_sides:
+        return True  # Remove all frames for this job
+    return img.info.get(info_key) in cleaned[jid]
+
+
+def archive_and_clean_outputs(config_dict, cleaned):
+    """Archive output trajectories and debug zips, remove entries matching cleaned.
+
+    cleaned: {job_id: set of subunit_ids} from archive_and_clean_csvs.
+    Archive is always a full backup. Cleaning removes only matching entries.
     """
-    if not job_ids:
+    if not cleaned:
         return
 
     method_name = config_dict["Main"]["method"]
-    job_ids_set = set(job_ids)
+    _, info_key = _get_subunit_config(method_name)
+    # DoubleMinimization: always remove all 3 frames (min1+TS+min2) since they
+    # share reaction check metadata and are always re-written together.
+    remove_all_sides = method_name == "DoubleMinimization"
 
     # ---- Output Trajectories ----
     traj_dir = f"{method_name}_trajes"
@@ -440,7 +552,7 @@ def archive_and_clean_outputs(config_dict, job_ids):
             try:
                 with Trajectory(traj_path, 'r') as traj:
                     for idx in range(len(traj)):
-                        if traj[idx].info.get('src_index') in job_ids_set:
+                        if _should_remove_frame(traj[idx], cleaned, info_key, remove_all_sides):
                             has_stale = True
                             break
             except Exception:
@@ -449,7 +561,6 @@ def archive_and_clean_outputs(config_dict, job_ids):
                 break
 
         if has_stale:
-            # Archive
             n = 0
             while os.path.exists(os.path.join(traj_dir, f"previous_{n}.zip")):
                 n += 1
@@ -457,14 +568,13 @@ def archive_and_clean_outputs(config_dict, job_ids):
                 for f in traj_files:
                     zf.write(f, os.path.basename(f))
 
-            # Filter
             for traj_path in traj_files:
                 try:
                     with Trajectory(traj_path, 'r') as traj:
                         all_frames = [traj[idx] for idx in range(len(traj))]
                 except Exception:
                     continue
-                kept = [img for img in all_frames if img.info.get('src_index') not in job_ids_set]
+                kept = [img for img in all_frames if not _should_remove_frame(img, cleaned, info_key, remove_all_sides)]
                 os.remove(traj_path)
                 if kept:
                     with Trajectory(traj_path, 'w') as writer:
@@ -483,7 +593,7 @@ def archive_and_clean_outputs(config_dict, job_ids):
             try:
                 with zipfile.ZipFile(zip_path, 'r') as zf:
                     for name in zf.namelist():
-                        if _extract_job_id(name, patterns) in job_ids_set:
+                        if _should_remove_debug(name, patterns, cleaned, method_name):
                             has_stale = True
                             break
             except zipfile.BadZipFile:
@@ -492,7 +602,6 @@ def archive_and_clean_outputs(config_dict, job_ids):
                 break
 
         if has_stale:
-            # Archive
             n = 0
             while os.path.exists(os.path.join(zip_dir, f"previous_{n}.zip")):
                 n += 1
@@ -500,13 +609,12 @@ def archive_and_clean_outputs(config_dict, job_ids):
                 for f in zip_files:
                     zf.write(f, os.path.basename(f))
 
-            # Filter
             for zip_path in zip_files:
                 try:
                     with zipfile.ZipFile(zip_path, 'r') as zf_old:
                         all_entries = zf_old.infolist()
                         kept = [info for info in all_entries
-                                if _extract_job_id(info.filename, patterns) not in job_ids_set]
+                                if not _should_remove_debug(info.filename, patterns, cleaned, method_name)]
 
                         if not kept:
                             os.remove(zip_path)

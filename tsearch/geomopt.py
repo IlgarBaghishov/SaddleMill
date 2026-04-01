@@ -15,7 +15,7 @@ def relax_structure(config_dict, optimizable, logfile, trajfile, Optimizer):
     return converged
 
 
-def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, executorlib_worker_id=None):
+def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, executorlib_worker_id=None, **kwargs):
 
     rank = executorlib_worker_id
 
@@ -85,7 +85,7 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
             log_status("error")
 
 
-def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, executorlib_worker_id=None):
+def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, executorlib_worker_id=None, **kwargs):
 
     rank = executorlib_worker_id
 
@@ -102,13 +102,14 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
     my_output_file = f"{method_name}_trajes/collected_opt_rank_{rank}.traj"
     zip_name = f"{method_name}_debug_zips/structure_rank_{rank}_data.zip"
 
-    def log_status(parent_source_idx, status_msg):
+    def log_status(parent_source_idx, side_id, status_msg):
         with open(status_file, 'a') as f:
-            f.write(f"{i},{rank},{parent_source_idx},{status_msg}\n")
+            f.write(f"{i},{rank},{parent_source_idx},{side_id},{status_msg}\n")
 
     # 3. Initialize list to track temp files from BOTH optimizations
     temp_files = []
-
+    continuation_data = kwargs.get('continuation_data')  # {side: Atoms} or None
+    entries_to_run = kwargs.get('entries_to_run')        # set of side_ids (-1, 1) or None
     with Trajectory(my_output_file, 'a') as writer:
         orig = atoms.info.get('orig_info', atoms.info)
         parent_source_idx = orig['src_index']
@@ -123,6 +124,7 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
 
             # Identify IDs
             refined_eigenmode = orig['eigenmode']
+            continue_from_result = config_dict["Main"]["continue_from_result"]
 
             # --- PREPARE TS (Middle Image) ---
             ts_atoms = atoms.copy()
@@ -133,46 +135,43 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
                 forces=atoms.get_forces()
             )
 
-            # --- MINIMIZATION 1 (Forward) ---
-            min1 = ts_atoms.copy()
-            min1.calc = calc
+            # --- MINIMIZE BOTH SIDES ---
+            mins = {}  # side -> (atoms, converged)
             displacement = 0.25
-            min1.positions += displacement * refined_eigenmode
-            
-            # Define temp files for step 1
-            log1 = f'optimization_r{rank}_{i}-0.log'
-            traj1 = f'optimization_r{rank}_{i}-0.traj'
-            temp_files.extend([log1, traj1])
-            
-            optimizable = FrechetCellFilter(min1) if config_dict['our'+method_name]['relax_cell'] else min1
-            conv1 = relax_structure(config_dict, optimizable, log1, traj1, Optimizer)
-            
-            # Freeze results
-            min1.calc = SinglePointCalculator(min1, energy=min1.get_potential_energy(), forces=min1.get_forces())
-            min1.info['type'] = 'minimum_1'
-            min1.info['parent_ts_index'] = parent_source_idx
-            min1.info['converged'] = conv1
-            min1.info['src_index'] = i
+            for side in [-1, 1]:
+                should_run = entries_to_run is None or side in entries_to_run
+                file_idx = 0 if side == -1 else 1
 
-            # --- MINIMIZATION 2 (Backward) ---
-            min2 = ts_atoms.copy()
-            min2.calc = calc
-            min2.positions -= displacement * refined_eigenmode
-            
-            # Define temp files for step 2
-            log2 = f'optimization_r{rank}_{i}-1.log'
-            traj2 = f'optimization_r{rank}_{i}-1.traj'
-            temp_files.extend([log2, traj2])
-            
-            optimizable = FrechetCellFilter(min2) if config_dict['our'+method_name]['relax_cell'] else min2
-            conv2 = relax_structure(config_dict, optimizable, log2, traj2, Optimizer)
-            
-            # Freeze results
-            min2.calc = SinglePointCalculator(min2, energy=min2.get_potential_energy(), forces=min2.get_forces())
-            min2.info['type'] = 'minimum_2'
-            min2.info['parent_ts_index'] = parent_source_idx
-            min2.info['converged'] = conv2
-            min2.info['src_index'] = i
+                if should_run:
+                    if continuation_data and side in continuation_data and continue_from_result:
+                        min_atoms = continuation_data[side].copy()
+                        min_atoms.calc = calc
+                    else:
+                        min_atoms = ts_atoms.copy()
+                        min_atoms.calc = calc
+                        min_atoms.positions += -side * displacement * refined_eigenmode
+
+                    log_f = f'optimization_r{rank}_{i}-{file_idx}.log'
+                    traj_f = f'optimization_r{rank}_{i}-{file_idx}.traj'
+                    temp_files.extend([log_f, traj_f])
+
+                    optimizable = FrechetCellFilter(min_atoms) if config_dict['our'+method_name]['relax_cell'] else min_atoms
+                    conv = relax_structure(config_dict, optimizable, log_f, traj_f, Optimizer)
+                    min_atoms.calc = SinglePointCalculator(min_atoms, energy=min_atoms.get_potential_energy(), forces=min_atoms.get_forces())
+                else:
+                    if not (continuation_data and side in continuation_data):
+                        raise ValueError(f"Missing continuation data for kept side={side}")
+                    min_atoms = continuation_data[side].copy()
+                    conv = bool(min_atoms.info.get('orig_info', min_atoms.info).get('converged'))
+
+                min_atoms.info['side'] = side
+                min_atoms.info['parent_ts_index'] = parent_source_idx
+                min_atoms.info['converged'] = conv
+                min_atoms.info['src_index'] = i
+                mins[side] = (min_atoms, conv)
+
+            min1, conv1 = mins[-1]
+            min2, conv2 = mins[1]
 
             # --- CHECK REACTION ---
             neighbor_fudge = 1.25
@@ -209,22 +208,17 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
             ts_atoms.info['is_ads_reaction'] = is_ads_reaction
             ts_atoms.info['n_ads_formed_bonds'] = ads_n_formed
             ts_atoms.info['n_ads_broken_bonds'] = ads_n_broken
+            ts_atoms.info['side'] = 0
             ts_atoms.info['src_index'] = i
 
-            # --- WRITE TRIPLET (Min1 -> TS -> Min2) ---
+            # --- WRITE FRAMES (Min1, TS, Min2) ---
             writer.write(min1)
             writer.write(ts_atoms)
             writer.write(min2)
 
-            if conv1 and conv2:
-                status_msg = "converged_both"
-            elif conv1:
-                status_msg = "converged_min1"
-            elif conv2:
-                status_msg = "converged_min2"
-            else:
-                status_msg = "unconverged"
-            log_status(parent_source_idx, status_msg)
+            for side, (_, conv) in mins.items():
+                if entries_to_run is None or side in entries_to_run:
+                    log_status(parent_source_idx, side, "converged" if conv else "not_converged")
 
             if consecutive_errors is not None:
                 consecutive_errors[0] = 0
@@ -244,7 +238,9 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
             print(f"\nTraceback details:\n{traceback.format_exc()}", flush=True)
             if consecutive_errors is not None:
                 consecutive_errors[0] += 1
-            log_status(parent_source_idx, f"error: {str(e)}")
+            for side in [-1, 1]:
+                if entries_to_run is None or side in entries_to_run:
+                    log_status(parent_source_idx, side, f"error: {str(e)}")
 
             existing_files = [f for f in temp_files if os.path.exists(f)]
             if existing_files and config_dict['Main']['zip']:
