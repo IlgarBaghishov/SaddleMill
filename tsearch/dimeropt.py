@@ -18,6 +18,28 @@ class StopRun(Exception):
     pass
 
 
+def _setup_dimer(atoms, calc, eigenmode=None, displacement_dict=None,
+                 dimer_control_kwargs=None, control_logfile=None,
+                 logfile=None, trajectory=None):
+    """Create MinModeAtoms and MinModeTranslate optimizer for dimer method.
+
+    Does not run the optimization. Caller attaches callbacks and calls
+    dim_rlx.run().
+
+    Returns (d_atoms, dim_rlx).
+    """
+    atoms.calc = calc
+    d_control = DimerControl(logfile=control_logfile, **(dimer_control_kwargs or {}))
+    eig_kw = {'eigenmodes': [np.array(eigenmode)]} if eigenmode is not None else {}
+    d_atoms = MinModeAtoms(atoms, d_control, **eig_kw)
+    if displacement_dict:
+        d_atoms.displace(**displacement_dict)
+    else:
+        d_atoms.displace(displacement_vector=np.random.randn(len(atoms), 3) * 1e-10,
+                         method='vector')
+    dim_rlx = MinModeTranslate(d_atoms, trajectory=trajectory, logfile=logfile)
+    return d_atoms, dim_rlx
+
 
 def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executorlib_worker_id=None, **kwargs):
 
@@ -70,36 +92,27 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
             temp_files = [temp_log, temp_opt_log, temp_traj]
 
             try:
-                atoms.calc = calc
-
                 # Handle constraints:
                 if atoms.constraints:
                     free_indices = [atom.index for atom in atoms if atom.index not in atoms.constraints[0].get_indices()]
                 else:
                     free_indices = [atom.index for atom in atoms]
 
-                d_control = DimerControl(
-                    logfile = temp_log,
-                    **config_dict["DimerControl"],
-                )
-
                 # Use existing eigenmode if available (top level from
                 # get_attempts/initial_guess, or orig_info from continuation),
                 # otherwise let ASE derive one from the displacement.
-                eigenmode_kwarg = {}
-                orig = atoms.info.get('orig_info', {})
-                if 'eigenmode' in atoms.info:
-                    eigenmode_kwarg['eigenmodes'] = [np.array(atoms.info['eigenmode'])]
-                elif 'eigenmode' in orig:
-                    eigenmode_kwarg['eigenmodes'] = [np.array(orig['eigenmode'])]
+                eigenmode = atoms.info.get('eigenmode')
+                if eigenmode is None:
+                    eigenmode = atoms.info.get('orig_info', {}).get('eigenmode')
+                if eigenmode is not None:
+                    eigenmode = np.array(eigenmode)
 
-                d_atoms = MinModeAtoms(atoms, d_control, **eigenmode_kwarg)
-                d_atoms.displace(**displacement_dict)
-
-                dim_rlx = MinModeTranslate(
-                    d_atoms,
-                    trajectory = temp_traj,
-                    logfile = temp_opt_log
+                d_atoms, dim_rlx = _setup_dimer(
+                    atoms, calc, eigenmode=eigenmode,
+                    displacement_dict=displacement_dict,
+                    dimer_control_kwargs=config_dict["DimerControl"],
+                    control_logfile=temp_log,
+                    logfile=temp_opt_log, trajectory=temp_traj,
                 )
 
                 # PR Check

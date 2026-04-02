@@ -48,6 +48,9 @@ class ConfigManager:
             "intermediate_minima_check_interval": 100,
             "intermediate_minima_min_depth": 0.05,
             "add_images_check_interval": 100,
+            "dimer_refine_ci": False,
+            "dimer_refine_steps": 300,
+            "refine_band_steps": 0,
             "vasp_command_endpoints": None,
             "vasp_ncore_endpoints": None,
             "vasp_command_intermediates": None,
@@ -470,8 +473,11 @@ def _get_debug_filename_patterns(method_name):
     if method_name == "NEB":
         return [
             re.compile(r'^(?:ERROR_)?neb_(\d+)(?:_sub(\d+))?\.'),
+            re.compile(r'^(?:ERROR_)?neb_refine_(\d+)(?:_sub(\d+))?\.'),
             re.compile(r'^(?:ERROR_)?(?:reactant|product)_relaxation_(\d+)(?:_sub(\d+))?\.'),
             re.compile(r'^(?:ERROR_)?diffusion_barrier_(\d+)(?:_sub(\d+))?\.'),
+            re.compile(r'^(?:ERROR_)?dimer_ci_(?:control_)?(\d+)(?:_sub(\d+))?_img\d+\.'),
+            re.compile(r'^(?:ERROR_)?imin_relax_(\d+)(?:_sub(\d+))?_img\d+\.'),
             re.compile(r'^VASP_(\d+)(?:_sub(\d+))?_'),
         ]
     elif method_name == "Dimer":

@@ -51,6 +51,20 @@ class swDNEB(NEBMethod):
         imgforce += sw * (perp_spring_force - np.vdot(perp_spring_force, perp_pot_force) * perp_pot_force)
 
 
+def _find_segment_ci(seg_start, seg_end, climbing_set, energies):
+    """Find the climbing-image index for a segment [seg_start, seg_end].
+
+    Returns the CI index, or None if the segment has no interior images.
+    """
+    for ci_idx in climbing_set:
+        if seg_start < ci_idx < seg_end:
+            return ci_idx
+    interior = [j for j in range(seg_start + 1, seg_end)]
+    if interior:
+        return max(interior, key=lambda idx: energies[idx])
+    return None
+
+
 class OCPNEB(BaseNEB):
     def __init__(
         self,
@@ -70,6 +84,9 @@ class OCPNEB(BaseNEB):
         intermediate_minima_min_depth=0.05,
         intermediate_minima_check_interval=100,
         initial_imin_set=None,
+        frozen_images=None,
+        freeze_fmax=None,
+        freeze_endpoint_fmax=None,
     ):
         super().__init__(
             images,
@@ -93,6 +110,9 @@ class OCPNEB(BaseNEB):
         self._imin_seeded = initial_imin_set is not None
         self._climbing_set = set()
         self.image_fmax = np.zeros(self.nimages)
+        self._frozen_set = set(frozen_images) if frozen_images else set()
+        self._freeze_fmax = freeze_fmax
+        self._freeze_endpoint_fmax = freeze_endpoint_fmax
 
         if not self.vasp:
             from fairchem.core.common.utils import setup_imports, setup_logging
@@ -114,10 +134,12 @@ class OCPNEB(BaseNEB):
 
             self.intermediate_forces = []
             self.cached = False
+            self._frozen_energies = {}
+            self._frozen_pbc_forces = {}
 
 
     def get_forces(self):
-        if self.vasp and not self.intermediate_minima and not self._imin_set:
+        if self.vasp and not self.intermediate_minima and not self._imin_set and not self._frozen_set:
             return super().get_forces()
         elif self.vasp:
             # VASP + intermediate_minima: per-image evaluation + custom NEB forces
@@ -137,10 +159,21 @@ class OCPNEB(BaseNEB):
             if self.cached:
                 return self.intermediate_forces
             else:
+                # Convert absolute frozen indices to relative indices in images[1:-1]
+                frozen_rel = set()
+                for abs_idx in self._frozen_set:
+                    if 1 <= abs_idx <= self.nimages - 2:
+                        frozen_rel.add(abs_idx - 1)
+                need_eval_rel = sorted(
+                    idx for idx in range(len(images))
+                    if idx not in frozen_rel or (idx + 1) not in self._frozen_energies
+                )
+                eval_images = [images[idx] for idx in need_eval_rel]
+
                 energies_calcd = []
                 forces_calcd = []
-                for i in range(0, len(images), self.batch_size):
-                    batch_images = images[i : i + self.batch_size]
+                for i in range(0, len(eval_images), self.batch_size):
+                    batch_images = eval_images[i : i + self.batch_size]
                     data_list = [self.a2g(img) for img in batch_images]
                     batch = self.atomicdata_list_to_batch(data_list)
 
@@ -148,27 +181,40 @@ class OCPNEB(BaseNEB):
                     energies_calcd.extend(predictions["energy"].detach().cpu().flatten().tolist())
                     forces_calcd.extend(predictions["forces"].detach().cpu().numpy())
 
-                forces = np.array(forces_calcd)
+                eval_forces = (np.array(forces_calcd).reshape(len(eval_images), self.natoms, 3)
+                               if eval_images else np.empty((0, self.natoms, 3)))
+                eval_map = {rel: i for i, rel in enumerate(need_eval_rel)}
 
+                forces = np.zeros((len(images), self.natoms, 3))
                 energies = np.empty(self.nimages)
-                energies[1:-1] = energies_calcd
-
                 energies[0] = self.reactant_energy
                 energies[-1] = self.product_energy
 
-                # Handle constraints:
-                if self.images[0].constraints and np.equal(self.images[0].get_tags(), np.zeros(len(self.images[0]),int)).all():  # if had constraints and all atom tags are 0
+                for rel_idx in range(len(images)):
+                    abs_idx = rel_idx + 1
+                    if rel_idx in eval_map:
+                        ei = eval_map[rel_idx]
+                        energies[abs_idx] = energies_calcd[ei]
+                        forces[rel_idx] = eval_forces[ei]
+                        if abs_idx in self._frozen_set:
+                            self._frozen_energies[abs_idx] = energies_calcd[ei]
+                            self._frozen_pbc_forces[abs_idx] = eval_forces[ei].copy()
+                    else:
+                        energies[abs_idx] = self._frozen_energies[abs_idx]
+                        forces[rel_idx] = self._frozen_pbc_forces[abs_idx]
+
+                # Handle constraints
+                if self.images[0].constraints and np.equal(self.images[0].get_tags(), np.zeros(len(self.images[0]),int)).all():
                     fixed_atoms = self.images[0].constraints[0].get_indices()
                 elif not np.equal(self.images[0].get_tags(), np.zeros(len(self.images[0]),int)).all():
                     fixed_atoms = np.array([idx for idx, tag in enumerate(self.images[0].get_tags()) if tag == 0])
                 else:
                     fixed_atoms = np.array([],dtype=int)
 
-                for i in range(self.nimages - 2):
+                for i in range(len(images)):
                     for fixed_atom in fixed_atoms:
-                        forces[fixed_atom + len(images[0]) * i] = [0, 0, 0]
+                        forces[i, fixed_atom] = [0, 0, 0]
 
-                forces = np.reshape(forces, (len(images), self.natoms, 3))
                 forces = self.get_precon_forces(forces, energies, self.images)
 
                 self.intermediate_forces = forces
@@ -205,9 +251,13 @@ class OCPNEB(BaseNEB):
                               self._force_call_count % self.intermediate_minima_check_interval == 0))
         if should_check_imin:
             self._check_imin_first_call = False
+            frozen_and_neighbors = set()
+            for f in self._frozen_set:
+                frozen_and_neighbors.update([f - 1, f, f + 1])
             imin_set = set()
             for i in range(2, self.nimages - 2):  # exclude endpoint-adjacent images to ensure each segment has room for a CI
-                if (energies[i] < energies[i - 1] - self.intermediate_minima_min_depth and
+                if (i not in frozen_and_neighbors and
+                        energies[i] < energies[i - 1] - self.intermediate_minima_min_depth and
                         energies[i] < energies[i + 1] - self.intermediate_minima_min_depth):
                     imin_set.add(i)
             self._imin_set = imin_set
@@ -220,11 +270,12 @@ class OCPNEB(BaseNEB):
         # Always recompute climbing set from current energies and current imin_set
         climbing_set = set()
         if self.climb:
-            if imin_set:
-                boundaries = sorted([0] + list(imin_set) + [self.nimages - 1])
+            all_boundaries = imin_set | self._frozen_set
+            if all_boundaries:
+                boundaries = sorted(set([0, self.nimages - 1]) | all_boundaries)
                 for s in range(len(boundaries) - 1):
                     inner = [idx for idx in range(boundaries[s] + 1, boundaries[s + 1])
-                             if idx not in imin_set]
+                             if idx not in imin_set and idx not in self._frozen_set]
                     if inner:
                         climbing_set.add(max(inner, key=lambda idx: energies[idx]))
             else:
@@ -252,7 +303,9 @@ class OCPNEB(BaseNEB):
             # from now on we use the preconditioned forces (equal for precon=ID)
             imgforce = precon_forces[i - 1]
 
-            if i in imin_set:
+            if i in self._frozen_set:
+                imgforce[:] = 0.0
+            elif i in imin_set:
                 pass  # Full PES force, no spring force, no tangential modification
             elif i in climbing_set:
                 if self.method == "aseneb":
@@ -286,4 +339,41 @@ class OCPNEB(BaseNEB):
         images[0].info['imin_set'] = sorted(self._imin_set)
         images[0].info['climbing_set'] = sorted(self._climbing_set)
 
+        if self._freeze_fmax is not None:
+            self._auto_freeze()
+
         return precon_forces.reshape((-1, 3))
+
+    def _auto_freeze(self):
+        """Add newly converged sub-bands/imin/CIs to frozen set.
+
+        Never freezes individual regular images. Runs at every step when
+        freeze_fmax is set.
+        """
+        fmax = self._freeze_fmax
+        endpoint_fmax = self._freeze_endpoint_fmax or fmax
+        imin_set = self._imin_set
+        climbing_set = self._climbing_set
+        boundaries = sorted([0] + list(imin_set) + [self.nimages - 1])
+
+        for s in range(len(boundaries) - 1):
+            seg_start, seg_end = boundaries[s], boundaries[s + 1]
+
+            all_converged = all(
+                self.image_fmax[j] < (endpoint_fmax if (j in imin_set or j == 0 or j == self.nimages - 1) else fmax)
+                for j in range(seg_start, seg_end + 1)
+            )
+            if all_converged:
+                for j in range(seg_start, seg_end + 1):
+                    if 0 < j < self.nimages - 1:
+                        self._frozen_set.add(j)
+            else:
+                for j in [seg_start, seg_end]:
+                    if (j in imin_set and 0 < j < self.nimages - 1
+                            and j not in self._frozen_set
+                            and self.image_fmax[j] < endpoint_fmax):
+                        self._frozen_set.add(j)
+                seg_ci = _find_segment_ci(seg_start, seg_end, climbing_set, self.energies)
+                if (seg_ci is not None and seg_ci not in self._frozen_set
+                        and self.image_fmax[seg_ci] < fmax):
+                    self._frozen_set.add(seg_ci)

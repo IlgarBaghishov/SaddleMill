@@ -12,22 +12,9 @@ from ase.data import covalent_radii
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import Trajectory
 from ase.mep.neb import NEB, NEBTools, NEBState
-from tsearch.catsunami.ocpneb import OCPNEB
+from tsearch.catsunami.ocpneb import OCPNEB, _find_segment_ci
+from tsearch.dimeropt import _setup_dimer
 from tsearch.tools import backup_flux_logs
-
-
-def _find_segment_ci(seg_start, seg_end, climbing_set, energies):
-    """Find the climbing-image index for a segment [seg_start, seg_end].
-
-    Returns the CI index, or None if the segment has no interior images.
-    """
-    for ci_idx in climbing_set:
-        if seg_start < ci_idx < seg_end:
-            return ci_idx
-    interior = [j for j in range(seg_start + 1, seg_end)]
-    if interior:
-        return max(interior, key=lambda idx: energies[idx])
-    return None
 
 
 def _expand_band(neb, fmax_threshold, max_num_frames, num_frames, calc):
@@ -334,6 +321,7 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
             can_add_images = not is_vasp and max_num_frames > num_images
             add_images_check_interval = config_dict["ourNEB"]["add_images_check_interval"]
             optimizer_kwargs = config_dict[config_dict["Main"]["Optimizer"]]
+            endpoint_fmax = config_dict["ourNEB"]["endpoint_relax_fmax"] if default_relax else fmax
 
             neb = OCPNEB(
                 images,
@@ -344,6 +332,8 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
                 intermediate_minima_min_depth=config_dict["ourNEB"]["intermediate_minima_min_depth"],
                 intermediate_minima_check_interval=config_dict["ourNEB"]["intermediate_minima_check_interval"],
                 initial_imin_set=initial_imin_set,
+                freeze_fmax=fmax if not is_vasp else None,
+                freeze_endpoint_fmax=endpoint_fmax if not is_vasp else None,
                 **neb_kwargs,
             )
 
@@ -371,6 +361,8 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
                                 intermediate_minima=use_intermediate_minima,
                                 intermediate_minima_min_depth=config_dict["ourNEB"]["intermediate_minima_min_depth"],
                                 intermediate_minima_check_interval=config_dict["ourNEB"]["intermediate_minima_check_interval"],
+                                freeze_fmax=fmax if not is_vasp else None,
+                                freeze_endpoint_fmax=endpoint_fmax if not is_vasp else None,
                                 **neb_kwargs,
                             )
                             opt = Optimizer[1](neb, logfile=temp_log, trajectory=temp_traj,
@@ -378,7 +370,112 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
                             print(f"Rank {rank}, structure {i}: added images, band now has {len(neb.images)} images", flush=True)
             else:
                 converged = opt.run(fmax=fmax, steps=total_steps)
-    
+
+            # --- Post-NEB: dimer CI refinement + imin relaxation + continuation ---
+            if not converged and not is_vasp:
+                any_new_converged = False
+
+                # Dimer on unconverged CIs
+                if config_dict["ourNEB"]["dimer_refine_ci"]:
+                    dimer_refine_steps = config_dict["ourNEB"]["dimer_refine_steps"]
+                    p_imin = neb._imin_set
+                    p_climb = neb._climbing_set
+                    p_bounds = sorted([0] + list(p_imin) + [neb.nimages - 1])
+
+                    for seg_s in range(len(p_bounds) - 1):
+                        seg_start, seg_end = p_bounds[seg_s], p_bounds[seg_s + 1]
+                        seg_ci = _find_segment_ci(seg_start, seg_end, p_climb, neb.energies)
+                        if seg_ci is None or neb.image_fmax[seg_ci] < fmax:
+                            continue
+
+                        state_d = NEBState(neb, neb.images, neb.energies)
+                        tangent = neb.neb_method.get_tangent(
+                            state_d, state_d.spring(seg_ci - 1), state_d.spring(seg_ci), seg_ci)
+
+                        ci_atoms = neb.images[seg_ci].copy()
+                        ci_atoms.constraints = neb.images[seg_ci].constraints
+                        d_log = f'dimer_ci_{i}{suffix}_img{seg_ci}.log'
+                        d_ctrl = f'dimer_ci_control_{i}{suffix}_img{seg_ci}.log'
+                        d_traj = f'dimer_ci_{i}{suffix}_img{seg_ci}.traj'
+                        temp_files.extend([d_log, d_ctrl, d_traj])
+
+                        try:
+                            d_atoms, dim_rlx = _setup_dimer(
+                                ci_atoms, calc, eigenmode=tangent,
+                                dimer_control_kwargs=config_dict.get("DimerControl", {}),
+                                control_logfile=d_ctrl, logfile=d_log, trajectory=d_traj)
+                            if dim_rlx.run(fmax=fmax, steps=dimer_refine_steps):
+                                neb.images[seg_ci].positions[:] = ci_atoms.positions
+                                any_new_converged = True
+                                print(f"Rank {rank}, structure {i}: dimer converged CI {seg_ci}", flush=True)
+                            else:
+                                print(f"Rank {rank}, structure {i}: dimer failed CI {seg_ci}", flush=True)
+                        except Exception as e:
+                            print(f"Rank {rank}, structure {i}: dimer error CI {seg_ci}: {e}", flush=True)
+
+                    if any_new_converged:
+                        neb.cached = False
+                        neb.get_forces()
+
+                # Imin relaxation (only if refine_band_steps > 0 AND intermediate_minima)
+                refine_band_steps = config_dict["ourNEB"]["refine_band_steps"]
+                if refine_band_steps > 0 and use_intermediate_minima:
+                    ep_opt_name = config_dict["ourNEB"]["endpoint_relax_Optimizer"] or config_dict["Main"]["Optimizer"]
+                    ep_kwargs = config_dict[ep_opt_name]
+                    for imin_idx in sorted(neb._imin_set):
+                        if neb.image_fmax[imin_idx] < endpoint_fmax:
+                            continue
+                        ep_img = neb.images[imin_idx]
+                        ep_img.calc = calc
+                        ep_log = f'imin_relax_{i}{suffix}_img{imin_idx}.log'
+                        ep_traj_f = f'imin_relax_{i}{suffix}_img{imin_idx}.traj'
+                        temp_files.extend([ep_log, ep_traj_f])
+                        try:
+                            ep_opt = Optimizer[0](ep_img, logfile=ep_log, trajectory=ep_traj_f, **ep_kwargs)
+                            ep_opt.run(endpoint_fmax, config_dict["ourNEB"]["endpoint_relax_steps"])
+                            e_ep, f_ep = ep_img.get_potential_energy(), ep_img.get_forces()
+                            ep_img.calc = SinglePointCalculator(ep_img, energy=e_ep, forces=f_ep)
+                            neb.image_fmax[imin_idx] = float(np.sqrt((f_ep**2).sum(axis=1)).max())
+                            if neb.image_fmax[imin_idx] < endpoint_fmax:
+                                any_new_converged = True
+                                print(f"Rank {rank}, structure {i}: relaxed imin {imin_idx}", flush=True)
+                        except Exception as e:
+                            print(f"Rank {rank}, structure {i}: imin relax error {imin_idx}: {e}", flush=True)
+
+                # Continuation NEB with frozen converged images
+                if refine_band_steps > 0 and any_new_converged:
+                    t_log = f'neb_refine_{i}{suffix}.log'
+                    t_traj = f'neb_refine_{i}{suffix}.traj'
+                    temp_files.extend([t_log, t_traj])
+
+                    neb_kw_cont = dict(neb_kwargs, climb=False)
+                    neb = OCPNEB(
+                        neb.images,
+                        batch_size=config_dict["ourNEB"]["batch_size"],
+                        dneb=config_dict["ourNEB"]["DNEB"],
+                        vasp=False, intermediate_minima=False,
+                        initial_imin_set=neb._imin_set or None,
+                        frozen_images=neb._frozen_set,
+                        freeze_fmax=fmax, freeze_endpoint_fmax=endpoint_fmax,
+                        **neb_kw_cont,
+                    )
+                    opt_cont = Optimizer[1](neb, logfile=t_log, trajectory=t_traj, **optimizer_kwargs)
+                    opt_cont.run(fmax=fmax, steps=refine_band_steps)
+                    print(f"Rank {rank}, structure {i}: continuation NEB done", flush=True)
+
+                # Final eval without frozen for correct image_type in result extraction
+                if any_new_converged:
+                    saved_imin = neb._imin_set
+                    neb = OCPNEB(
+                        neb.images,
+                        batch_size=config_dict["ourNEB"]["batch_size"],
+                        dneb=config_dict["ourNEB"]["DNEB"],
+                        vasp=False, intermediate_minima=False,
+                        initial_imin_set=saved_imin or None,
+                        **neb_kwargs,
+                    )
+                    neb.get_forces()
+
             if config_dict["Main"]["Calculator"] == "VaspInteractive":
                 for img in neb.images[1:-1]:
                     img.calc.finalize()
