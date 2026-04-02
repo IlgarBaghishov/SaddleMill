@@ -358,7 +358,7 @@ Each band image in the output trajectory contains:
 
 Intermediate minima images are duplicated so each sub-band is self-contained (has its own endpoints). Per-sub-band redo temp files use `_sub{subband_idx}` suffix.
 
-For method `Dimer`, each output frame contains: `eigenmode`, `converged`, `src_index`, `attempt_id`, `stoprun`, `selected_index`, `reaction_type`, `orig_info`.
+For method `Dimer`, each output frame contains: `eigenmode`, `curvature`, `converged`, `src_index`, `attempt_id`, `stoprun`, `selected_index`, `reaction_type`, `orig_info`.
 
 For method `DoubleMinimization`, each output frame contains: `side` (-1=min1, 0=ts, 1=min2), `parent_ts_index`, `converged`, `src_index`, `is_reaction`, `n_formed_bonds`, `n_broken_bonds`, `orig_info`. CSV writes 2 lines per job (one per side): `{job_id},{rank},{side_id},{parent_ts_idx},{status}`.
 

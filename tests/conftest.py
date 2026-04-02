@@ -184,57 +184,11 @@ def fairchem_calc():
 
 
 @pytest.fixture(scope="session")
-def _oc_adsorbate_slab_session():
-    """Session-scoped version of oc_adsorbate_slab (for expensive GPU fixtures)."""
-    return read(str(FIXTURES_DIR / "oc_adsorbate_slab.traj"))
+def converged_ts_atoms():
+    """Pre-generated converged TS from fixtures/converged_ts.traj.
 
-
-@pytest.fixture(scope="session")
-def converged_ts_atoms(fairchem_calc, _oc_adsorbate_slab_session):
-    """Generate a TS structure by running a quick Dimer search with FAIRChem.
-
-    Session-scoped: runs once, shared by doublegeomopt and other tests.
-    Returns Atoms with eigenmode/converged/src_index in .info, plus
-    SinglePointCalculator attached (so energy/forces are available).
-
-    If dimer doesn't fully converge in 300 steps, still returns the result
-    (doublegeomopt only needs eigenmode present).
+    Contains eigenmode, converged=1, src_index=0 in .info, plus
+    SinglePointCalculator with energy/forces. Generated once via Dimer
+    with FAIRChem on oc_adsorbate_slab.
     """
-    if not has_cuda():
-        pytest.skip("No CUDA GPU")
-    from ase.mep import DimerControl, MinModeAtoms, MinModeTranslate
-
-    atoms = _oc_adsorbate_slab_session.copy()
-    tags = atoms.get_tags()
-    atoms.set_constraint(FixAtoms(indices=np.where(tags == 0)[0]))
-    atoms.calc = fairchem_calc
-
-    d_control = DimerControl(
-        initial_eigenmode_method="displacement",
-        maximum_translation=0.1,
-        dimer_separation=0.01,
-    )
-    d_atoms = MinModeAtoms(atoms, d_control)
-
-    # Displace a single adsorbate atom
-    ads_indices = np.where(tags == 2)[0]
-    if len(ads_indices) > 0:
-        d_atoms.displace(displacement_center=int(ads_indices[0]),
-                         gauss_std=0.2, number_of_atoms=1)
-    else:
-        d_atoms.displace(displacement_vector=np.random.randn(len(atoms), 3) * 0.01,
-                         method='vector')
-
-    dim_rlx = MinModeTranslate(d_atoms)
-    converged = dim_rlx.run(fmax=0.05, steps=300)
-
-    eigenmode = d_atoms.get_eigenmode()
-    energy = atoms.get_potential_energy()
-    forces = atoms.get_forces()
-
-    atoms.info["eigenmode"] = eigenmode
-    atoms.info["converged"] = 1 if converged else 1  # Mark as converged for testing
-    atoms.info["src_index"] = 0
-    atoms.calc = SinglePointCalculator(atoms, energy=energy, forces=forces)
-
-    return atoms
+    return read(str(FIXTURES_DIR / "converged_ts.traj"))

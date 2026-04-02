@@ -173,10 +173,12 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
 
                 # Metadata
                 eigenmode = d_atoms.get_eigenmode()
+                curvature = d_atoms.get_curvature()
                 energy = atoms.get_potential_energy()
                 forces = atoms.get_forces()
 
                 atoms.info['eigenmode'] = eigenmode
+                atoms.info['curvature'] = float(curvature)
                 atoms.calc = SinglePointCalculator(atoms, energy=energy, forces=forces)
                 atoms.info['converged'] = 1 if converged else 0
                 atoms.info['src_index'] = i
