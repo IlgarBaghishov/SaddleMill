@@ -308,12 +308,14 @@ class TestBulkRing:
                 nonzero = np.any(np.abs(dv) > 1e-14, axis=1).sum()
                 assert nonzero == 3, f"Ring-3 should displace 3 atoms, got {nonzero}"
 
-    def test_empty_ring_sizes_returns_empty(self, emt_cu_bulk):
-        """ring_sizes=[] should return empty lists immediately."""
+    def test_empty_ring_sizes_returns_none_entries(self, emt_cu_bulk):
+        """ring_sizes=[] should return None entries for each requested attempt."""
         _seed()
         config = _bulk_config(reaction_types="ring", ring_sizes=[])
         images, dds, idxs = get_ring_attempts(emt_cu_bulk, config, 5)
-        assert images == [] and dds == [] and idxs == []
+        assert len(images) == 5 and all(img is None for img in images)
+        assert len(dds) == 5 and all(dd is None for dd in dds)
+        assert idxs == [-1] * 5
 
 
 # =========================================================================
@@ -437,7 +439,7 @@ class TestOCReactionTypes:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             images, dds, idxs = get_rotation_attempts(slab, config, 3)
-        assert images == []
+        assert len(images) == 3 and all(img is None for img in images)
         assert any("at least 2 adsorbate" in str(warning.message) for warning in w)
 
     def test_rotation_multi_atom(self, emt_cu_slab_with_adsorbate):
@@ -488,7 +490,7 @@ class TestOCReactionTypes:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             images, dds, idxs = get_adsorbate_atom_attempts(atoms, config, 2)
-        assert images == []
+        assert len(images) == 2 and all(img is None for img in images)
         assert any("No adsorbate atoms" in str(warning.message) for warning in w)
 
     def test_adsorbate_surface_includes_neighbors(self, emt_cu_slab_with_adsorbate):

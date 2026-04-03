@@ -333,7 +333,7 @@ def get_hop_reuse_attempts(atoms, num_attempts):
 
     if len(sites) == 0:
         warnings.warn("Found no interstitial sites; skipping hop_reuse.")
-        return [], [], []
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
 
     cell = atoms.get_cell()
     positions = atoms.get_positions()
@@ -375,7 +375,7 @@ def get_hop_insert_attempts(atoms, num_attempts):
 
     if len(sites) < 2:
         warnings.warn("Found fewer than 2 interstitial sites; skipping hop_insert.")
-        return [], [], []
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
 
     cell = atoms.get_cell()
     site_idx_list = _shuffled_site_indices(len(sites), num_attempts)
@@ -428,7 +428,7 @@ def get_kickout_reuse_attempts(atoms, num_attempts):
 
     if len(sites) < 2:
         warnings.warn("Found fewer than 2 interstitial sites; skipping kickout_reuse.")
-        return [], [], []
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
 
     cell = atoms.get_cell()
     positions = atoms.get_positions()
@@ -486,7 +486,7 @@ def get_kickout_insert_attempts(atoms, num_attempts):
 
     if len(sites) < 2:
         warnings.warn("Found fewer than 2 interstitial sites; skipping kickout_insert.")
-        return [], [], []
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
 
     cell = atoms.get_cell()
     positions = atoms.get_positions()
@@ -628,7 +628,7 @@ def get_ring_attempts(atoms, config_dict, num_attempts):
         ring_sizes = [int(x) for x in ring_sizes]
 
     if not ring_sizes:
-        return [], [], []
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
 
     neighbors_dict = _build_neighbor_dict(atoms)
     cell = atoms.get_cell()
@@ -641,6 +641,10 @@ def get_ring_attempts(atoms, config_dict, num_attempts):
             images.append(result[0])
             displacement_dicts.append(result[1])
             selected_indices.append(result[2])
+        else:
+            images.append(None)
+            displacement_dicts.append(None)
+            selected_indices.append(-1)
     return images, displacement_dicts, selected_indices
 
 
@@ -689,7 +693,7 @@ def get_adsorbate_atom_attempts(atoms, config_dict, num_attempts):
     adsorbate_indices = _get_oc_adsorbate_indices(atoms)
     if len(adsorbate_indices) == 0:
         warnings.warn("No adsorbate atoms (tag 1 or 2) found; skipping 'adsorbate_atom'.")
-        return [], [], []
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
 
     chosen = _sample_adsorbate_atoms(adsorbate_indices, num_attempts)
     images, displacement_dicts, selected_indices = [], [], []
@@ -707,7 +711,7 @@ def get_adsorbate_atom_neighbors_attempts(atoms, config_dict, num_attempts):
     adsorbate_indices = _get_oc_adsorbate_indices(atoms)
     if len(adsorbate_indices) == 0:
         warnings.warn("No adsorbate atoms (tag 1 or 2) found; skipping 'adsorbate_atom_neighbors'.")
-        return [], [], []
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
 
     chosen = _sample_adsorbate_atoms(adsorbate_indices, num_attempts)
     images, displacement_dicts, selected_indices = [], [], []
@@ -725,7 +729,7 @@ def get_adsorbate_attempts(atoms, config_dict, num_attempts):
     adsorbate_indices = _get_oc_adsorbate_indices(atoms)
     if len(adsorbate_indices) == 0:
         warnings.warn("No adsorbate atoms (tag 1 or 2) found; skipping 'adsorbate'.")
-        return [], [], []
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
 
     mask = np.zeros(len(atoms), dtype=bool)
     mask[adsorbate_indices] = True
@@ -746,7 +750,7 @@ def get_diffusion_attempts(atoms, config_dict, num_attempts):
     adsorbate_indices = _get_oc_adsorbate_indices(atoms)
     if len(adsorbate_indices) == 0:
         warnings.warn("No adsorbate atoms (tag 1 or 2) found; skipping 'diffusion'.")
-        return [], [], []
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
 
     images, displacement_dicts, selected_indices = [], [], []
     for _ in range(num_attempts):
@@ -769,10 +773,10 @@ def get_rotation_attempts(atoms, config_dict, num_attempts):
     adsorbate_indices = _get_oc_adsorbate_indices(atoms)
     if len(adsorbate_indices) == 0:
         warnings.warn("No adsorbate atoms (tag 1 or 2) found; skipping 'rotation'.")
-        return [], [], []
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
     if len(adsorbate_indices) < 2:
         warnings.warn("Rotation requires at least 2 adsorbate atoms; skipping.")
-        return [], [], []
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
 
     positions = atoms.get_positions()
     masses = atoms.get_masses()
@@ -805,7 +809,7 @@ def get_adsorbate_surface_attempts(atoms, config_dict, num_attempts):
     adsorbate_indices = _get_oc_adsorbate_indices(atoms)
     if len(adsorbate_indices) == 0:
         warnings.warn("No adsorbate atoms (tag 1 or 2) found; skipping 'adsorbate_surface'.")
-        return [], [], []
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
 
     mask = _get_oc_neighbor_mask(atoms, adsorbate_indices)
 
@@ -825,7 +829,7 @@ def get_surface_attempts(atoms, config_dict, num_attempts):
     surface_indices = np.where(tags == 1)[0]
     if len(surface_indices) == 0:
         warnings.warn("No surface atoms (tag=1) found; skipping 'surface'.")
-        return [], [], []
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
 
     chosen = _sample_adsorbate_atoms(surface_indices, num_attempts)
     images, displacement_dicts, selected_indices = [], [], []

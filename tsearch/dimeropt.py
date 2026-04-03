@@ -81,6 +81,10 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
             if entries_to_run is not None and attempt not in entries_to_run:
                 continue
 
+            if atoms is None:
+                log_status(attempt, -1, "error: failed to generate attempt")
+                continue
+
             # Use continuation structure if available for this attempt
             if continuation_data and attempt in continuation_data:
                 atoms = continuation_data[attempt]
