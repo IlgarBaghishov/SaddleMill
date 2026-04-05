@@ -267,19 +267,31 @@ class OCPNEB(BaseNEB):
 
         imin_set = self._imin_set
 
-        # Always recompute climbing set from current energies and current imin_set
+        # Recompute climbing set. Only imin create segment boundaries (never frozen images).
+        # Frozen CIs are locked: once a CI freezes, it stays as CI for its segment permanently.
+        frozen_cis = self._climbing_set & self._frozen_set
         climbing_set = set()
         if self.climb:
-            all_boundaries = imin_set | self._frozen_set
-            if all_boundaries:
-                boundaries = sorted(set([0, self.nimages - 1]) | all_boundaries)
+            if imin_set:
+                boundaries = sorted(set([0, self.nimages - 1]) | imin_set)
                 for s in range(len(boundaries) - 1):
-                    inner = [idx for idx in range(boundaries[s] + 1, boundaries[s + 1])
-                             if idx not in imin_set and idx not in self._frozen_set]
-                    if inner:
-                        climbing_set.add(max(inner, key=lambda idx: energies[idx]))
+                    seg_start, seg_end = boundaries[s], boundaries[s + 1]
+                    seg_frozen_cis = {idx for idx in frozen_cis if seg_start < idx < seg_end}
+                    if seg_frozen_cis:
+                        climbing_set.update(seg_frozen_cis)
+                    else:
+                        inner = [idx for idx in range(seg_start + 1, seg_end)
+                                 if idx not in imin_set and idx not in self._frozen_set]
+                        if inner:
+                            climbing_set.add(max(inner, key=lambda idx: energies[idx]))
             else:
-                climbing_set.add(state.imax)
+                if frozen_cis:
+                    climbing_set.update(frozen_cis)
+                else:
+                    candidates = [idx for idx in range(1, self.nimages - 1)
+                                  if idx not in self._frozen_set]
+                    if candidates:
+                        climbing_set.add(max(candidates, key=lambda idx: energies[idx]))
         self._climbing_set = climbing_set
 
         # Set imax to the global highest energy among climbing images (for result collection)
@@ -340,7 +352,13 @@ class OCPNEB(BaseNEB):
         images[0].info['climbing_set'] = sorted(self._climbing_set)
 
         if self._freeze_fmax is not None:
+            prev_frozen = set(self._frozen_set)
             self._auto_freeze()
+            # Cache energy/forces for newly frozen images so they skip batching next step
+            for abs_idx in self._frozen_set - prev_frozen:
+                if abs_idx not in self._frozen_energies:
+                    self._frozen_energies[abs_idx] = energies[abs_idx]
+                    self._frozen_pbc_forces[abs_idx] = self.real_forces[abs_idx].copy()
 
         return precon_forces.reshape((-1, 3))
 
