@@ -18,14 +18,10 @@ htmlcov/
 .DS_Store
 *.log
 *ll_out*
-examples/catsunami
-examples/dneb_tests
-examples/nebopt_executorlib_ls6_ilgar
-examples/nebopt_intcases_impr_tang_aselinear_20images
-examples/nebopt_interesting_cases_aseneb_aselinear
-examples/nebopt_interesting_cases_impr_tang_aselinear
-examples/dimeropt_executorlib/
-# examples/dimeropt_lematbulk/
-examples/nebopt_vasp_oc20neb/*
-!examples/nebopt_vasp_oc20neb/config.ini
+examples/**
+!examples/**/
 !examples/**/*.sh
+!examples/**/config.ini
+!examples/**/data/**
+!examples/**/sched-fluxion-qmanager.toml
+examples/NEB_OC20NEB*/**
