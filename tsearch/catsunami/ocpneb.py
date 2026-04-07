@@ -326,6 +326,7 @@ class OCPNEB(BaseNEB):
             images[img_i].info['nimages'] = self.nimages
         images[0].info['imin_set'] = sorted(self._imin_set)
         images[0].info['climbing_set'] = sorted(self._climbing_set)
+        images[0].info['frozen_set'] = sorted(self._frozen_set)
 
         if self._freeze_fmax is not None:
             prev_frozen = set(self._frozen_set)

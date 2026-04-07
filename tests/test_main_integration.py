@@ -6,6 +6,7 @@ verify output formats (CSVs, trajectories, metadata), and test resume/continuati
 
 import pytest
 import os
+import csv
 import shutil
 import glob
 from pathlib import Path
@@ -70,9 +71,8 @@ zip = False
         csv_files = glob.glob("Minimization_status_csvs/*.csv")
         assert len(csv_files) >= 1
         with open(csv_files[0], 'r') as f:
-            for line in f:
-                parts = line.strip().split(",")
-                assert len(parts) == 3, f"Minimization CSV should have 3 columns, got: {line}"
+            for parts in csv.reader(f):
+                assert len(parts) == 3, f"Minimization CSV should have 3 columns, got: {parts}"
                 assert parts[2] in ("converged", "not_converged") or parts[2].startswith("error")
 
         # Verify output trajectory
@@ -125,9 +125,8 @@ allow_shared_calculator = True
         csv_files = glob.glob("NEB_status_csvs/*.csv")
         assert len(csv_files) >= 1
         with open(csv_files[0], 'r') as f:
-            for line in f:
-                parts = line.strip().split(",")
-                assert len(parts) == 4, f"NEB CSV should have 4 columns, got: {line}"
+            for parts in csv.reader(f):
+                assert len(parts) == 4, f"NEB CSV should have 4 columns, got: {parts}"
                 status = parts[3]
                 assert status in ("converged", "converged_CI", "not_converged") or status.startswith("error")
 
@@ -211,9 +210,8 @@ dimer_separation = 0.01
         csv_files = glob.glob("Dimer_status_csvs/*.csv")
         assert len(csv_files) >= 1
         with open(csv_files[0], 'r') as f:
-            for line in f:
-                parts = line.strip().split(",")
-                assert len(parts) == 5, f"Dimer CSV should have 5 columns, got: {line}"
+            for parts in csv.reader(f):
+                assert len(parts) == 5, f"Dimer CSV should have 5 columns, got: {parts}"
                 status = parts[4]
                 valid_statuses = {
                     "converged", "converged_after_extension",

@@ -186,6 +186,7 @@ def parse_neb_trajectory(traj_path, progress_label=""):
             "nimages": nimages,
             "imin_set": list(a0.info.get("imin_set", [])),
             "climbing_set": list(a0.info.get("climbing_set", [])),
+            "frozen_set": list(a0.info.get("frozen_set", [])),
             "energies": [],
             "effective_fmax": [],
             "positions": [],
@@ -229,13 +230,12 @@ def parse_neb_trajectory(traj_path, progress_label=""):
                 "detail": f"{prev_climbing} → {step_data['climbing_set']}",
             })
 
-        # Detect newly frozen images (efmax drops to ~0)
+        # Detect newly frozen images
         if steps:
-            prev_fmax = steps[-1]["effective_fmax"]
-            for img_i in range(min(len(prev_fmax), len(step_data["effective_fmax"]))):
-                was_frozen = prev_fmax[img_i] < FROZEN_THRESHOLD
-                is_frozen = step_data["effective_fmax"][img_i] < FROZEN_THRESHOLD
-                if is_frozen and not was_frozen:
+            prev_frozen = set(steps[-1].get("frozen_set", []))
+            cur_frozen = set(step_data.get("frozen_set", []))
+            for img_i in cur_frozen - prev_frozen:
+                if img_i < len(step_data["effective_fmax"]):
                     events.append({
                         "step_idx": step_idx,
                         "type": "freeze",
@@ -397,8 +397,9 @@ def plot_overview(job_id, log_sections, refine_sections, traj_steps, traj_events
     heatmap = np.full((max_nimages, n_sampled), np.nan)
     for col, si in enumerate(sampled_indices):
         s = all_heatmap_steps[si]
+        frozen = set(s.get("frozen_set", []))
         for img_i, fm in enumerate(s["effective_fmax"]):
-            if fm > FROZEN_THRESHOLD:
+            if img_i not in frozen:
                 heatmap[img_i, col] = fm
             else:
                 heatmap[img_i, col] = FROZEN_THRESHOLD  # mark frozen as minimum
@@ -425,14 +426,15 @@ def plot_overview(job_id, log_sections, refine_sections, traj_steps, traj_events
         if col_i % marker_sample != 0:
             continue
         s = all_heatmap_steps[si]
+        frozen_set = set(s.get("frozen_set", []))
         for im_idx in s.get("imin_set", []):
             if im_idx < len(s["effective_fmax"]):
-                frozen = s["effective_fmax"][im_idx] < FROZEN_THRESHOLD
+                frozen = im_idx in frozen_set
                 color = "darkblue" if frozen else "lightskyblue"
                 ax_b.plot(si, im_idx, "s", color=color, markersize=2, alpha=0.8)
         for ci_idx in s.get("climbing_set", []):
             if ci_idx < len(s["effective_fmax"]):
-                frozen = s["effective_fmax"][ci_idx] < FROZEN_THRESHOLD
+                frozen = ci_idx in frozen_set
                 color = "black" if frozen else "gray"
                 ax_b.plot(si, ci_idx, "^", color=color, markersize=2, alpha=0.8)
 
@@ -513,7 +515,7 @@ def plot_overview(job_id, log_sections, refine_sections, traj_steps, traj_events
     imin_count = np.array([len(s.get("imin_set", [])) for s in traj_steps])
     ci_count = np.array([len(s.get("climbing_set", [])) for s in traj_steps])
     frozen_count = np.array([
-        sum(1 for fm in s["effective_fmax"] if fm < FROZEN_THRESHOLD)
+        len(s.get("frozen_set", []))
         for s in traj_steps
     ])
 
@@ -563,7 +565,7 @@ def plot_per_image_fmax(job_id, traj_steps, traj_events, output_path):
                 fmax_vals.append(fm)
 
                 # Determine type
-                if fm < FROZEN_THRESHOLD:
+                if img_i in set(s.get("frozen_set", [])):
                     colors.append("green")
                 elif img_i in s.get("imin_set", []):
                     colors.append("blue")
@@ -626,8 +628,12 @@ def plot_per_image_fmax(job_id, traj_steps, traj_events, output_path):
 # ── Plotting: Figure 3 — Post-NEB Refinement ──────────────────────────────
 
 def plot_refinement(job_id, files, temp_dir, output_path):
-    """Plot dimer CI refinement, imin relaxation, and refine NEB results."""
-    # Collect dimer CI files
+    """Plot dimer CI refinement, imin relaxation, and refine NEB results.
+
+    Sections are visually separated: dimer CI (top), imin relaxation (middle),
+    refine NEB (bottom, full width). In dimer panels, curvature=0 is aligned
+    with the fmax threshold so both lines below one reference = converged.
+    """
     dimer_files = sorted([
         (fn, fp) for fn, fp in files.items()
         if fn.startswith(f"dimer_ci_{job_id}_img") and fn.endswith(".log")
@@ -637,43 +643,82 @@ def plot_refinement(job_id, files, temp_dir, output_path):
         (fn, fp) for fn, fp in files.items()
         if fn.startswith(f"imin_relax_{job_id}_img") and fn.endswith(".log")
     ])
+    refine_log_fn = f"neb_refine_{job_id}.log"
+    has_refine = refine_log_fn in files
 
-    n_panels = len(dimer_files) + len(imin_files) + 1  # +1 for refine NEB
-    if n_panels == 0:
+    n_dimer = len(dimer_files)
+    n_imin = len(imin_files)
+
+    if n_dimer + n_imin == 0 and not has_refine:
         return
 
-    ncols = min(3, n_panels)
-    nrows = (n_panels + ncols - 1) // ncols
+    ncols = min(3, max(n_dimer, n_imin, 1))
 
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+    dimer_rows = (n_dimer + ncols - 1) // ncols if n_dimer > 0 else 0
+    imin_rows = (n_imin + ncols - 1) // ncols if n_imin > 0 else 0
+    refine_rows = 1 if has_refine else 0
+
+    total_rows = dimer_rows + imin_rows + refine_rows
+    if total_rows == 0:
+        return
+
+    fig = plt.figure(figsize=(5 * ncols, 4 * total_rows + 1))
     fig.suptitle(f"Job {job_id} — Post-NEB Refinement", fontsize=14, fontweight="bold")
 
-    panel_idx = 0
+    gs = GridSpec(total_rows, ncols, figure=fig, hspace=0.7, wspace=0.45)
 
-    # Dimer CI plots
-    for fn, fp in dimer_files:
-        row, col = divmod(panel_idx, ncols)
-        ax = axes[row][col]
+    row_offset = 0
+
+    # ── Dimer CI section ──
+    for i, (fn, fp) in enumerate(dimer_files):
+        r, c = divmod(i, ncols)
+        ax = fig.add_subplot(gs[row_offset + r, c])
 
         img_num = re.search(r"img(\d+)", fn).group(1)
         with open(fp) as f:
             data = parse_dimer_log(f.read())
 
         if data["steps"]:
+            # Left axis: fmax (log scale, red)
             ax.semilogy(data["steps"], data["fmaxes"], "r-", linewidth=1, label="fmax")
-            ax.axhline(FMAX_THRESHOLD, color="r", linestyle="--", linewidth=0.5, alpha=0.5)
 
+            # Right axis: curvature (linear, blue)
             ax2 = ax.twinx()
-            ax2.plot(data["steps"], data["curvatures"], "b-", linewidth=0.8, alpha=0.7, label="curvature")
-            ax2.axhline(0, color="b", linestyle=":", linewidth=0.5, alpha=0.3)
-            ax2.set_ylabel("Curvature", fontsize=8, color="b")
+            ax2.plot(data["steps"], data["curvatures"], "b-", linewidth=0.8, alpha=0.7,
+                     label="curvature")
+            ax2.set_ylabel("Curvature (eV/Å²)", fontsize=8, color="b")
             ax2.tick_params(axis="y", labelcolor="b")
+
+            # Align curvature=0 with FMAX_THRESHOLD on the log axis so that
+            # both red and blue lines below one reference line = converged.
+            # Lock fmax limits to prevent render-time re-snapping.
+            ymin_log, ymax_log = ax.get_ylim()
+            ymin_log = min(ymin_log, FMAX_THRESHOLD * 0.5)
+            ymax_log = max(ymax_log, FMAX_THRESHOLD * 2)
+            ax.set_ylim(ymin_log, ymax_log)
+
+            log_range = np.log10(ymax_log) - np.log10(ymin_log)
+            frac = (np.log10(FMAX_THRESHOLD) - np.log10(ymin_log)) / log_range
+
+            curv_vals = data["curvatures"]
+            need_below = max(abs(min(min(curv_vals), -0.05)), 0.05)
+            need_above = max(max(curv_vals), 0.05)
+            scale = max(need_below / frac, need_above / (1 - frac)) * 1.1
+            ax2.set_ylim(-frac * scale, (1 - frac) * scale)
+
+            # Single convergence reference line (fmax threshold + curvature=0)
+            ax.axhline(FMAX_THRESHOLD, color="gray", linestyle="--", linewidth=1.2,
+                       alpha=0.6, label=f"fmax={FMAX_THRESHOLD} / curv=0")
 
             final_fm = data["fmaxes"][-1]
             final_curv = data["curvatures"][-1]
-            converged = "YES" if final_fm < FMAX_THRESHOLD else "NO"
-            ax.set_title(f"Dimer CI img{img_num}\nfinal fmax={final_fm:.4f}, curv={final_curv:.3f} [{converged}]",
-                         fontsize=8)
+            conv_fm = final_fm < FMAX_THRESHOLD
+            conv_curv = final_curv < 0
+            converged = "YES" if conv_fm and conv_curv else "NO"
+            ax.set_title(
+                f"Dimer CI img{img_num}\n"
+                f"fmax={final_fm:.4f}, curv={final_curv:.3f} [{converged}]",
+                fontsize=8)
         else:
             ax.set_title(f"Dimer CI img{img_num}\n(no data)", fontsize=8)
 
@@ -681,12 +726,13 @@ def plot_refinement(job_id, files, temp_dir, output_path):
         ax.set_ylabel("fmax (eV/Å)", fontsize=8, color="r")
         ax.tick_params(axis="y", labelcolor="r")
         ax.grid(True, alpha=0.2)
-        panel_idx += 1
 
-    # Imin relaxation plots
-    for fn, fp in imin_files:
-        row, col = divmod(panel_idx, ncols)
-        ax = axes[row][col]
+    row_offset += dimer_rows
+
+    # ── Imin relaxation section ──
+    for i, (fn, fp) in enumerate(imin_files):
+        r, c = divmod(i, ncols)
+        ax = fig.add_subplot(gs[row_offset + r, c])
 
         img_num = re.search(r"img(\d+)", fn).group(1)
         with open(fp) as f:
@@ -695,11 +741,12 @@ def plot_refinement(job_id, files, temp_dir, output_path):
         if sections and sections[0]["steps"]:
             sec = sections[0]
             ax.semilogy(sec["steps"], sec["fmaxes"], "b-", linewidth=1)
-            ax.axhline(ENDPOINT_FMAX, color="orange", linestyle="--", linewidth=0.5, alpha=0.5,
-                        label=f"endpoint_fmax={ENDPOINT_FMAX}")
+            ax.axhline(ENDPOINT_FMAX, color="orange", linestyle="--", linewidth=0.5,
+                        alpha=0.5, label=f"endpoint_fmax={ENDPOINT_FMAX}")
             final_fm = sec["fmaxes"][-1]
             converged = "YES" if final_fm < ENDPOINT_FMAX else "NO"
-            ax.set_title(f"Imin relax img{img_num}\nfinal fmax={final_fm:.4f} [{converged}]", fontsize=8)
+            ax.set_title(f"Imin relax img{img_num}\nfinal fmax={final_fm:.4f} [{converged}]",
+                         fontsize=8)
         else:
             ax.set_title(f"Imin relax img{img_num}\n(no data)", fontsize=8)
 
@@ -707,13 +754,12 @@ def plot_refinement(job_id, files, temp_dir, output_path):
         ax.set_ylabel("fmax (eV/Å)", fontsize=8)
         ax.legend(fontsize=7)
         ax.grid(True, alpha=0.2)
-        panel_idx += 1
 
-    # Refine NEB plot
-    refine_log_fn = f"neb_refine_{job_id}.log"
-    if refine_log_fn in files:
-        row, col = divmod(panel_idx, ncols)
-        ax = axes[row][col]
+    row_offset += imin_rows
+
+    # ── Refine NEB section (full width, visually separated) ──
+    if has_refine:
+        ax = fig.add_subplot(gs[row_offset, :])
 
         with open(files[refine_log_fn]) as f:
             sections = parse_optimizer_log(f.read())
@@ -731,17 +777,12 @@ def plot_refinement(job_id, files, temp_dir, output_path):
         if all_steps:
             ax.semilogy(all_steps, all_fmax, "m-", linewidth=1)
             ax.axhline(FMAX_THRESHOLD, color="r", linestyle="--", linewidth=0.5, alpha=0.5)
-            ax.set_title(f"Refine NEB\nfinal fmax={all_fmax[-1]:.4f}, {len(all_steps)} steps", fontsize=8)
+            ax.set_title(f"Refine NEB\nfinal fmax={all_fmax[-1]:.4f}, {len(all_steps)} steps",
+                         fontsize=8)
 
         ax.set_xlabel("Step", fontsize=8)
         ax.set_ylabel("fmax (eV/Å)", fontsize=8)
         ax.grid(True, alpha=0.2)
-        panel_idx += 1
-
-    # Hide unused axes
-    for idx in range(panel_idx, nrows * ncols):
-        row, col = divmod(idx, ncols)
-        axes[row][col].set_visible(False)
 
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -852,9 +893,10 @@ def plot_fmax_and_type_timeline(job_id, traj_steps, traj_events, output_path):
         nim = s["nimages"]
         imin_set = set(s.get("imin_set", []))
         ci_set = set(s.get("climbing_set", []))
+        frozen_set = set(s.get("frozen_set", []))
         for img_i in range(nim):
             fm = s["effective_fmax"][img_i] if img_i < len(s["effective_fmax"]) else 0
-            if fm < FROZEN_THRESHOLD and img_i > 0 and img_i < nim - 1:
+            if img_i in frozen_set and img_i > 0 and img_i < nim - 1:
                 frozen_c[si] += 1
             elif img_i == 0 or img_i == nim - 1:
                 endpoint_c[si] += 1
@@ -886,7 +928,7 @@ def plot_fmax_and_type_timeline(job_id, traj_steps, traj_events, output_path):
             s = traj_steps[si]
             if img_i < len(s["effective_fmax"]):
                 fm = s["effective_fmax"][img_i]
-                if fm > FROZEN_THRESHOLD:  # skip frozen for clarity
+                if img_i not in set(s.get("frozen_set", [])):  # skip frozen for clarity
                     steps_i.append(si)
                     fmax_i.append(fm)
 
@@ -1000,11 +1042,12 @@ def generate_text_report(job_id, rank, subbands_info, files, log_sections,
         lines.append(f"    nimages={sf['nimages']}, imin_set={sf['imin_set']}, climbing_set={sf['climbing_set']}")
         lines.append(f"    Per-image fmax: {[f'{fm:.4f}' for fm in sf['effective_fmax']]}")
 
-        frozen_imgs = [i for i, fm in enumerate(sf["effective_fmax"]) if fm < FROZEN_THRESHOLD]
+        frozen_imgs = sf.get("frozen_set", [])
         lines.append(f"    Frozen images: {frozen_imgs} ({len(frozen_imgs)} total)")
 
         # Per-image convergence
         lines.append("    Per-image convergence:")
+        frozen_set = set(frozen_imgs)
         for img_i, fm in enumerate(sf["effective_fmax"]):
             img_type = "endpoint"
             if img_i in sf.get("imin_set", []):
@@ -1013,14 +1056,14 @@ def generate_text_report(job_id, rank, subbands_info, files, log_sections,
                 img_type = "CI"
             elif img_i == 0 or img_i == sf["nimages"] - 1:
                 img_type = "endpoint"
-            elif fm < FROZEN_THRESHOLD:
+            elif img_i in frozen_set:
                 img_type = "frozen"
             else:
                 img_type = "regular"
 
             threshold = ENDPOINT_FMAX if img_type in ("endpoint", "imin") else FMAX_THRESHOLD
             status = "CONVERGED" if fm < threshold else f"NOT CONVERGED (need < {threshold})"
-            if fm < FROZEN_THRESHOLD:
+            if img_i in frozen_set:
                 status = "FROZEN"
             lines.append(f"      Image {img_i:2d} [{img_type:8s}]: fmax={fm:.6f}  {status}")
 
@@ -1131,12 +1174,13 @@ def generate_text_report(job_id, rank, subbands_info, files, log_sections,
             lines.append(f"  Final refine state:")
             lines.append(f"    nimages={sf['nimages']}, imin_set={sf['imin_set']}")
             lines.append(f"    Per-image fmax: {[f'{fm:.4f}' for fm in sf['effective_fmax']]}")
-            frozen_imgs = [i for i, fm in enumerate(sf["effective_fmax"]) if fm < FROZEN_THRESHOLD]
+            frozen_imgs = sf.get("frozen_set", [])
             lines.append(f"    Frozen images: {frozen_imgs}")
 
             # Sub-band convergence after refine
             imin_set = sf.get("imin_set", [])
             boundaries = sorted([0] + imin_set + [sf["nimages"] - 1])
+            frozen_set = set(frozen_imgs)
             lines.append("    Sub-band convergence after refine:")
             for seg_i in range(len(boundaries) - 1):
                 seg_start = boundaries[seg_i]
@@ -1145,7 +1189,7 @@ def generate_text_report(job_id, rank, subbands_info, files, log_sections,
                 for j in range(seg_start, seg_end + 1):
                     if j < len(sf["effective_fmax"]):
                         fm = sf["effective_fmax"][j]
-                        if fm > FROZEN_THRESHOLD:
+                        if j not in frozen_set:
                             max_fm = max(max_fm, fm)
                 lines.append(f"      Sub-band {seg_i} ({seg_start}..{seg_end}): max_fmax={max_fm:.6f} "
                               f"({'CONVERGED' if max_fm < FMAX_THRESHOLD else 'NOT CONVERGED'})")
@@ -1161,11 +1205,12 @@ def generate_text_report(job_id, rank, subbands_info, files, log_sections,
     # Why didn't it converge?
     if traj_steps:
         sf = traj_steps[-1]
-        max_fmax = max(fm for fm in sf["effective_fmax"] if fm > FROZEN_THRESHOLD) if any(fm > FROZEN_THRESHOLD for fm in sf["effective_fmax"]) else 0
+        frozen_set = set(sf.get("frozen_set", []))
+        max_fmax = max((fm for img_i, fm in enumerate(sf["effective_fmax"]) if img_i not in frozen_set), default=0)
 
         stuck_images = []
         for img_i, fm in enumerate(sf["effective_fmax"]):
-            if fm >= FMAX_THRESHOLD and fm > FROZEN_THRESHOLD:
+            if fm >= FMAX_THRESHOLD and img_i not in frozen_set:
                 img_type = "CI" if img_i in sf.get("climbing_set", []) else \
                            "imin" if img_i in sf.get("imin_set", []) else \
                            "endpoint" if (img_i == 0 or img_i == sf["nimages"]-1) else "regular"
