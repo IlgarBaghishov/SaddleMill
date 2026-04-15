@@ -21,6 +21,7 @@ class ConfigManager:
             "jobs_per_node": 1,  # this only used if device = 'cpu', otherwise jobs_per_gpu is used
             "jobs_per_gpu": 1,
             "run_jobs": "remaining",
+            "input_statuses": "all",
             "continue_from_result": True,
             "zip": True,
             "max_consecutive_errors": 5,

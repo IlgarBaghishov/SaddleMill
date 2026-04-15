@@ -47,8 +47,31 @@ class TestConfigManager:
         assert d["Main"]["fmax"] == 0.05
         assert d["Main"]["executorlib"] is True
         assert d["Main"]["method"] is None
+        assert d["Main"]["input_statuses"] == "all"
         assert d["ourNEB"]["num_frames"] == 10
         assert d["ourDimer"]["num_attempts_per_type"] == 1
+
+    def test_input_statuses_parses_as_list(self, tmp_path):
+        """Space-separated input_statuses becomes a list via _parse_value."""
+        ini = tmp_path / "config.ini"
+        ini.write_text(textwrap.dedent("""\
+            [Main]
+            method = DoubleMinimization
+            input_statuses = converged converged_CI
+        """))
+        cm = ConfigManager(str(ini))
+        assert cm["Main"]["input_statuses"] == ["converged", "converged_CI"]
+
+    def test_input_statuses_parses_single_string(self, tmp_path):
+        """Single-token input_statuses stays a string."""
+        ini = tmp_path / "config.ini"
+        ini.write_text(textwrap.dedent("""\
+            [Main]
+            method = DoubleMinimization
+            input_statuses = converged_CI
+        """))
+        cm = ConfigManager(str(ini))
+        assert cm["Main"]["input_statuses"] == "converged_CI"
 
     def test_defaults_not_mutated_by_instance(self):
         """Creating a ConfigManager does not mutate the class-level DEFAULTS."""

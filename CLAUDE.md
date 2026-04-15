@@ -169,6 +169,7 @@ steps = 6000                # Max optimization steps
 jobs_per_gpu = 1            # Concurrent jobs per GPU
 Calculator = FAIRChemCalculator  # FAIRChemCalculator | Vasp | VaspInteractive
 run_jobs = remaining         # Job categories to process (see below)
+input_statuses = all         # Filter input frames by stored source status (see below)
 continue_from_result = True # Resume from previous result (see below)
 zip = True                  # Compress debug files
 max_consecutive_errors = 5  # Kill worker after N consecutive all-error structures (0 = disabled)
@@ -311,6 +312,34 @@ run_jobs = not_converged
 continue_from_result = False      # Re-run from scratch
 ```
 
+### `input_statuses` — Filter Input Frames by Source Status
+
+Every output frame carries its CSV status in `.info['status']`. `input_statuses` filters *input* frames by that stored status, applied in `__main__.py` right after `load_and_sanitize` via `tools.passes_input_filter`. Matched frames submit; unmatched frames are silently skipped (no CSV row) so they remain "remaining" on a subsequent resume with a broader filter.
+
+Patterns use `fnmatch` wildcards — e.g. `converged*` matches `converged`, `converged_CI`, `converged_after_extension`, `converged_to_desorption`, `converged_desorption_skipped`. Values are a single pattern or a space-separated list. The special value `all` (the default) bypasses the filter entirely.
+
+When an explicit filter is set, frames whose `orig_info` lacks a `status` field (raw `.traj` files that have never been through tsearch) are rejected — an explicit filter is a deliberate "only these statuses" request. Use the default `all` for first-time runs on user-prepared inputs.
+
+Status strings by source:
+- **Dimer**: `converged`, `converged_after_extension`, `converged_to_desorption`, `not_converged`, `not_converged_after_extension`, `not_converged_StopRun`, `error: ...`
+- **NEB** (per sub-band, tagged onto every image in the segment): `converged`, `converged_CI`, `not_converged`
+- **Minimization**: `converged`, `not_converged`
+- **DoubleMinimization**: `converged`, `converged_desorption_skipped`, `not_converged` (TS frame always `converged`)
+
+**Examples:**
+```ini
+method = DoubleMinimization
+dir_path = /path/to/NEB_trajes
+input_statuses = converged_CI                       # only CI-only converged sub-bands
+input_statuses = converged                          # only fully-converged sub-bands
+input_statuses = converged converged_CI             # both together
+input_statuses = converged*                         # any converged* variant
+input_statuses = all                                # no filtering (default)
+
+dir_path = /path/to/Dimer_trajes
+input_statuses = converged converged_after_extension  # Dimer converged, no desorption
+```
+
 ## Output Structure
 
 For method `NEB`:
@@ -320,11 +349,13 @@ NEB_trajes/collected_ts_rank_*.traj  # All band images with metadata in atoms.in
 NEB_debug_zips/                      # Compressed log/traj/plot files
 ```
 
-NEB output image metadata: `src_index`, `image_idx`, `subband_idx`, `image_type` (endpoint/intermediate_minimum/climbing/regular), `effective_fmax`, `image_converged`, `band_converged`, `band_converged_CI`, `nimages`, `interpolation_method`, `orig_info`. CI images also get `eigenmode`, `barrier`, `dE`. Imin images duplicated for sub-band self-containment. NEB CSV is still per-sub-band lines; band-level run_jobs categorization requires ALL sub-bands converged/converged_CI.
+Every output frame (all methods) carries `status` — the CSV status string that was written for that entry, used by `input_statuses` for downstream filtering.
 
-Dimer output: `eigenmode`, `curvature`, `converged`, `src_index`, `attempt_id`, `stoprun`, `selected_index`, `reaction_type`, `orig_info`.
+NEB output image metadata: `src_index`, `image_idx`, `subband_idx`, `image_type` (endpoint/intermediate_minimum/climbing/regular), `effective_fmax`, `image_converged`, `band_converged`, `band_converged_CI`, `status`, `nimages`, `interpolation_method`, `orig_info`. CI images also get `eigenmode`, `barrier`, `dE`. Every image in a sub-band shares the sub-band's `status` (`converged` / `converged_CI` / `not_converged`). Imin images duplicated for sub-band self-containment. NEB CSV is still per-sub-band lines; band-level run_jobs categorization requires ALL sub-bands converged/converged_CI.
 
-DoubleMinimization output: `side` (-1/0/1), `parent_ts_index`, `converged`, `src_index`, `is_reaction`, `n_formed_bonds`, `n_broken_bonds`, `orig_info`. CSV: 2 lines per job `{job_id},{rank},{side_id},{parent_ts_idx},{status}`.
+Dimer output: `eigenmode`, `curvature`, `converged`, `src_index`, `attempt_id`, `stoprun`, `selected_index`, `reaction_type`, `status`, `orig_info`.
+
+DoubleMinimization output: `side` (-1/0/1), `parent_ts_index`, `converged`, `src_index`, `is_reaction`, `n_formed_bonds`, `n_broken_bonds`, `status`, `orig_info`. CSV: 2 lines per job `{job_id},{rank},{side_id},{parent_ts_idx},{status}`.
 
 ## Execution Modes
 

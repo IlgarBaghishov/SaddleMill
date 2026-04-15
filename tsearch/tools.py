@@ -1,5 +1,5 @@
 import numpy as np
-import json, os, glob, shutil, tempfile, zipfile
+import json, os, glob, shutil, tempfile, zipfile, fnmatch
 from ase.neighborlist import neighbor_list, natural_cutoffs
 from ase.io import Trajectory
 from tsearch.config import VALID_RUN_CATEGORIES, _RUN_CATEGORY_ALIASES, _get_subunit_config
@@ -40,6 +40,25 @@ def load_and_sanitize(traj, i, j):
         images = traj[i]
         images.info = {"orig_info": dict(images.info)}
     return images
+
+
+def passes_input_filter(images, config_dict):
+    """Return True if a sanitized input's status matches ``input_statuses``.
+
+    Patterns support ``fnmatch`` wildcards (e.g. ``converged*`` matches
+    ``converged``, ``converged_CI``, ``converged_after_extension``, etc.).
+    The special value ``"all"`` (the default) bypasses the filter entirely.
+    """
+    raw = config_dict["Main"]["input_statuses"]
+    if raw in ("all", None):
+        return True
+
+    main_atoms = images[0] if isinstance(images, list) else images
+    orig = main_atoms.info.get('orig_info', {})
+    status = orig.get('status')
+
+    patterns = [raw] if isinstance(raw, str) else list(raw)
+    return any(fnmatch.fnmatchcase(status or '', p) for p in patterns)
 
 
 #==============================================================================

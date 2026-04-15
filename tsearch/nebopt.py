@@ -559,6 +559,13 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
                 ci_below_fmax = neb.image_fmax[seg_ci] < fmax if seg_ci is not None else False
                 all_below_fmax = all(neb.image_fmax[j] < fmax for j in range(seg_start, seg_end + 1))
 
+                if all_below_fmax:
+                    seg_status = "converged"
+                elif ci_below_fmax:
+                    seg_status = "converged_CI"
+                else:
+                    seg_status = "not_converged"
+
                 # Compute CI tangent (eigenmode) for the segment
                 tangent = None
                 seg_barrier = None
@@ -592,6 +599,7 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
                     img.info['image_converged'] = bool(neb.image_fmax[j] < img_threshold)
                     img.info['band_converged'] = bool(all_below_fmax)
                     img.info['band_converged_CI'] = bool(ci_below_fmax)
+                    img.info['status'] = seg_status
                     img.info['nimages'] = len(neb.images)
                     img.info['interpolation_method'] = interp_method_out
 
@@ -603,13 +611,7 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
                     img.wrap()
                     writer.write(img)
 
-                # Per-subband status
-                if all_below_fmax:
-                    log_status("converged", sub_band_id=seg_idx)
-                elif ci_below_fmax:
-                    log_status("converged_CI", sub_band_id=seg_idx)
-                else:
-                    log_status("not_converged", sub_band_id=seg_idx)
+                log_status(seg_status, sub_band_id=seg_idx)
 
         if consecutive_errors is not None:
             consecutive_errors[0] = 0

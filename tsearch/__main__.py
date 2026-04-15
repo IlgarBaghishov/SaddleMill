@@ -5,7 +5,8 @@ from itertools import groupby
 from contextlib import nullcontext
 from tsearch.init_function import init_function
 from tsearch.tools import (save_ordered_traj_names, read_ordered_traj_names,
-                            clean_up_files, load_and_sanitize, extract_previous_results)
+                            clean_up_files, load_and_sanitize, passes_input_filter,
+                            extract_previous_results)
 from tsearch.config import (load_config, load_method, get_trajes_and_indices,
                             create_results_directories, get_remaining_trajes,
                             get_flux_resources, archive_and_clean_csvs,
@@ -97,6 +98,9 @@ def main():
             for _, i, j in group:
                 job_id = job_IDs[idx]
                 images = load_and_sanitize(traj, i, j)
+                if not passes_input_filter(images, config_dict):
+                    idx += 1
+                    continue
                 try:
                     f = submitter(method, job_id, config_dict, images,
                                   continuation_data=previous_results.get(job_id),

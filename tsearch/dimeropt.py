@@ -197,7 +197,7 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                 atoms.info['eigenmode'] = eigenmode
                 atoms.info['curvature'] = float(curvature)
                 atoms.calc = SinglePointCalculator(atoms, energy=energy, forces=forces)
-                atoms.info['converged'] = 1 if converged else 0
+                # atoms.info['converged'] = 1 if converged else 0
                 atoms.info['src_index'] = i
                 atoms.info['attempt_id'] = attempt
                 atoms.info['stoprun'] = 1 if stopped_early else 0
@@ -208,6 +208,7 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                     status = "converged_to_desorption"
                     atoms.info['converged'] = 1
                     atoms.info['reaction_type'] = 'desorption'
+                atoms.info['status'] = status
                 atoms.wrap()
 
                 writer.write(atoms)

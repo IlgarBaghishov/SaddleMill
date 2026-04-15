@@ -15,6 +15,7 @@ from ase.neighborlist import natural_cutoffs
 from tests.conftest import make_config_dict
 from tsearch.tools import (
     load_and_sanitize,
+    passes_input_filter,
     save_ordered_traj_names,
     read_ordered_traj_names,
     clean_up_files,
@@ -118,6 +119,112 @@ class TestLoadAndSanitize:
         orig = result.info["orig_info"]
         assert np.array_equal(orig["forces_max"], arr)
         assert orig["label"] == "test"
+
+
+# =========================================================================
+# TestPassesInputFilter
+# =========================================================================
+
+class TestPassesInputFilter:
+    """Tests for passes_input_filter: fnmatch-based status filtering."""
+
+    def _sanitized(self, **info_kwargs):
+        """Build an Atoms with orig_info populated like load_and_sanitize does."""
+        atoms = bulk("Cu", "fcc", a=3.6)
+        atoms.info = {"orig_info": dict(info_kwargs)}
+        return atoms
+
+    def test_all_bypasses_filter(self):
+        """input_statuses='all' accepts any frame, even one without a status."""
+        atoms = self._sanitized()
+        config = make_config_dict(method="Dimer", input_statuses="all")
+        assert passes_input_filter(atoms, config) is True
+
+    def test_string_filter_exact_match_passes(self):
+        """Single-string filter matches exact status."""
+        atoms = self._sanitized(status="converged_CI")
+        config = make_config_dict(method="Dimer", input_statuses="converged_CI")
+        assert passes_input_filter(atoms, config) is True
+
+    def test_string_filter_mismatch_skips(self):
+        """Single-string filter skips frames with a different status."""
+        atoms = self._sanitized(status="converged")
+        config = make_config_dict(method="Dimer", input_statuses="converged_CI")
+        assert passes_input_filter(atoms, config) is False
+
+    def test_list_filter_any_match_passes(self):
+        """List filter accepts frames whose status is in the list."""
+        atoms = self._sanitized(status="converged_CI")
+        config = make_config_dict(
+            method="Dimer",
+            input_statuses=["converged", "converged_CI"],
+        )
+        assert passes_input_filter(atoms, config) is True
+
+    def test_list_filter_excludes_unlisted_status(self):
+        """List filter rejects statuses not enumerated."""
+        atoms = self._sanitized(status="converged_to_desorption")
+        config = make_config_dict(
+            method="Dimer",
+            input_statuses=["converged", "converged_after_extension"],
+        )
+        assert passes_input_filter(atoms, config) is False
+
+    def test_missing_status_rejected_when_filter_set(self):
+        """Frames lacking 'status' (raw inputs) are rejected by an explicit filter."""
+        atoms = self._sanitized()
+        config = make_config_dict(method="Dimer", input_statuses="converged")
+        assert passes_input_filter(atoms, config) is False
+
+    def test_missing_status_passes_when_default_all(self):
+        """Default 'all' accepts raw inputs with no prior status."""
+        atoms = self._sanitized()
+        config = make_config_dict(method="Dimer")
+        assert config["Main"]["input_statuses"] == "all"
+        assert passes_input_filter(atoms, config) is True
+
+    @pytest.mark.parametrize("status", [
+        "converged",
+        "converged_CI",
+        "converged_after_extension",
+        "converged_to_desorption",
+        "converged_desorption_skipped",
+    ])
+    def test_wildcard_matches_all_converged_variants(self, status):
+        """'converged*' matches every converged-prefixed status."""
+        atoms = self._sanitized(status=status)
+        config = make_config_dict(method="Dimer", input_statuses="converged*")
+        assert passes_input_filter(atoms, config) is True
+
+    @pytest.mark.parametrize("status", [
+        "not_converged",
+        "not_converged_after_extension",
+        "not_converged_StopRun",
+        "error: kaboom",
+    ])
+    def test_wildcard_rejects_non_converged(self, status):
+        """'converged*' does not match statuses that don't start with 'converged'."""
+        atoms = self._sanitized(status=status)
+        config = make_config_dict(method="Dimer", input_statuses="converged*")
+        assert passes_input_filter(atoms, config) is False
+
+    def test_wildcard_in_list(self):
+        """Wildcards work inside a list; any pattern match accepts."""
+        atoms = self._sanitized(status="not_converged_StopRun")
+        config = make_config_dict(
+            method="Dimer",
+            input_statuses=["converged*", "not_converged_*"],
+        )
+        assert passes_input_filter(atoms, config) is True
+
+    def test_list_of_images_uses_first(self):
+        """For multi-image jobs (NEB input), the first image drives filtering."""
+        head = self._sanitized(status="converged")
+        tail = self._sanitized(status="converged_CI")
+        config = make_config_dict(method="NEB", input_statuses="converged")
+        assert passes_input_filter([head, tail], config) is True
+        config2 = make_config_dict(method="NEB", input_statuses="converged_CI")
+        assert passes_input_filter([head, tail], config2) is False
 
 
 # =========================================================================

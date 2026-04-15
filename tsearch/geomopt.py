@@ -53,11 +53,13 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
             atoms.calc = SinglePointCalculator(atoms, energy=atoms.get_potential_energy(), forces=atoms.get_forces())
 
             if converged:
-                log_status("converged")
+                status = "converged"
                 atoms.info['converged'] = 1
             else:
-                log_status("not_converged")
+                status = "not_converged"
                 atoms.info['converged'] = 0
+            log_status(status)
+            atoms.info['status'] = status
             atoms.info['src_index'] = i
             atoms.wrap()
 
@@ -119,14 +121,6 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
         orig = atoms.info.get('orig_info', {})
         parent_source_idx = orig['src_index']
         try:
-            if not orig['converged']:
-                msg = "Input structure marked as unconverged."
-                print(f"Rank {rank} WARNING on structure {i}: {msg}", flush=True)
-                for side in [-1, 1]:
-                    if entries_to_run is None or side in entries_to_run:
-                        log_status(side, parent_source_idx, f"error: {msg}")
-                return
-
             if 'eigenmode' not in orig:
                 raise Exception("Input structure missing 'eigenmode' in info.")
             if 'src_index' not in orig:
@@ -224,6 +218,15 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
             ts_atoms.info['src_index'] = i
 
             # --- WRITE FRAMES (Min1, TS, Min2) ---
+            side_statuses = {}
+            for side in [-1, 1]:
+                if side == skip_side:
+                    side_statuses[side] = "converged_desorption_skipped"
+                else:
+                    side_statuses[side] = "converged" if mins[side][1] else "not_converged"
+            min1.info['status'] = side_statuses[-1]
+            min2.info['status'] = side_statuses[1]
+            ts_atoms.info['status'] = "converged"
             min1.wrap()
             ts_atoms.wrap()
             min2.wrap()
@@ -231,12 +234,9 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
             writer.write(ts_atoms)
             writer.write(min2)
 
-            for side, (_, conv) in mins.items():
+            for side in mins:
                 if entries_to_run is None or side in entries_to_run:
-                    if side == skip_side:
-                        log_status(side, parent_source_idx, "converged_desorption_skipped")
-                    else:
-                        log_status(side, parent_source_idx, "converged" if conv else "not_converged")
+                    log_status(side, parent_source_idx, side_statuses[side])
 
             if consecutive_errors is not None:
                 consecutive_errors[0] = 0
