@@ -5,7 +5,7 @@ import zipfile
 from ase.io import Trajectory
 from ase.filters import FrechetCellFilter
 from ase.calculators.singlepoint import SinglePointCalculator
-from tsearch.tools import check_reaction, check_adsorbate_reaction, backup_flux_logs
+from tsearch.tools import check_reaction, check_adsorbate_reaction, backup_flux_logs, get_task_name
 from tsearch.dimeropt import _refine_eigenmode
 
 
@@ -36,6 +36,7 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
     status_file = f"{method_name}_status_csvs/status_rank_{rank}.csv"
     my_output_file = f"{method_name}_trajes/collected_opt_rank_{rank}.traj"
     zip_name = f"{method_name}_debug_zips/structure_rank_{rank}_data.zip"
+    task_name = get_task_name(config_dict)
 
     def log_status(status_msg):
         with open(status_file, 'a') as f:
@@ -61,6 +62,7 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
                 atoms.info['converged'] = 0
             log_status(status)
             atoms.info['status'] = status
+            atoms.info['task_name'] = task_name
             atoms.info['src_index'] = i
             atoms.wrap()
 
@@ -109,6 +111,7 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
     status_file = f"{method_name}_status_csvs/status_rank_{rank}.csv"
     my_output_file = f"{method_name}_trajes/collected_opt_rank_{rank}.traj"
     zip_name = f"{method_name}_debug_zips/structure_rank_{rank}_data.zip"
+    task_name = get_task_name(config_dict)
 
     def log_status(side_id, parent_source_idx, status_msg):
         with open(status_file, 'a') as f:
@@ -243,6 +246,9 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
             min1.info['status'] = side_statuses[-1]
             min2.info['status'] = side_statuses[1]
             ts_atoms.info['status'] = "converged"
+            min1.info['task_name'] = task_name
+            min2.info['task_name'] = task_name
+            ts_atoms.info['task_name'] = task_name
             min1.wrap()
             ts_atoms.wrap()
             min2.wrap()

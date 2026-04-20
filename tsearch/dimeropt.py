@@ -11,7 +11,7 @@ from ase.io import Trajectory
 from ase.mep import DimerControl, MinModeAtoms, MinModeTranslate
 from ase.calculators.singlepoint import SinglePointCalculator
 from tsearch.dimertools.structure_edit import get_attempts
-from tsearch.tools import backup_flux_logs
+from tsearch.tools import backup_flux_logs, get_task_name
 
 
 class StopRun(Exception):
@@ -72,6 +72,7 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
     status_file = f"{method_name}_status_csvs/status_rank_{rank}.csv"
     my_output_file = f"{method_name}_trajes/collected_ts_rank_{rank}.traj"
     zip_name = f"{method_name}_debug_zips/structure_rank_{rank}_data.zip"
+    task_name = get_task_name(config_dict)
 
     max_consecutive_errors = config_dict["Main"]["max_consecutive_errors"]
     if consecutive_errors is not None and consecutive_errors[0] >= max_consecutive_errors > 0:
@@ -230,6 +231,7 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                     atoms.info['converged'] = 1
                     atoms.info['reaction_type'] = 'desorption'
                 atoms.info['status'] = status
+                atoms.info['task_name'] = task_name
                 atoms.wrap()
 
                 writer.write(atoms)
