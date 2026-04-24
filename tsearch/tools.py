@@ -61,6 +61,13 @@ def passes_input_filter(images, config_dict):
     return any(fnmatch.fnmatchcase(status or '', p) for p in patterns)
 
 
+def get_task_name(config_dict):
+    """Return [FAIRChemCalculator] task_name if FAIRChem is the calculator, else None."""
+    if config_dict["Main"]["Calculator"] == "FAIRChemCalculator":
+        return config_dict["FAIRChemCalculator"].get("task_name")
+    return None
+
+
 #==============================================================================
 ### FILE IO
 

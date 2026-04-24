@@ -14,7 +14,7 @@ from ase.io import Trajectory
 from ase.mep.neb import NEB, NEBTools, NEBState
 from tsearch.catsunami.ocpneb import OCPNEB, _find_segment_ci
 from tsearch.dimeropt import _setup_dimer
-from tsearch.tools import backup_flux_logs
+from tsearch.tools import backup_flux_logs, get_task_name
 
 
 def _expand_band(neb, fmax_threshold, max_num_frames, num_frames, calc):
@@ -208,6 +208,7 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
     zip_name = f"{config_dict['Main']['method']}_debug_zips/structure_rank_{rank}_data.zip"
     status_file = f"{config_dict['Main']['method']}_status_csvs/status_rank_{rank}.csv"
     my_output_file = f"{config_dict['Main']['method']}_trajes/collected_ts_rank_{rank}.traj"
+    task_name = get_task_name(config_dict)
 
     def log_status(status_msg, sub_band_id=0):
         with open(status_file, 'a') as f:
@@ -600,6 +601,7 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
                     img.info['band_converged'] = bool(all_below_fmax)
                     img.info['band_converged_CI'] = bool(ci_below_fmax)
                     img.info['status'] = seg_status
+                    img.info['task_name'] = task_name
                     img.info['nimages'] = len(neb.images)
                     img.info['interpolation_method'] = interp_method_out
 
