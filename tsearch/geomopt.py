@@ -48,6 +48,8 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
         temp_opt_log = f'optimization_{i}.log'
         temp_traj = f'optimization_{i}.traj'
         temp_files = [temp_opt_log, temp_traj]
+        orig = atoms.info.get('orig_info', {})
+        parent_source_idx = orig.get('src_index')
 
         try:
             optimizable = FrechetCellFilter(atoms) if config_dict['our'+method_name]['relax_cell'] else atoms
@@ -60,16 +62,13 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
             else:
                 status = "not_converged"
                 atoms.info['converged'] = 0
-            log_status(status)
             atoms.info['status'] = status
             atoms.info['task_name'] = task_name
+            atoms.info['parent_ts_index'] = parent_source_idx
             atoms.info['src_index'] = i
             atoms.wrap()
 
             writer.write(atoms)
-
-            if consecutive_errors is not None:
-                consecutive_errors[0] = 0
 
             # Clean up temp files
             existing_files = [f for f in temp_files if os.path.exists(f)]
@@ -79,6 +78,10 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
                         zf.write(f_name, arcname=f"{f_name}")
                 for f_name in existing_files:
                     os.remove(f_name)
+
+            log_status(status)
+            if consecutive_errors is not None:
+                consecutive_errors[0] = 0
 
         except Exception as e:
             print(f"Rank {rank} FAILED on structure {i}: {e}", flush=True)
@@ -123,7 +126,7 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
     entries_to_run = kwargs.get('entries_to_run')        # set of side_ids (-1, 1) or None
     with Trajectory(my_output_file, 'a') as writer:
         orig = atoms.info.get('orig_info', {})
-        parent_source_idx = orig['src_index']
+        parent_source_idx = orig.get('src_index')
         try:
             if 'eigenmode' not in orig:
                 raise Exception("Input structure missing 'eigenmode' in info.")
@@ -256,13 +259,6 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
             writer.write(ts_atoms)
             writer.write(min2)
 
-            for side in mins:
-                if entries_to_run is None or side in entries_to_run:
-                    log_status(side, parent_source_idx, side_statuses[side])
-
-            if consecutive_errors is not None:
-                consecutive_errors[0] = 0
-
             # --- CLEANUP (Success Case) ---
             existing_files = [f for f in temp_files if os.path.exists(f)]
             if existing_files and config_dict['Main']['zip']:
@@ -271,6 +267,13 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
                         zf.write(f_name, arcname=f_name)
                 for f_name in existing_files:
                     os.remove(f_name)
+
+            for side in mins:
+                if entries_to_run is None or side in entries_to_run:
+                    log_status(side, parent_source_idx, side_statuses[side])
+
+            if consecutive_errors is not None:
+                consecutive_errors[0] = 0
 
         except Exception as e:
             # --- CLEANUP (Error Case) ---

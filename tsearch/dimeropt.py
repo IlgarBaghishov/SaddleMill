@@ -236,9 +236,6 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
 
                 writer.write(atoms)
 
-                log_status(attempt, slctd_indx, status)
-                any_attempt_succeeded = True
-
                 # Clean up temp files
                 existing_files = [f for f in temp_files if os.path.exists(f)]
                 if existing_files and config_dict['Main']['zip']:
@@ -247,6 +244,9 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                             zf.write(f_name, arcname=f"{f_name}")
                     for f_name in existing_files:
                         os.remove(f_name)
+
+                log_status(attempt, slctd_indx, status)
+                any_attempt_succeeded = True
 
             except Exception as e:
                 print(f"Rank {rank} FAILED on structure {i}, attempt {attempt}: {e}", flush=True)
