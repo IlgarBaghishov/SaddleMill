@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=128
 #SBATCH -p development
 #SBATCH -t 02:00:00
-#SBATCH -A CHE23004
+#SBATCH -A YOUR_ALLOCATION
 #SBATCH -J neb_oc20neb
 
 pwd; hostname -f; date

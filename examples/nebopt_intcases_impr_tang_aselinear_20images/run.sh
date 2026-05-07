@@ -4,7 +4,7 @@
 #SBATCH -o ll_out
 #SBATCH -p gpu-a100
 #SBATCH -t 48:00:00
-#SBATCH -A CHE23004
+#SBATCH -A YOUR_ALLOCATION
 
 module unload impi python3
 module load cuda/12.8

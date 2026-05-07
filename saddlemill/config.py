@@ -269,7 +269,7 @@ def load_optimizer(config_dict):
 def get_trajes_and_indices(config_dict):
     
     main_cfg = config_dict.get("Main", {})
-    dir_path = main_cfg.get("dir_path", ".")
+    dir_path = os.path.expandvars(os.path.expanduser(main_cfg.get("dir_path", ".")))
     input_pattern = os.path.join(dir_path, "**", "*.traj")
     all_traj_files = sorted(glob.glob(input_pattern, recursive=True))
     

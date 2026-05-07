@@ -4,7 +4,7 @@
 #SBATCH -p gpu-a100
 #SBATCH -t 48:00:00
 #SBATCH -o slurm_%j.out
-#SBATCH -A CHE23004
+#SBATCH -A YOUR_ALLOCATION
 #SBATCH -J neb_mp20bat
 
 pwd; hostname -f; date

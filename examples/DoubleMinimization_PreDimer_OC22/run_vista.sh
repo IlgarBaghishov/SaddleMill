@@ -4,7 +4,7 @@
 #SBATCH -p gh
 #SBATCH -t 48:00:00
 #SBATCH -o slurm_%j.out
-#SBATCH -A CHE23004
+#SBATCH -A YOUR_ALLOCATION
 #SBATCH -J doublemin_predimer_oc22
 
 pwd; hostname -f; date

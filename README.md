@@ -13,10 +13,10 @@ module unload impi python3
 module load cuda/12.8
 
 # Enter idev to get a GPU node
-idev -A CHE23004 -p gpu-a100-dev -t 02:00:00
+idev -A YOUR_ALLOCATION -p gpu-a100-dev -t 02:00:00
 
 # Create base environment
-conda create --prefix /work/08405/ilgar/ls6/conda_envs/executorlib -c conda-forge python=3.12 flux-core flux-sched openmpi=5.0.5 "libhwloc=*=cuda*" executorlib
+conda create --prefix $WORK/conda_envs/executorlib -c conda-forge python=3.12 flux-core flux-sched openmpi=5.0.5 "libhwloc=*=cuda*" executorlib
 conda activate executorlib
 
 find $CONDA_PREFIX -name "sched-fluxion-*.so" -path "*feedstock_root*" -exec cp {} $CONDA_PREFIX/lib/flux/modules/ \;
@@ -79,10 +79,10 @@ Create base environment:
 mamba config --set pkgs_dirs $SCRATCH/.cache/conda
 
 # Enter idev to get a GPU node
-salloc --nodes 1 --qos interactive --time 04:00:00 --constraint gpu --gpus 4 --account m1883_g
+salloc --nodes 1 --qos interactive --time 04:00:00 --constraint gpu --gpus 4 --account YOUR_ALLOCATION
 
-# Create base environment in CFS
-mamba create -p /global/cfs/cdirs/m5144/sung/envs/executorlib -c conda-forge python=3.12 \
+# Create base environment
+mamba create -p $SCRATCH/envs/executorlib -c conda-forge python=3.12 \
   flux-core flux-sched executorlib "libhwloc=*=cuda*"  # warnings about cuda, ucx, nccl, etc. are ok
 conda activate executorlib
 
@@ -113,7 +113,7 @@ srun -n 2 --mpi=pmi2 flux start flux resource list
 Clone the environment and install specific machine learning libraries.
 
 ```bash
-conda create --prefix /work/08405/ilgar/vista/conda_libraries/saddlemill --clone executorlib
+conda create --prefix $WORK/conda_libraries/saddlemill --clone executorlib
 
 pip config set global.cache-dir "/path/to/your/cache/directory"  # like $SCRATCH/.cache/pip
 
@@ -166,9 +166,9 @@ export PYTHONPATH=<saddlemill_path>:$PYTHONPATH
 Request an interactive node:
 
 ```bash
-idev -p gh-dev -N 1 -m 120 -A CHE23004
+idev -p gh-dev -N 1 -m 120 -A YOUR_ALLOCATION
 # or for Lonestar:
-idev -p gpu-a100-dev -N 1 -m 120 -A CHE23004
+idev -p gpu-a100-dev -N 1 -m 120 -A YOUR_ALLOCATION
 
 ```
 

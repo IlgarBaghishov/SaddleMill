@@ -6,7 +6,7 @@
 #SBATCH -q regular
 #SBATCH -t 48:00:00
 #SBATCH --output=slurm_%j.log
-#SBATCH --account=m1883_g
+#SBATCH --account=YOUR_ALLOCATION
 #SBATCH -J doublemin_oc22
 
 pwd; hostname -f; date
