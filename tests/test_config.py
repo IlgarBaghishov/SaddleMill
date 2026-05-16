@@ -321,6 +321,127 @@ class TestLoadMethod:
         with pytest.raises(NotImplementedError, match="not implemented"):
             load_method(config)
 
+    def test_singlepoint_vasp_requires_fpj_1(self):
+        """SinglePoint + VASP rejects frames_per_job != 1."""
+        config = make_config_dict(method="SinglePoint", Calculator="Vasp",
+                                  frames_per_job=3, vasp_command="mpirun vasp_std")
+        with pytest.raises(NotImplementedError, match="frames_per_job=1"):
+            load_method(config)
+
+    def test_singlepoint_vasp_fpj_1_loads(self):
+        """SinglePoint + VASP with frames_per_job=1 loads cleanly."""
+        config = make_config_dict(method="SinglePoint", Calculator="Vasp",
+                                  frames_per_job=1, vasp_command="mpirun vasp_std")
+        fn = load_method(config)
+        from saddlemill.geomopt import singlepoint
+        assert fn is singlepoint
+
+    def test_singlepoint_vaspinteractive_requires_fpj_1(self):
+        """SinglePoint + VaspInteractive also rejects frames_per_job > 1."""
+        config = make_config_dict(method="SinglePoint", Calculator="VaspInteractive",
+                                  frames_per_job=2, vasp_command="mpirun vasp_std")
+        with pytest.raises(NotImplementedError, match="frames_per_job=1"):
+            load_method(config)
+
+    @pytest.mark.parametrize("method,section,required_key", [
+        ("NEB", "ourNEB", "vasp_command_endpoints"),
+        ("Dimer", "ourDimer", "vasp_command"),
+        ("Minimization", "ourMinimization", "vasp_command"),
+        ("DoubleMinimization", "ourDoubleMinimization", "vasp_command"),
+        ("SinglePoint", "ourSinglePoint", "vasp_command"),
+    ])
+    def test_vasp_command_required(self, method, section, required_key):
+        """Missing vasp_command for any VASP method raises a clear ValueError."""
+        config = make_config_dict(method=method, Calculator="Vasp")
+        # Ensure the required key is not set (None is the default — leave it).
+        config[section][required_key] = None
+        with pytest.raises(ValueError, match=required_key):
+            load_method(config)
+
+    def test_vasp_command_present_loads(self):
+        """A method with all required VASP command keys loads cleanly."""
+        config = make_config_dict(method="Dimer", Calculator="Vasp",
+                                  vasp_command="mpirun -n 64 vasp_std")
+        fn = load_method(config)
+        from saddlemill.dimeropt import dimeropt
+        assert fn is dimeropt
+
+
+class TestVaspDebugPatterns:
+    """Tests for the per-method VASP debug-zip filename regexes added in
+    `_get_debug_filename_patterns` (config.py)."""
+
+    def _match_in(self, patterns, name):
+        for pat in patterns:
+            m = pat.match(name)
+            if m:
+                return m
+        return None
+
+    def test_dimer_vasp_pattern_captures_job_and_attempt(self):
+        from saddlemill.config import _get_debug_filename_patterns
+        patterns = _get_debug_filename_patterns("Dimer")
+        m = self._match_in(patterns, "VASP_3_5/OUTCAR")
+        assert m is not None and m.group(1) == "3" and m.group(2) == "5"
+        # ERROR_-prefixed entries also match.
+        m = self._match_in(patterns, "ERROR_VASP_7_0/INCAR")
+        assert m is not None and m.group(1) == "7" and m.group(2) == "0"
+
+    def test_minimization_vasp_pattern_captures_job_only(self):
+        from saddlemill.config import _get_debug_filename_patterns
+        patterns = _get_debug_filename_patterns("Minimization")
+        m = self._match_in(patterns, "VASP_12/OUTCAR")
+        assert m is not None and m.group(1) == "12"
+        # subunit_id is not captured (lastindex==1).
+        assert m.lastindex == 1
+
+    def test_doublemin_vasp_pattern_accepts_negative_side(self):
+        from saddlemill.config import _get_debug_filename_patterns
+        patterns = _get_debug_filename_patterns("DoubleMinimization")
+        # Side -1
+        m = self._match_in(patterns, "VASP_4_-1/OUTCAR")
+        assert m is not None and m.group(1) == "4"
+        # Side 0 (TS)
+        m = self._match_in(patterns, "VASP_4_0/INCAR")
+        assert m is not None and m.group(1) == "4"
+        # Side 1
+        m = self._match_in(patterns, "VASP_4_1/POSCAR")
+        assert m is not None and m.group(1) == "4"
+        # subunit_id (side) is NOT captured — that lets DM fall through to
+        # "remove all for matching job" since DM always re-runs all 3 sides.
+        assert m.lastindex == 1
+
+    def test_dimer_should_remove_debug_per_attempt(self):
+        """Dimer cleans VASP files only for the matching (job, attempt)."""
+        from saddlemill.config import (_get_debug_filename_patterns,
+                                       _should_remove_debug)
+        patterns = _get_debug_filename_patterns("Dimer")
+        cleaned = {3: {5}}
+        assert _should_remove_debug("VASP_3_5/OUTCAR", patterns, cleaned, "Dimer")
+        assert not _should_remove_debug("VASP_3_6/OUTCAR", patterns, cleaned, "Dimer")
+        assert not _should_remove_debug("VASP_4_5/OUTCAR", patterns, cleaned, "Dimer")
+
+    def test_doublemin_should_remove_debug_all_sides(self):
+        """DM cleans every VASP side dir for the matching job."""
+        from saddlemill.config import (_get_debug_filename_patterns,
+                                       _should_remove_debug)
+        patterns = _get_debug_filename_patterns("DoubleMinimization")
+        cleaned = {2: {-1, 1}}  # cleaned subunit_ids = sides
+        for side in (-1, 0, 1):
+            assert _should_remove_debug(f"VASP_2_{side}/OUTCAR", patterns,
+                                        cleaned, "DoubleMinimization"), (
+                f"VASP_2_{side} should be removed (DM re-runs all sides)")
+        assert not _should_remove_debug("VASP_3_-1/OUTCAR", patterns, cleaned,
+                                        "DoubleMinimization")
+
+    def test_minimization_should_remove_debug_per_job(self):
+        from saddlemill.config import (_get_debug_filename_patterns,
+                                       _should_remove_debug)
+        patterns = _get_debug_filename_patterns("Minimization")
+        cleaned = {7: {None}}
+        assert _should_remove_debug("VASP_7/INCAR", patterns, cleaned, "Minimization")
+        assert not _should_remove_debug("VASP_8/INCAR", patterns, cleaned, "Minimization")
+
 
 # ===================================================================
 # 4. TestLoadOptimizer

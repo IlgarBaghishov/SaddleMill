@@ -69,6 +69,78 @@ def get_task_name(config_dict):
 
 
 #==============================================================================
+### VASP HELPERS
+
+def resolve_vasp_calc(config_dict, calc, i, subunit_id, section):
+    """Return an instantiated calculator for this (job, subunit).
+
+    For FAIRChem, returns the shared instance unchanged. For VASP/VaspInteractive,
+    builds a fresh calculator pointing at ``VASP_{i}[_{subunit_id}]/`` with the
+    section's ``vasp_command`` / ``vasp_ncore`` and the global ``[Vasp]`` INCAR kwargs.
+    ``subunit_id=None`` produces ``VASP_{i}/`` (Minimization, SinglePoint).
+    """
+    if config_dict["Main"]["Calculator"] not in ("Vasp", "VaspInteractive"):
+        return calc
+    suffix = f"_{subunit_id}" if subunit_id is not None else ""
+    kwargs = {"directory": f"VASP_{i}{suffix}",
+              "command": config_dict[section]["vasp_command"],
+              **config_dict["Vasp"]}
+    ncore = config_dict[section].get("vasp_ncore")
+    if ncore is not None:
+        kwargs["ncore"] = int(ncore)
+    return calc(**kwargs)
+
+
+def remove_vasp_heavies(dir_path):
+    """Delete WAVECAR / CHG / CHGCAR from *dir_path* if they exist."""
+    for name in ("WAVECAR", "CHG", "CHGCAR"):
+        p = os.path.join(dir_path, name)
+        if os.path.exists(p):
+            os.remove(p)
+
+
+def archive_and_clear_temp_files(temp_files, zip_name, prefix="", enabled=True):
+    """Zip existing temp files/directories into *zip_name* and remove them.
+
+    Mirrors the per-method temp-file cleanup that previously lived inline in
+    each method. Walks directories (e.g. VASP working dirs) so every file inside
+    is archived under its relative path. Set ``enabled=False`` to skip zipping
+    and just remove the entries.
+    """
+    existing = [f for f in temp_files if os.path.exists(f)]
+    if not existing:
+        return
+    if enabled:
+        with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
+            for f_name in existing:
+                if os.path.isdir(f_name):
+                    for root, _dirs, files in os.walk(f_name):
+                        for file in files:
+                            filepath = os.path.join(root, file)
+                            zf.write(filepath, arcname=f"{prefix}{filepath}")
+                else:
+                    zf.write(f_name, arcname=f"{prefix}{f_name}")
+    for f_name in existing:
+        if os.path.isdir(f_name):
+            shutil.rmtree(f_name)
+        else:
+            os.remove(f_name)
+
+
+def finalize_if_vasp_interactive(config_dict, calc_instance):
+    """Call ``.finalize()`` on a VaspInteractive instance; no-op otherwise.
+
+    The matching guard is on the active calculator class, not on the instance
+    type — that keeps the call site readable next to other VASP-only branches.
+    """
+    if config_dict["Main"]["Calculator"] == "VaspInteractive":
+        try:
+            calc_instance.finalize()
+        except Exception:
+            pass
+
+
+#==============================================================================
 ### FILE IO
 
 def save_ordered_traj_names(trajes_and_idxs):
@@ -118,9 +190,11 @@ def clean_up_files(config_dict):
         "SinglePoint": [],  # SP writes no temp files in cwd.
     }
 
-    # VASP NEB creates per-image directories named VASP_{job_id}_{image_idx}/
-    if method_name == "NEB" and config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
-        patterns["NEB"].append("VASP_*_*/")
+    # Each method creates per-job-unit directories named VASP_{job_id}[_{subunit}]/
+    # (NEB → _image_idx, Dimer → _attempt, DM → _-1/_0/_1, Min/SP → no suffix).
+    # The single VASP_* glob matches all of these (file-or-directory).
+    if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
+        patterns.setdefault(method_name, []).append("VASP_*")
 
     # Flux log files and their backups (common to all methods)
     patterns.setdefault(method_name, [])

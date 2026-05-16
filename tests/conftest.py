@@ -68,15 +68,32 @@ def make_config_dict(method="Minimization", **overrides):
         "device": "cuda", "name_or_path": "uma-s-1p2", "task_name": "oc20",
     })
 
-    # Route overrides to the appropriate section
-    _our_neb_keys = set(config.get("ourNEB", {}).keys())
-    _our_dimer_keys = set(config.get("ourDimer", {}).keys())
-    _our_min_keys = set(config.get("ourMinimization", {}).keys())
-    _our_dmin_keys = set(config.get("ourDoubleMinimization", {}).keys())
+    # Route overrides to the appropriate section. ourDimer / ourMinimization /
+    # ourDoubleMinimization / ourSinglePoint all share `vasp_command` and
+    # `vasp_ncore` keys — routing by method-specific section based on the
+    # current method.
     _main_keys = set(config.get("Main", {}).keys())
+    method = config["Main"]["method"]
+    method_section_map = {
+        "NEB": "ourNEB",
+        "Dimer": "ourDimer",
+        "Minimization": "ourMinimization",
+        "DoubleMinimization": "ourDoubleMinimization",
+        "SinglePoint": "ourSinglePoint",
+    }
+    primary_method_section = method_section_map.get(method)
+    _vasp_shared_keys = {"vasp_command", "vasp_ncore"}
+
+    _our_neb_keys = set(config.get("ourNEB", {}).keys()) - _vasp_shared_keys
+    _our_dimer_keys = set(config.get("ourDimer", {}).keys()) - _vasp_shared_keys
+    _our_min_keys = set(config.get("ourMinimization", {}).keys()) - _vasp_shared_keys
+    _our_dmin_keys = set(config.get("ourDoubleMinimization", {}).keys()) - _vasp_shared_keys
+    _our_sp_keys = set(config.get("ourSinglePoint", {}).keys()) - _vasp_shared_keys
 
     for key, val in overrides.items():
-        if key in _main_keys:
+        if key in _vasp_shared_keys and primary_method_section in config:
+            config[primary_method_section][key] = val
+        elif key in _main_keys:
             config["Main"][key] = val
         elif key in _our_neb_keys:
             config["ourNEB"][key] = val
@@ -86,6 +103,8 @@ def make_config_dict(method="Minimization", **overrides):
             config["ourMinimization"][key] = val
         elif key in _our_dmin_keys:
             config["ourDoubleMinimization"][key] = val
+        elif key in _our_sp_keys:
+            config["ourSinglePoint"][key] = val
         elif key.startswith("BaseNEB_"):
             config["BaseNEB"][key[len("BaseNEB_"):]] = val
         elif key.startswith("DimerControl_"):

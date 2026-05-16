@@ -14,7 +14,8 @@ from ase.io import Trajectory
 from ase.mep.neb import NEB, NEBTools, NEBState
 from saddlemill.catsunami.ocpneb import OCPNEB, _find_segment_ci
 from saddlemill.dimeropt import _setup_dimer
-from saddlemill.tools import backup_flux_logs, get_task_name
+from saddlemill.tools import (backup_flux_logs, get_task_name, remove_vasp_heavies,
+                              finalize_if_vasp_interactive)
 
 
 def _expand_band(neb, fmax_threshold, max_num_frames, num_frames, calc):
@@ -228,8 +229,7 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
     def _cleanup_temp_files(error=False):
         if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
             for image_idx in range(num_images):
-                for vasp_heavy_files in [f'VASP_{i}_{image_idx}/WAVECAR',f'VASP_{i}_{image_idx}/CHG',f'VASP_{i}_{image_idx}/CHGCAR']:
-                    if os.path.exists(vasp_heavy_files): os.remove(vasp_heavy_files)
+                remove_vasp_heavies(f"VASP_{i}_{image_idx}")
         existing_files = [f for f in temp_files if os.path.exists(f)]
         if existing_files and config_dict['Main']['zip']:
             prefix = "ERROR_" if error else ""
@@ -251,25 +251,27 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
     try:
         need_interpolation = default_interp and num_images <= 2
 
+        def _build_neb_vasp_calc(image_idx, role):
+            """role: 'endpoints' or 'intermediates' — picks command/ncore keys."""
+            kwargs = {
+                "directory": f"VASP_{i}_{image_idx}",
+                "command": config_dict["ourNEB"][f"vasp_command_{role}"],
+                **config_dict["Vasp"],
+            }
+            ncore = config_dict["ourNEB"][f"vasp_ncore_{role}"]
+            if ncore is not None:
+                kwargs["ncore"] = int(ncore)
+            return calc(**kwargs)
+
         reactant = images[0]
         if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
-            reactant.calc = calc(
-                directory=f"VASP_{i}_{0}",
-                command=config_dict["ourNEB"]["vasp_command_endpoints"],
-                ncore=int(config_dict["ourNEB"]["vasp_ncore_endpoints"]),
-                **config_dict["Vasp"],
-                )
+            reactant.calc = _build_neb_vasp_calc(0, "endpoints")
         else:
             reactant.calc = calc
 
         product = images[-1]
         if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
-            product.calc = calc(
-                directory=f"VASP_{i}_{num_images-1}",
-                command=config_dict["ourNEB"]["vasp_command_endpoints"],
-                ncore=int(config_dict["ourNEB"]["vasp_ncore_endpoints"]),
-                **config_dict["Vasp"],
-                )
+            product.calc = _build_neb_vasp_calc(num_images - 1, "endpoints")
         else:
             product.calc = calc
 
@@ -333,12 +335,7 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
 
         for image_idx in range(1, num_images-1):
             if config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive"):
-                images[image_idx].calc = calc(
-                    directory=f"VASP_{i}_{image_idx}",
-                    command=config_dict["ourNEB"]["vasp_command_intermediates"],
-                    ncore=int(config_dict["ourNEB"]["vasp_ncore_intermediates"]),
-                    **config_dict["Vasp"],
-                    )
+                images[image_idx].calc = _build_neb_vasp_calc(image_idx, "intermediates")
             else:
                 images[image_idx].calc = calc
 

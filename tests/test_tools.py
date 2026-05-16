@@ -402,6 +402,62 @@ class TestCleanUpFiles:
         assert not (tmp_path / "neb_0.log").exists()
         assert not vasp_dir.exists()
 
+    def test_dimer_vasp_cleanup(self, tmp_path, monkeypatch):
+        """Dimer + VASP also removes per-attempt VASP_{job}_{attempt}/ dirs."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "dimer_opt_0_3.log").write_text("dummy")
+        vasp_dir = tmp_path / "VASP_0_3"
+        vasp_dir.mkdir()
+        (vasp_dir / "OUTCAR").write_text("dummy")
+
+        config = make_config_dict(method="Dimer", Calculator="Vasp")
+        clean_up_files(config)
+
+        assert not (tmp_path / "dimer_opt_0_3.log").exists()
+        assert not vasp_dir.exists()
+
+    def test_minimization_vasp_cleanup(self, tmp_path, monkeypatch):
+        """Minimization + VaspInteractive removes the per-job VASP_{job}/ dir."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "optimization_0.log").write_text("dummy")
+        vasp_dir = tmp_path / "VASP_0"
+        vasp_dir.mkdir()
+        (vasp_dir / "INCAR").write_text("dummy")
+
+        config = make_config_dict(method="Minimization", Calculator="VaspInteractive")
+        clean_up_files(config)
+
+        assert not (tmp_path / "optimization_0.log").exists()
+        assert not vasp_dir.exists()
+
+    def test_double_minimization_vasp_cleanup(self, tmp_path, monkeypatch):
+        """DoubleMinimization + VASP removes all three side dirs VASP_{i}_{-1,0,1}/."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "optimization_0_-1.log").write_text("dummy")
+        for side in (-1, 0, 1):
+            d = tmp_path / f"VASP_0_{side}"
+            d.mkdir()
+            (d / "OUTCAR").write_text("dummy")
+
+        config = make_config_dict(method="DoubleMinimization", Calculator="Vasp")
+        clean_up_files(config)
+
+        assert not (tmp_path / "optimization_0_-1.log").exists()
+        for side in (-1, 0, 1):
+            assert not (tmp_path / f"VASP_0_{side}").exists(), f"VASP_0_{side} should have been removed"
+
+    def test_singlepoint_vasp_cleanup(self, tmp_path, monkeypatch):
+        """SinglePoint + VASP removes the per-job VASP_{job}/ scratch dir."""
+        monkeypatch.chdir(tmp_path)
+        vasp_dir = tmp_path / "VASP_0"
+        vasp_dir.mkdir()
+        (vasp_dir / "INCAR").write_text("dummy")
+
+        config = make_config_dict(method="SinglePoint", Calculator="Vasp")
+        clean_up_files(config)
+
+        assert not vasp_dir.exists()
+
     def test_dimer_cleanup(self, tmp_path, monkeypatch):
         """Dimer cleanup removes dimer-specific temp files."""
         monkeypatch.chdir(tmp_path)

@@ -6,6 +6,16 @@ from ase.io import Trajectory
 VALID_RUN_CATEGORIES = frozenset({"converged", "not_converged", "errored", "remaining"})
 _RUN_CATEGORY_ALIASES = {"not_started": "remaining", "error": "errored"}
 
+# Per-method config section + required command keys when Calculator is VASP/VaspInteractive.
+# NEB needs two commands (endpoints heavier than intermediates); other methods need one.
+_VASP_METHOD_SECTION = {
+    "NEB": ("ourNEB", ["vasp_command_endpoints", "vasp_command_intermediates"]),
+    "Dimer": ("ourDimer", ["vasp_command"]),
+    "Minimization": ("ourMinimization", ["vasp_command"]),
+    "DoubleMinimization": ("ourDoubleMinimization", ["vasp_command"]),
+    "SinglePoint": ("ourSinglePoint", ["vasp_command"]),
+}
+
 class ConfigManager:
     # 1. Define your Safe Defaults here
     DEFAULTS = {
@@ -30,13 +40,19 @@ class ConfigManager:
         },
         "ourMinimization": {
             "relax_cell": False,
+            "vasp_command": None,
+            "vasp_ncore": None,
         },
         "ourSinglePoint": {
-            "frames_per_job": 1,  # 1 (default) | 3. With 3, each executorlib job processes a triplet (e.g. DM min1/TS/min2) in a single batched FAIRChem forward pass.
+            "frames_per_job": 1,  # 1 (default) | 3. With 3, each executorlib job processes a triplet (e.g. DM min1/TS/min2) in a single batched FAIRChem forward pass. VASP requires 1.
+            "vasp_command": None,
+            "vasp_ncore": None,
         },
         "ourDoubleMinimization": {
             "relax_cell": False,
             "pre_dimer_refine": False,
+            "vasp_command": None,
+            "vasp_ncore": None,
         },
         "ourNEB": {
             "only_endpoints_in_input_traj": False,
@@ -71,6 +87,8 @@ class ConfigManager:
             "delocalization_threshold": 0.8,
             "extension_check_fmax": 0.4,
             "extension_check_curvature": -0.2,
+            "vasp_command": None,
+            "vasp_ncore": None,
         },
     }
 
@@ -237,12 +255,20 @@ def load_method(config_dict):
             f"input_format='lmdb' is only supported for method='SinglePoint'; got method={method_name!r}."
         )
 
+    calc_name = config_dict["Main"]["Calculator"]
     if method_name == "SinglePoint":
-        calc_name = config_dict["Main"]["Calculator"]
-        if calc_name != "FAIRChemCalculator":
+        if calc_name not in ("FAIRChemCalculator", "Vasp", "VaspInteractive"):
             raise NotImplementedError(
-                f"method='SinglePoint' currently supports only FAIRChemCalculator; got Calculator={calc_name!r}."
+                f"method='SinglePoint' supports FAIRChemCalculator, Vasp, and "
+                f"VaspInteractive; got Calculator={calc_name!r}."
             )
+        if calc_name in ("Vasp", "VaspInteractive"):
+            fpj = config_dict["ourSinglePoint"].get("frames_per_job", 1)
+            if fpj != 1:
+                raise NotImplementedError(
+                    f"SinglePoint with Calculator={calc_name!r} requires "
+                    f"frames_per_job=1 (no batched DFT forward pass); got frames_per_job={fpj}."
+                )
         # v1: LMDB output cleaning is not implemented; restrict resume categories.
         if input_format == "lmdb":
             cats = _normalize_run_jobs(config_dict["Main"]["run_jobs"])
@@ -253,6 +279,16 @@ def load_method(config_dict):
                     "categories, delete SinglePoint_lmdbs/ and "
                     "SinglePoint_status_csvs/ first."
                 )
+
+    if calc_name in ("Vasp", "VaspInteractive"):
+        section, required_keys = _VASP_METHOD_SECTION[method_name]
+        missing = [k for k in required_keys if not config_dict[section].get(k)]
+        if missing:
+            raise ValueError(
+                f"Calculator={calc_name!r} requires [{section}] {', '.join(missing)} "
+                f"to be set. Add them to config.ini (the launcher command for VASP, "
+                f"e.g. 'mpirun -n 64 vasp_std')."
+            )
 
     if method_name == "NEB":
         from saddlemill.nebopt import nebopt as method
@@ -620,14 +656,24 @@ def _get_debug_filename_patterns(method_name):
             re.compile(r'^VASP_(\d+)(?:_sub(\d+))?_'),
         ]
     elif method_name == "Dimer":
-        return [re.compile(r'^(?:ERROR_)?dimer_(?:control_|opt_)?(\d+)_(\d+)_')]
+        return [
+            re.compile(r'^(?:ERROR_)?dimer_(?:control_|opt_)?(\d+)_(\d+)_'),
+            # VASP debug entries: per-attempt dir → (job, attempt) per-subunit cleanup.
+            re.compile(r'^(?:ERROR_)?VASP_(\d+)_(\d+)/'),
+        ]
     elif method_name == "DoubleMinimization":
         return [
             re.compile(r'^(?:ERROR_)?optimization_(\d+)_(-?\d+)'),
             re.compile(r'^(?:ERROR_)?dimer_refine_(\d+)'),
+            # VASP debug entries: per-side dirs (VASP_{job}_-1/0/1) — capture only job_id
+            # so the DM remove-all-for-job branch fires (DM always re-runs all 3 sides).
+            re.compile(r'^(?:ERROR_)?VASP_(\d+)_-?\d+/'),
         ]
     elif method_name == "Minimization":
-        return [re.compile(r'^(?:ERROR_)?optimization_(\d+)')]
+        return [
+            re.compile(r'^(?:ERROR_)?optimization_(\d+)'),
+            re.compile(r'^(?:ERROR_)?VASP_(\d+)/'),
+        ]
     return []
 
 
@@ -798,13 +844,13 @@ def get_flux_resources(config_dict):
     elif config_dict["Main"]["device"] == 'cpu':
         max_workers = nnodes * jobs_per_node
         gpus_per_core = 0
-        if config_dict["Main"]["Calculator"] in ("#Vasp", "#VaspInteractive"):
-            cores = (all_ncores-1) // max_workers
-            threads_per_core = 1
-        else:
-            cores = 1
-            # threads_per_core = (all_ncores-1) // nnodes
-            threads_per_core = all_ncores // nnodes
+        # Always cores=1 per worker so executorlib spawns single-rank Python
+        # workers (no internal mpi4py dependency). The user's vasp_command
+        # (or FAIRChem CPU calc) handles its own threading / MPI ranks.
+        # threads_per_core is partitioned across all workers so the total
+        # resource request fits inside the node's physical core budget.
+        cores = 1
+        threads_per_core = max(1, all_ncores // max_workers)
     else:
         raise ValueError("Only devices cuda and cpu available. Please set one of the two in Main section of config.ini")
     return max_workers, cores, gpus_per_core, threads_per_core

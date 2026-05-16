@@ -11,7 +11,9 @@ from ase.io import Trajectory
 from ase.mep import DimerControl, MinModeAtoms, MinModeTranslate
 from ase.calculators.singlepoint import SinglePointCalculator
 from saddlemill.dimertools.structure_edit import get_attempts
-from saddlemill.tools import backup_flux_logs, get_task_name
+from saddlemill.tools import (backup_flux_logs, get_task_name, resolve_vasp_calc,
+                              remove_vasp_heavies, finalize_if_vasp_interactive,
+                              archive_and_clear_temp_files)
 
 
 class StopRun(Exception):
@@ -73,6 +75,7 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
     my_output_file = f"{method_name}_trajes/collected_ts_rank_{rank}.traj"
     zip_name = f"{method_name}_debug_zips/structure_rank_{rank}_data.zip"
     task_name = get_task_name(config_dict)
+    is_vasp = config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive")
 
     max_consecutive_errors = config_dict["Main"]["max_consecutive_errors"]
     if consecutive_errors is not None and consecutive_errors[0] >= max_consecutive_errors > 0:
@@ -123,6 +126,10 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
             temp_opt_log = f'dimer_opt_{i}_{attempt}_{slctd_indx}.log'
             temp_traj = f'dimer_{i}_{attempt}_{slctd_indx}.traj'
             temp_files = [temp_log, temp_opt_log, temp_traj]
+            attempt_vasp_dir = f"VASP_{i}_{attempt}" if is_vasp else None
+            if attempt_vasp_dir is not None:
+                temp_files.append(attempt_vasp_dir)
+            attempt_calc = None
 
             try:
                 # Handle constraints:
@@ -140,8 +147,9 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                 if eigenmode is not None:
                     eigenmode = np.array(eigenmode)
 
+                attempt_calc = resolve_vasp_calc(config_dict, calc, i, attempt, "ourDimer")
                 d_atoms, dim_rlx = _setup_dimer(
-                    atoms, calc, eigenmode=eigenmode,
+                    atoms, attempt_calc, eigenmode=eigenmode,
                     displacement_dict=displacement_dict,
                     dimer_control_kwargs=config_dict["DimerControl"],
                     control_logfile=temp_log,
@@ -215,6 +223,9 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                 curvature = d_atoms.get_curvature()
                 energy = atoms.get_potential_energy()
                 forces = atoms.get_forces()
+                finalize_if_vasp_interactive(config_dict, attempt_calc)
+                if attempt_vasp_dir is not None:
+                    remove_vasp_heavies(attempt_vasp_dir)
 
                 atoms.info['eigenmode'] = eigenmode
                 atoms.info['curvature'] = float(curvature)
@@ -236,14 +247,10 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
 
                 writer.write(atoms)
 
-                # Clean up temp files
-                existing_files = [f for f in temp_files if os.path.exists(f)]
-                if existing_files and config_dict['Main']['zip']:
-                    with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
-                        for f_name in existing_files:
-                            zf.write(f_name, arcname=f"{f_name}")
-                    for f_name in existing_files:
-                        os.remove(f_name)
+                # Clean up temp files (the zip block below walks directories too,
+                # so the per-attempt VASP dir is captured automatically).
+                archive_and_clear_temp_files(temp_files, zip_name, prefix="",
+                                   enabled=config_dict['Main']['zip'])
 
                 log_status(attempt, slctd_indx, status)
                 any_attempt_succeeded = True
@@ -251,13 +258,10 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
             except Exception as e:
                 print(f"Rank {rank} FAILED on structure {i}, attempt {attempt}: {e}", flush=True)
                 print(f"\nTraceback details:\n{traceback.format_exc()}", flush=True)
-                existing_files = [f for f in temp_files if os.path.exists(f)]
-                if existing_files and config_dict['Main']['zip']:
-                    with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
-                        for f_name in existing_files:
-                            zf.write(f_name, arcname=f"ERROR_{f_name}")
-                    for f_name in existing_files:
-                        os.remove(f_name)
+                if attempt_calc is not None:
+                    finalize_if_vasp_interactive(config_dict, attempt_calc)
+                archive_and_clear_temp_files(temp_files, zip_name, prefix="ERROR_",
+                                   enabled=config_dict['Main']['zip'])
                 log_status(attempt, slctd_indx, f"error: {str(e)}")
 
     # Track consecutive structure-level errors for worker health

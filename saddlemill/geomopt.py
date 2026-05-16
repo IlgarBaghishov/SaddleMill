@@ -5,7 +5,9 @@ import zipfile
 from ase.io import Trajectory
 from ase.filters import FrechetCellFilter
 from ase.calculators.singlepoint import SinglePointCalculator
-from saddlemill.tools import check_reaction, check_adsorbate_reaction, backup_flux_logs, get_task_name
+from saddlemill.tools import (check_reaction, check_adsorbate_reaction, backup_flux_logs,
+                              get_task_name, resolve_vasp_calc, remove_vasp_heavies,
+                              finalize_if_vasp_interactive, archive_and_clear_temp_files)
 from saddlemill.dimeropt import _refine_eigenmode
 
 
@@ -30,9 +32,11 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
     if continuation_data is not None and config_dict["Main"]["continue_from_result"]:
         atoms = continuation_data
 
-    atoms.calc = calc
-
     method_name = config_dict["Main"]["method"]
+    is_vasp = config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive")
+    vasp_calc = resolve_vasp_calc(config_dict, calc, i, None, "ourMinimization")
+    atoms.calc = vasp_calc
+
     status_file = f"{method_name}_status_csvs/status_rank_{rank}.csv"
     my_output_file = f"{method_name}_trajes/collected_opt_rank_{rank}.traj"
     zip_name = f"{method_name}_debug_zips/structure_rank_{rank}_data.zip"
@@ -48,6 +52,8 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
         temp_opt_log = f'optimization_{i}.log'
         temp_traj = f'optimization_{i}.traj'
         temp_files = [temp_opt_log, temp_traj]
+        if is_vasp:
+            temp_files.append(f"VASP_{i}")
         orig = atoms.info.get('orig_info', {})
         parent_source_idx = orig.get('src_index')
 
@@ -56,6 +62,9 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
             converged = relax_structure(config_dict, optimizable, temp_opt_log, temp_traj, Optimizer)
             energy = atoms.get_potential_energy()
             forces = atoms.get_forces()
+            finalize_if_vasp_interactive(config_dict, vasp_calc)
+            if is_vasp:
+                remove_vasp_heavies(f"VASP_{i}")
 
             if converged:
                 status = "converged"
@@ -72,14 +81,8 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
 
             writer.write(atoms)
 
-            # Clean up temp files
-            existing_files = [f for f in temp_files if os.path.exists(f)]
-            if existing_files and config_dict['Main']['zip']:
-                with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
-                    for f_name in existing_files:
-                        zf.write(f_name, arcname=f"{f_name}")
-                for f_name in existing_files:
-                    os.remove(f_name)
+            archive_and_clear_temp_files(temp_files, zip_name, prefix="",
+                                         enabled=config_dict['Main']['zip'])
 
             log_status(status)
             if consecutive_errors is not None:
@@ -90,13 +93,9 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
             print(f"\nTraceback details:\n{traceback.format_exc()}", flush=True)
             if consecutive_errors is not None:
                 consecutive_errors[0] += 1
-            existing_files = [f for f in temp_files if os.path.exists(f)]
-            if existing_files and config_dict['Main']['zip']:
-                with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
-                    for f_name in existing_files:
-                        zf.write(f_name, arcname=f"ERROR_{f_name}")
-                for f_name in existing_files:
-                    os.remove(f_name)
+            finalize_if_vasp_interactive(config_dict, vasp_calc)
+            archive_and_clear_temp_files(temp_files, zip_name, prefix="ERROR_",
+                                         enabled=config_dict['Main']['zip'])
             log_status(f"error: {str(e)}")
 
 
@@ -110,9 +109,13 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
         backup_flux_logs(rank)
         sys.exit(1)
 
-    atoms.calc = calc
-
     method_name = config_dict["Main"]["method"]
+    is_vasp = config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive")
+    # TS-side calculator: used for TS E/F and optional pre_dimer_refine.
+    ts_calc = resolve_vasp_calc(config_dict, calc, i, 0 if is_vasp else None, "ourDoubleMinimization")
+    active_vasp_calcs = [ts_calc] if is_vasp else []
+    atoms.calc = ts_calc
+
     status_file = f"{method_name}_status_csvs/status_rank_{rank}.csv"
     my_output_file = f"{method_name}_trajes/collected_opt_rank_{rank}.traj"
     zip_name = f"{method_name}_debug_zips/structure_rank_{rank}_data.zip"
@@ -124,6 +127,8 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
 
     # 3. Initialize list to track temp files from BOTH optimizations
     temp_files = []
+    if is_vasp:
+        temp_files.extend([f"VASP_{i}_{s}" for s in (-1, 0, 1)])
     continuation_data = kwargs.get('continuation_data')  # {side: Atoms} or None
     entries_to_run = kwargs.get('entries_to_run')        # set of side_ids (-1, 1) or None
     with Trajectory(my_output_file, 'a') as writer:
@@ -144,7 +149,7 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
                 dimer_log = f'dimer_refine_{i}.log'
                 temp_files.append(dimer_log)
                 refined_eigenmode, curvature = _refine_eigenmode(
-                    atoms, calc, refined_eigenmode,
+                    atoms, ts_calc, refined_eigenmode,
                     dimer_control_kwargs=config_dict.get("DimerControl", {}),
                     control_logfile=dimer_log,
                 )
@@ -156,10 +161,27 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
             ts_atoms.info = atoms.info.copy()
             ts_energy = atoms.get_potential_energy()
             ts_forces = atoms.get_forces()
+            finalize_if_vasp_interactive(config_dict, ts_calc)
+            if is_vasp:
+                remove_vasp_heavies(f"VASP_{i}_0")
 
             # --- MINIMIZE BOTH SIDES ---
             mins = {}  # side -> (atoms, converged)
             displacement = 0.25
+
+            # Per-side VASP calc cache: instantiated lazily, reused for both
+            # the desorption-check single-point AND the subsequent relaxation
+            # (so WAVECAR warm-starts the relax).
+            side_calcs = {}
+
+            def _side_calc(side):
+                if not is_vasp:
+                    return calc
+                if side not in side_calcs:
+                    side_calcs[side] = resolve_vasp_calc(
+                        config_dict, calc, i, side, "ourDoubleMinimization")
+                    active_vasp_calcs.append(side_calcs[side])
+                return side_calcs[side]
 
             # Desorption: only optimize toward bound state, skip desorption direction
             skip_side = None
@@ -167,7 +189,7 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
                 energies = {}
                 for test_side in [-1, 1]:
                     test_atoms = ts_atoms.copy()
-                    test_atoms.calc = calc
+                    test_atoms.calc = _side_calc(test_side)
                     test_atoms.positions += -test_side * displacement * refined_eigenmode
                     energies[test_side] = test_atoms.get_potential_energy()
                 skip_side = max(energies, key=energies.get)
@@ -181,13 +203,18 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
                     energy = ts_energy
                     forces = ts_forces
                     conv = True
+                    # The skip-side dir got one single-point during the desorption
+                    # check above; finalize + clean WAVECAR so nothing leaks.
+                    if is_vasp and side in side_calcs:
+                        finalize_if_vasp_interactive(config_dict, side_calcs[side])
+                        remove_vasp_heavies(f"VASP_{i}_{side}")
                 elif should_run:
                     if continuation_data and side in continuation_data and continue_from_result:
                         min_atoms = continuation_data[side].copy()
-                        min_atoms.calc = calc
+                        min_atoms.calc = _side_calc(side)
                     else:
                         min_atoms = ts_atoms.copy()
-                        min_atoms.calc = calc
+                        min_atoms.calc = _side_calc(side)
                         min_atoms.positions += -side * displacement * refined_eigenmode
 
                     log_f = f'optimization_{i}_{side}.log'
@@ -198,6 +225,9 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
                     conv = relax_structure(config_dict, optimizable, log_f, traj_f, Optimizer)
                     energy = min_atoms.get_potential_energy()
                     forces = min_atoms.get_forces()
+                    if is_vasp:
+                        finalize_if_vasp_interactive(config_dict, side_calcs[side])
+                        remove_vasp_heavies(f"VASP_{i}_{side}")
                 else:
                     if not (continuation_data and side in continuation_data):
                         raise ValueError(f"Missing continuation data for kept side={side}")
@@ -264,13 +294,8 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
             writer.write(min2)
 
             # --- CLEANUP (Success Case) ---
-            existing_files = [f for f in temp_files if os.path.exists(f)]
-            if existing_files and config_dict['Main']['zip']:
-                with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
-                    for f_name in existing_files:
-                        zf.write(f_name, arcname=f_name)
-                for f_name in existing_files:
-                    os.remove(f_name)
+            archive_and_clear_temp_files(temp_files, zip_name, prefix="",
+                                         enabled=config_dict['Main']['zip'])
 
             for side in mins:
                 if entries_to_run is None or side in entries_to_run:
@@ -285,17 +310,14 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
             print(f"\nTraceback details:\n{traceback.format_exc()}", flush=True)
             if consecutive_errors is not None:
                 consecutive_errors[0] += 1
+            for vc in active_vasp_calcs:
+                finalize_if_vasp_interactive(config_dict, vc)
             for side in [-1, 1]:
                 if entries_to_run is None or side in entries_to_run:
                     log_status(side, parent_source_idx, f"error: {str(e)}")
 
-            existing_files = [f for f in temp_files if os.path.exists(f)]
-            if existing_files and config_dict['Main']['zip']:
-                with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
-                    for f_name in existing_files:
-                        zf.write(f_name, arcname=f"ERROR_{f_name}")
-                for f_name in existing_files:
-                    os.remove(f_name)
+            archive_and_clear_temp_files(temp_files, zip_name, prefix="ERROR_",
+                                         enabled=config_dict['Main']['zip'])
 
 
 def singlepoint(i, config_dict, atoms, calc, consecutive_errors=None,
@@ -317,6 +339,7 @@ def singlepoint(i, config_dict, atoms, calc, consecutive_errors=None,
 
     method_name = config_dict["Main"]["method"]   # "SinglePoint"
     input_format = config_dict["Main"]["input_format"]
+    is_vasp = config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive")
     status_file = f"{method_name}_status_csvs/status_rank_{rank}.csv"
     task_name = get_task_name(config_dict)
 
@@ -327,8 +350,23 @@ def singlepoint(i, config_dict, atoms, calc, consecutive_errors=None,
         with open(status_file, 'a') as f:
             f.write(f'{i},{rank},"{status_msg}"\n')
 
+    vasp_calc = None
+    vasp_dir = f"VASP_{i}" if is_vasp else None
     try:
-        if len(frames) > 1:
+        if is_vasp:
+            # Config-level guard enforces frames_per_job=1 for VASP; defensive
+            # assert here so a misconfigured call doesn't silently drop frames.
+            if len(frames) != 1:
+                raise ValueError(
+                    f"SinglePoint+VASP requires frames_per_job=1; got {len(frames)} frames.")
+            a = frames[0]
+            vasp_calc = resolve_vasp_calc(config_dict, calc, i, None, "ourSinglePoint")
+            a.calc = vasp_calc
+            energy_v = a.get_potential_energy()
+            forces_v = a.get_forces()
+            finalize_if_vasp_interactive(config_dict, vasp_calc)
+            ef_pairs = [(energy_v, forces_v)]
+        elif len(frames) > 1:
             # Single batched FAIRChem forward pass for all frames.
             # Pattern from catsunami/ocpneb.py:168-175. Frames may have different
             # natoms (different parent structures in the same batch) — slice the
@@ -370,6 +408,11 @@ def singlepoint(i, config_dict, atoms, calc, consecutive_errors=None,
                     a.calc = SinglePointCalculator(a, energy=e, forces=f_arr)
                     writer.write(a)
 
+        if vasp_dir is not None and os.path.isdir(vasp_dir):
+            # SP has no _debug_zips/ — just drop the VASP scratch dir.
+            import shutil as _shutil
+            _shutil.rmtree(vasp_dir, ignore_errors=True)
+
         log_status("converged")
         if consecutive_errors is not None:
             consecutive_errors[0] = 0
@@ -379,4 +422,9 @@ def singlepoint(i, config_dict, atoms, calc, consecutive_errors=None,
         print(f"\nTraceback details:\n{traceback.format_exc()}", flush=True)
         if consecutive_errors is not None:
             consecutive_errors[0] += 1
+        if vasp_calc is not None:
+            finalize_if_vasp_interactive(config_dict, vasp_calc)
+        if vasp_dir is not None and os.path.isdir(vasp_dir):
+            import shutil as _shutil
+            _shutil.rmtree(vasp_dir, ignore_errors=True)
         log_status(f"error: {str(e)}")

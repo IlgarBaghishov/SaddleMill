@@ -28,7 +28,7 @@ The `__main__.py` reads `config.ini` from the current directory, loads the metho
 | Dimer | `Dimer` | `dimeropt.py` | Dimer method for saddle point search |
 | Minimization | `Minimization` | `geomopt.py` | Single structure geometry optimization |
 | DoubleMinimization | `DoubleMinimization` | `geomopt.py` | TS refinement: displaces along eigenmode in both directions, relaxes, checks for reaction |
-| SinglePoint | `SinglePoint` | `geomopt.py` | One E/F call per frame; only method that accepts `.aselmdb` input. Supports `frames_per_job = N` for batched evaluation of N frames per job in one FAIRChem forward pass. FAIRChem only. |
+| SinglePoint | `SinglePoint` | `geomopt.py` | One E/F call per frame; only method that accepts `.aselmdb` input. `frames_per_job = N` enables a batched FAIRChem forward pass for N frames per job. With VASP/VaspInteractive, `frames_per_job` is forced to 1 (no batched DFT). |
 
 ## Architecture
 
@@ -57,7 +57,7 @@ Auxiliary entry points:
 ### `config.py`
 - `ConfigManager`: Reads `config.ini` with type inference (bool/int/float/list/string). Quoted strings (`"..."` or `'...'`) preserved as literal strings (for VASP commands with spaces). Warns on unrecognized keys in known sections.
 - **Backward-compat key migration** (`_RENAMED_KEYS` + `_migrate_renamed_keys`): silently renames `intermediate_minima_check_interval` → `intermediate_minima_check_step`, `add_images_check_interval` → `add_images_step`. The removed bool `intermediate_minima = True` is auto-converted to `intermediate_minima_check_step = 100`.
-- `load_calculator()`: Returns calculator class/callable (`FAIRChemCalculator`, `Vasp`, or `VaspInteractive`). For FAIRChem, returns `from_model_checkpoint`; for VASP, returns the class itself. Instantiation deferred to `init_function.py` (FAIRChem) or `nebopt.py` (VASP, per-image). VASP support is NEB only; Dimer/Minimization/DoubleMinimization require FAIRChemCalculator.
+- `load_calculator()`: Returns calculator class/callable (`FAIRChemCalculator`, `Vasp`, or `VaspInteractive`). For FAIRChem, returns `from_model_checkpoint`; for VASP, returns the class itself. Instantiation deferred to `init_function.py` (FAIRChem) or to the method modules (VASP, per-job-unit). All five methods (NEB, Dimer, Minimization, DoubleMinimization, SinglePoint) accept VASP/VaspInteractive. NEB uses `[ourNEB] vasp_command_endpoints/intermediates`; other methods use a single `vasp_command` in their own `[ourXxx]` section. `vasp_command` is required when Calculator is VASP — `load_method` raises if it is missing. SinglePoint with VASP requires `frames_per_job = 1`.
 - `load_method()`: Imports the correct optimization function
 - `load_optimizer()`: Returns optimizer class(es) - for NEB returns (endpoint_optimizer, neb_optimizer)
 - `get_trajes_and_indices()`: Recursively scans dir_path (including subdirectories) for .traj files, splits into job batches
@@ -157,7 +157,7 @@ Adsorbate atoms: tag=2 only (no fallback). Substrate (tag=0) fixed via `FixAtoms
 - `geomopt()`: Standard relaxation with optional cell relaxation (FrechetCellFilter). Output frames carry `task_name` (from `get_task_name`).
 - `doublegeomopt()`: Takes converged TS with eigenmode, displaces ±0.25*eigenmode, relaxes both directions, detects bond breaking/forming via `check_reaction()` and `check_adsorbate_reaction()`. Reads `eigenmode`, `converged`, `src_index` from `atoms.info['orig_info']` (fallback `atoms.info`). Each frame gets `side` in `.info` (-1=min1, 0=ts, 1=min2). Writes 2 CSV lines per job in the form `{job_id},{rank},{side_id},{parent_source_idx},"{status_msg}"`. Accepts `entries_to_run`/`continuation_data` for per-side execution. Optional `pre_dimer_refine=True` (default False) runs a rotation-only dimer step via `_refine_eigenmode()` from `dimeropt.py` to refine the eigenmode direction before displacement. Rotation parameters controlled by `[DimerControl]` section (especially `max_num_rot`, `dimer_separation`). Stores refined eigenmode and `curvature` on the TS output frame's `.info`. The full reaction-detection metadata dict (`is_reaction`, `n_formed_bonds`, `n_broken_bonds`, `broken_bonds`, `formed_bonds`, plus `is_ads_reaction` / `n_ads_formed_bonds` / `n_ads_broken_bonds` / `ads_broken_bonds` / `ads_formed_bonds` for OC inputs) is copied onto every emitted frame (min1, TS, min2) along with `parent_ts_index` and `task_name`.
 - **Desorption-skip logic**: when `check_adsorbate_reaction()` flags the bond change as a desorption, the higher-energy side is skipped to avoid relaxing into vacuum; that side gets `side_statuses[side] = "converged_desorption_skipped"` while the other side still runs normally. The TS frame's `status` always reflects the converged TS itself.
-- `singlepoint()`: One E/F call per frame. Only method that supports `.aselmdb` input (via `[Main] input_format = lmdb`). With `[ourSinglePoint] frames_per_job = N` (any positive integer) it bundles N frames per executorlib job and computes their energies and forces in a single batched FAIRChem forward pass via `fairchem.core.datasets.atomic_data.atomicdata_list_to_batch` + `calc.predictor.predict`, then writes the frames contiguously in input order to the same rank shard. Per-frame `natoms` may vary within a batch — forces are sliced by cumulative `natoms` offsets. The last batch in each shard may be smaller than N (no divisibility check). For triplet-respecting use cases (e.g. DM output min1/TS/min2), pick N as a multiple of 3 so triplets stay intact. No optimizer, no temp log/traj files, no debug zips. Output goes to `SinglePoint_trajes/collected_sp_rank_{rank}.traj` (traj input) or `SinglePoint_lmdbs/collected_sp_rank_{rank}.aselmdb` (lmdb input). LMDB output preserves the source row's `key_value_pairs` and `data` (`info` + `traj_path`) verbatim and populates `row.energy` / `row.forces` via `SinglePointCalculator`. Does **not** call `atoms.wrap()` — the structure is untouched, only E/F are added. v1: FAIRChem only; LMDB input restricted to `run_jobs = remaining`.
+- `singlepoint()`: One E/F call per frame. Only method that supports `.aselmdb` input (via `[Main] input_format = lmdb`). With `[ourSinglePoint] frames_per_job = N` (any positive integer) it bundles N frames per executorlib job and computes their energies and forces in a single batched FAIRChem forward pass via `fairchem.core.datasets.atomic_data.atomicdata_list_to_batch` + `calc.predictor.predict`, then writes the frames contiguously in input order to the same rank shard. Per-frame `natoms` may vary within a batch — forces are sliced by cumulative `natoms` offsets. The last batch in each shard may be smaller than N (no divisibility check). For triplet-respecting use cases (e.g. DM output min1/TS/min2), pick N as a multiple of 3 so triplets stay intact. No optimizer, no temp log/traj files, no debug zips. Output goes to `SinglePoint_trajes/collected_sp_rank_{rank}.traj` (traj input) or `SinglePoint_lmdbs/collected_sp_rank_{rank}.aselmdb` (lmdb input). LMDB output preserves the source row's `key_value_pairs` and `data` (`info` + `traj_path`) verbatim and populates `row.energy` / `row.forces` via `SinglePointCalculator`. Does **not** call `atoms.wrap()` — the structure is untouched, only E/F are added. **VASP/VaspInteractive**: supported with `frames_per_job = 1` only (no batched DFT). Each job uses one `VASP_{i}/` scratch dir which is `shutil.rmtree`'d at job end — SP has no `_debug_zips/`. LMDB input restricted to `run_jobs = remaining`.
 
 ### `tools.py` - Utilities
 - `load_and_sanitize(traj, i, j)`: Loads atoms and stashes original `.info` into `atoms.info = {"orig_info": <original_info>}`. Prevents per-atom array data from causing size mismatches on atom add/remove. Called in `__main__.py` for all methods.
@@ -177,7 +177,7 @@ Adsorbate atoms: tag=2 only (no fallback). Substrate (tag=0) fixed via `FixAtoms
 - Assigns GPU based on executorlib_worker_id and jobs_per_gpu
 - Multi-GPU sharing (`jobs_per_gpu > 1`): auto-detects MPS daemons (`/tmp/mps_{gpu}/control`). If MPS running, sets `CUDA_MPS_PIPE_DIRECTORY` + `CUDA_VISIBLE_DEVICES=0`; else direct assignment. Skipped for VASP.
 - FAIRChem: instantiates calculator once (on GPU, shared across structures)
-- VASP/VaspInteractive: returns class (instantiation deferred to per-image in `nebopt.py`)
+- VASP/VaspInteractive: returns class — instantiation is deferred to the per-job-unit `resolve_vasp_calc()` helper in `tools.py`, called by `nebopt.py` (per-image), `dimeropt.py` (per-attempt), and `geomopt.py` (per-job / per-side / per-frame).
 - Returns `{calc, Optimizer, consecutive_errors}`. `consecutive_errors` is `[0]` (mutable list); resets on worker restart.
 
 ### `catsunami/autoframe.py` - NEB Frame Generation
@@ -305,8 +305,23 @@ relax_cell = False
 pre_dimer_refine = False   # Rotation-only dimer to refine eigenmode before displacement (requires [DimerControl])
 
 [ourSinglePoint]
-frames_per_job = 1   # 1 (default) | 3. With 3, each executorlib job processes a triplet (e.g. DM min1/TS/min2) in a single batched FAIRChem forward pass; writes 3 frames contiguously in input order.
+frames_per_job = 1   # 1 (default) | N. With N>1, each executorlib job processes N frames in a single batched FAIRChem forward pass. VASP/VaspInteractive forces N=1 (no batched DFT).
+# Required when Calculator = Vasp or VaspInteractive (same pattern in [ourDimer], [ourMinimization], [ourDoubleMinimization]):
+vasp_command = "srun --exclusive -n 64 vasp_std"
+vasp_ncore = 8
 ```
+
+**VASP/VaspInteractive across all methods.** Every method instantiates per-job-unit VASP working directories via the shared `tools.resolve_vasp_calc()` helper:
+
+| Method | Working dir | Notes |
+|--------|------------|-------|
+| NEB | `VASP_{job}_{image_idx}/` | Separate `vasp_command_endpoints`/`_intermediates` commands. |
+| Dimer | `VASP_{job}_{attempt_id}/` | One dir per attempt — clean isolation across reaction-type displacements. |
+| Minimization | `VASP_{job}/` | Single dir per job. |
+| DoubleMinimization | `VASP_{job}_-1/`, `VASP_{job}_0/`, `VASP_{job}_1/` | Side ints match `info['side']`. TS dir reused for `pre_dimer_refine`; side dirs reused for desorption-check single-point + relaxation (WAVECAR warm-start). |
+| SinglePoint | `VASP_{job}/` | `shutil.rmtree`'d at job end — SP has no `_debug_zips/`. |
+
+`VaspInteractive.finalize()` is always called before swapping in `SinglePointCalculator`, and in error handlers, so the VASP subprocess never outlives the Python job. WAVECAR/CHG/CHGCAR are removed from each dir on success; remaining VASP files are zipped into `{method}_debug_zips/` (except SP). Resume cleanup picks up stale `VASP_*` dirs through `tools.clean_up_files()` for every method when Calculator is VASP/VaspInteractive.
 
 ### `run_jobs` — Flexible Job Selection
 
