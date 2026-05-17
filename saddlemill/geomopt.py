@@ -373,6 +373,12 @@ def singlepoint(i, config_dict, atoms, calc, consecutive_errors=None,
             # concatenated forces by per-frame natoms.
             import numpy as _np
             from fairchem.core.datasets.atomic_data import atomicdata_list_to_batch
+            # a2g lifts energy/forces off atoms.calc when present, so a batch
+            # mixing rows-with-calc and rows-without-calc produces AtomicData
+            # with inconsistent keys and atomicdata_list_to_batch crashes.
+            # Drop any stored calc; SP overwrites it below with the new result.
+            for a in frames:
+                a.calc = None
             data_list = [calc.a2g(a) for a in frames]
             batch = atomicdata_list_to_batch(data_list)
             preds = calc.predictor.predict(batch)
