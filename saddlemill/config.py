@@ -96,6 +96,10 @@ class ConfigManager:
             "vasp_command": None,
             "vasp_ncore": None,
             "bulk_reuse_offset": 0,
+            "concentrate_prob": 0.3,     # fraction of gaussian OC attempts that get concentrated; 0 = off
+            "concentrate_power": 1.5,    # 1 = plain gaussian, 1.5 = gentle, 2 = your "squaring", 3+ = very peaked
+            "concentrate_std": 0.2,      # sets total kick norm = std*sqrt(3*n_eligible); matches adsorbate_atom's std
+
         },
         # SaddleMill-side VASP-input orchestration (the [Vasp] section itself is a
         # pure pass-through to ASE's Vasp calculator and never holds our keys).
