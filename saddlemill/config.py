@@ -36,8 +36,10 @@ class ConfigManager:
             "zip": True,
             "max_consecutive_errors": 5,
             "restart_limit": 3,
+            "seed_offset": 0, # offsets seed to change seed
             "input_format": "traj",  # traj (default) | lmdb. lmdb is only supported for method=SinglePoint.
-        },
+            "attempt_chunk_size": 0, # 0 = off (one job per structure). >0 = split a structure's redo attempts into jobs of this many, spread across workers.
+            },
         "ourMinimization": {
             "relax_cell": False,
             "vasp_command": None,
@@ -89,7 +91,7 @@ class ConfigManager:
             "extension_check_fmax": 0.4,
             "extension_check_curvature": -0.2,
             "engine": "ase",            # ase (stock ASE dimer) | kappa
-            "kappa_beta": 5.0,          # only used when engine = kappa
+            "kappa_beta": 2.0,          # only used when engine = kappa
             "kappa_recover_fmax": 0.3,  # only used when engine = kappa
             "vasp_command": None,
             "vasp_ncore": None,
@@ -511,19 +513,42 @@ def _categorize_statuses(statuses, method_name=None):
         return result
     return set(cats_per_line)
 
+def _expected_dimer_entries(config_dict):
+    """Total attempt slots per Dimer structure (sum of per-type counts).
+    None if not determinable — disables count-aware completion."""
+    rt = config_dict["ourDimer"].get("reaction_types")
+    if not rt:
+        return None
+    types = rt.split() if isinstance(rt, str) else list(rt)
+    raw = config_dict["ourDimer"].get("num_attempts_per_type", 1)
+    if isinstance(raw, list):
+        counts = [int(x) for x in raw]
+    elif isinstance(raw, str):
+        counts = [int(x) for x in raw.split()]
+    else:
+        counts = [int(raw)]
+    return len(types) * counts[0] if len(counts) == 1 else sum(counts)
 
 def get_remaining_trajes(trajes_and_idxs, config_dict):
     categories_to_run = _normalize_run_jobs(config_dict["Main"]["run_jobs"])
     method_name = config_dict["Main"]["method"]
     rows = read_status_csv_rows(method_name)
+    expected = _expected_dimer_entries(config_dict) if method_name == "Dimer" else None
 
-    job_categories = {}
+    job_statuses, job_seen = {}, {}
     for row in rows:
         job_id = int(row[0])
-        status = row[-1].strip()
-        job_categories.setdefault(job_id, []).append(status)
+        if expected is not None:
+            job_seen.setdefault(job_id, set()).add(int(row[2]))  # row[2] = attempt_id
+        job_statuses.setdefault(job_id, []).append(row[-1].strip())
     job_categories = {jid: _categorize_statuses(statuses, method_name)
-                      for jid, statuses in job_categories.items()}
+                      for jid, statuses in job_statuses.items()}
+
+    # A Dimer structure with unrecorded attempt slots still has work left.
+    if expected is not None:
+        for jid, seen in job_seen.items():
+            if len(seen) < expected:
+                job_categories[jid].add("remaining")
 
     remaining = []
     for idx, item in enumerate(trajes_and_idxs):
@@ -577,15 +602,26 @@ def build_redo_info(job_ids, config_dict):
         return redo_info
 
     # Other methods: per-subunit selection
-    redo_info = {}
+    expected = _expected_dimer_entries(config_dict) if method_name == "Dimer" else None
+    redo_info, present = {}, {}
     for row in rows:
         jid = int(row[0])
         if jid not in job_ids_set:
             continue
         status = row[-1].strip()
+        subunit_id = int(row[subunit_col]) if subunit_col is not None else None
+        if expected is not None:
+            present.setdefault(jid, set()).add(subunit_id)
         if _categorize_status(status) in categories_to_run:
-            subunit_id = int(row[subunit_col]) if subunit_col is not None else None
             redo_info.setdefault(jid, set()).add(subunit_id)
+
+    # Never-recorded attempts on a partial Dimer structure are "remaining" work.
+    if expected is not None and "remaining" in categories_to_run:
+        for jid in job_ids_set:
+            seen = present.get(jid, set())
+            if 0 < len(seen) < expected:                 # partial only
+                redo_info.setdefault(jid, set()).update(set(range(expected)) - seen)
+            # seen == 0 → leave absent → entries_to_run=None → run all (unchanged)
 
     return redo_info
 

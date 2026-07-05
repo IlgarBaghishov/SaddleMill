@@ -89,8 +89,8 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
 
     rank = executorlib_worker_id
 
-    run_offset = int(os.environ.get("SM_RUN_OFFSET", "0"))
-    seed = i + run_offset * 1000
+    seed_offset = int(os.environ.get("SM_SEED_OFFSET", config_dict["Main"].get("seed_offset", 0)))
+    seed = i + seed_offset * 100000
 
     random.seed(seed)
     np.random.seed(seed)

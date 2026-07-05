@@ -71,7 +71,7 @@ class KappaMinModeAtoms(MinModeAtoms):
     Extended MinModeAtoms to handle the Phase A/B double rotation and 
     the kappa-weighted translation forces.
     """
-    def __init__(self, atoms, beta=5.0, recover_fmax = 0.3, kappa_control=None, **kwargs):
+    def __init__(self, atoms, beta=2.0, recover_fmax = 0.3, kappa_control=None, **kwargs):
         super().__init__(atoms, **kwargs)
         
         # Tuning parameters for the translation step
@@ -86,8 +86,8 @@ class KappaMinModeAtoms(MinModeAtoms):
             # rotation parameters (see IsolatedDimerControl docstring).
             self.kappa_control = IsolatedDimerControl(
                dimer_separation=self.control.get_parameter('dimer_separation'),
-                f_rot_min=0.01, f_rot_max=0.50,   # don't bail after one rotation
-                max_num_rot=8,
+                f_rot_min=0.01, f_rot_max=2.0,   # don't bail after one rotation
+                max_num_rot=4,
                 logfile=self.control.logfile, eigenmode_logfile=self.control.logfile)  
         self.kappa_mode = None    
  
