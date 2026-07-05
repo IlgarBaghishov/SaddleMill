@@ -244,6 +244,28 @@ def _maybe_concentrate(disp_dict, eligible_indices, natoms, config_dict):
     vec = _power_law_vector(natoms, eligible_indices, power, std)
     return {"displacement_vector": vec, "method": "vector"}, True
 
+def _gauss_or_concentrate(atoms_new, center_idx, config_dict):
+    """Return (disp_dict, suffix). Gaussian centered on center_idx; with prob
+    concentrate_prob, a power-law vector over atoms within displacement_radius.
+    suffix: '' for plain Gaussian, '_conc' when concentrated."""
+    q, power, std = _concentrate_params(config_dict)
+    if q > 0.0 and random.random() < q:
+        radius = _displacement_radius(config_dict)
+        eligible = _atoms_within_radius(atoms_new, int(center_idx), radius)
+        vec = _power_law_vector(len(atoms_new), eligible, power, std)
+        return {"displacement_vector": vec, "method": "vector"}, "_conc"
+    return {"displacement_center": int(center_idx)}, ""
+
+
+def _maybe_gauss_or_concentrate(disp_dict, center_idx, atoms_new, config_dict, p):
+    """Return (disp_dict, suffix). With prob p swap the directed vector for a
+    Gaussian (possibly concentrated). suffix: '' directed, '_gauss' plain swap,
+    '_gauss_conc' concentrated swap."""
+    if random.random() >= p:
+        return disp_dict, ""
+    gdict, gsuffix = _gauss_or_concentrate(atoms_new, center_idx, config_dict)
+    return gdict, "_gauss" + gsuffix
+
 def _resolve_attempts_per_type(num_per_type, reaction_types_list):
     """Map num_attempts_per_type onto a per-type count list.
 
@@ -494,9 +516,10 @@ def get_hop_reuse_attempts(atoms, num_attempts, config_dict=None):
                 center_idx = scored_pairs[ptr % n_valid][1]
             else:
                 center_idx = random.randrange(len(atoms))
-            atoms_new.info['reaction_type'] = 'hop_reuse_gauss'
+            disp, suffix = _gauss_or_concentrate(atoms_new, center_idx, config_dict)
+            atoms_new.info['reaction_type'] = 'hop_reuse_gauss' + suffix   # -> _gauss or _gauss_conc
             images.append(atoms_new)
-            displacement_dicts.append({"displacement_center": int(center_idx)})
+            displacement_dicts.append(disp)
             selected_indices.append(int(center_idx))
         else:
             _, atom_idx, delta = scored_pairs[ptr]
@@ -622,9 +645,10 @@ def get_kickout_reuse_attempts(atoms, num_attempts, config_dict=None):
                 center_idx = scored_triplets[ptr % n_valid][3]  # kicker
             else:
                 center_idx = random.randrange(len(atoms))
-            atoms_new.info['reaction_type'] = 'kickout_reuse_gauss'
+            disp, suffix = _gauss_or_concentrate(atoms_new, center_idx, config_dict)
+            atoms_new.info['reaction_type'] = 'kickout_reuse_gauss' + suffix   # -> _gauss or _gauss_conc
             images.append(atoms_new)
-            displacement_dicts.append({"displacement_center": int(center_idx)})
+            displacement_dicts.append(disp)
             selected_indices.append(int(center_idx))
         else:
             _, site_b, kicked_idx, kicker_idx = scored_triplets[ptr]
@@ -697,6 +721,7 @@ def get_kickout_insert_attempts(atoms, num_attempts, config_dict=None):
     return images, displacement_dicts, selected_indices
 
 
+
 # --- Ring attempts (coordinated position swaps; ring_size=2 covers pairwise exchange) ---
 
 def _find_ring(neighbors_dict, seed, ring_size, max_retries=50):
@@ -745,7 +770,7 @@ def _build_neighbor_dict(atoms, cutoff=3.5):
     return neighbors_dict
 
 
-def _make_ring_attempt(atoms, neighbors_dict, cell, ring_size, reaction_type, p=0.1):
+def _make_ring_attempt(atoms, neighbors_dict, cell, ring_size, reaction_type, config_dict, p=0.1):
     """Create a single ring swap attempt. Returns (image, disp_dict, index) or None."""
     seed = random.randrange(len(atoms))
     ring = _find_ring(neighbors_dict, seed, ring_size)
@@ -780,7 +805,9 @@ def _make_ring_attempt(atoms, neighbors_dict, cell, ring_size, reaction_type, p=
 
     atoms_new.info['reaction_type'] = reaction_type
     disp_dict = {"displacement_vector": disp_vector, "method": "vector"}
-    return (atoms_new, _maybe_gaussian(disp_dict, int(ring[0]), p=p), int(ring[0]))
+    disp, suffix = _maybe_gauss_or_concentrate(disp_dict, int(ring[0]), atoms_new, config_dict, p)
+    atoms_new.info['reaction_type'] = reaction_type + suffix
+    return (atoms_new, disp, int(ring[0]))
 
 
 def get_ring_attempts(atoms, config_dict, num_attempts):
@@ -807,7 +834,7 @@ def get_ring_attempts(atoms, config_dict, num_attempts):
     images, displacement_dicts, selected_indices = [], [], []
     for _ in range(num_attempts):
         size = random.choice(ring_sizes)
-        result = _make_ring_attempt(atoms, neighbors_dict, cell, size, 'ring', p=p)
+        result = _make_ring_attempt(atoms, neighbors_dict, cell, size, 'ring', config_dict, p=p)
         if result:
             images.append(result[0])
             displacement_dicts.append(result[1])
