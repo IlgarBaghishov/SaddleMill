@@ -95,6 +95,7 @@ class ConfigManager:
             "kappa_recover_fmax": 0.3,  # only used when engine = kappa
             "vasp_command": None,
             "vasp_ncore": None,
+            "bulk_reuse_offset": 0,
         },
         # SaddleMill-side VASP-input orchestration (the [Vasp] section itself is a
         # pure pass-through to ASE's Vasp calculator and never holds our keys).
