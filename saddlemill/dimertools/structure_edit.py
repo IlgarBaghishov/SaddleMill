@@ -1051,6 +1051,21 @@ def get_all_movable_attempts(atoms, config_dict, num_attempts):
         
     return images, displacement_dicts, selected_indices
 
+def get_all_atoms_attempts(atoms, config_dict, num_attempts):
+    """Full random Gaussian over ALL atoms (bulk; no fixed substrate).
+    concentrate_prob=0 -> plain mask Gaussian; >0 -> power-law over all atoms."""
+    eligible = list(range(len(atoms)))
+    mask = [True] * len(atoms)
+    images, displacement_dicts, selected_indices = [], [], []
+    for _ in range(num_attempts):
+        atoms_new = atoms.copy()
+        disp, conc = _maybe_concentrate({"mask": mask}, eligible, len(atoms_new), config_dict)
+        atoms_new.info['reaction_type'] = 'all_atoms_conc' if conc else 'all_atoms'
+        images.append(atoms_new)
+        displacement_dicts.append(disp)
+        selected_indices.append(-1)
+    return images, displacement_dicts, selected_indices
+
 def get_rotation_attempts(atoms, config_dict, num_attempts):
     """Rigid-body rotation of adsorbate around its center of mass."""
     adsorbate_indices = _get_oc_adsorbate_indices(atoms)
@@ -1133,6 +1148,7 @@ _BULK_REACTION_TYPE_DISPATCH = {
     "kickout_insert": lambda atoms, config_dict, n: get_kickout_insert_attempts(atoms, n, config_dict),
     "ring": lambda atoms, config_dict, n: get_ring_attempts(atoms, config_dict, n),
     "initial_guess": lambda atoms, config_dict, n: get_initial_guess_attempts(atoms),
+    "all_atoms": lambda atoms, config_dict, n: get_all_atoms_attempts(atoms, config_dict, n),
 }
 
 _OC_REACTION_TYPE_DISPATCH = {
