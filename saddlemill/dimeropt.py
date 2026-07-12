@@ -22,6 +22,7 @@ class StopRun(Exception):
 
 def _setup_dimer(atoms, calc, eigenmode=None, displacement_dict=None,
                  dimer_control_kwargs=None, control_logfile=None,
+                 mode_logfile=None,
                  logfile=None, trajectory=None,
                  engine="ase", kappa_kwargs=None, kappa_control_kwargs=None):
     """Create MinModeAtoms and MinModeTranslate optimizer for dimer method.
@@ -44,7 +45,7 @@ def _setup_dimer(atoms, calc, eigenmode=None, displacement_dict=None,
     if engine == "kappa":
         from saddlemill.dimertools.kappa_dimer import KappaMinModeAtoms, IsolatedDimerControl
 
-        d_control = IsolatedDimerControl(logfile=control_logfile, **(dimer_control_kwargs or {}))
+        d_control = IsolatedDimerControl(logfile=control_logfile, eigenmode_logfile=mode_logfile, **(dimer_control_kwargs or {}))
         kw = dict(kappa_kwargs or {})
         if kappa_control_kwargs:
             kw["kappa_control"] = IsolatedDimerControl(logfile=control_logfile, **kappa_control_kwargs)
@@ -89,8 +90,8 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
 
     rank = executorlib_worker_id
 
-    run_offset = int(os.environ.get("SM_RUN_OFFSET", "0"))
-    seed = i + run_offset * 1000
+    seed_offset = int(os.environ.get("SM_SEED_OFFSET", config_dict["Main"].get("seed_offset", 0)))
+    seed = i + seed_offset * 100000
 
     random.seed(seed)
     np.random.seed(seed)
@@ -150,7 +151,8 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
             temp_log = f'dimer_control_{i}_{attempt}_{slctd_indx}.log'
             temp_opt_log = f'dimer_opt_{i}_{attempt}_{slctd_indx}.log'
             temp_traj = f'dimer_{i}_{attempt}_{slctd_indx}.traj'
-            temp_files = [temp_log, temp_opt_log, temp_traj]
+            temp_mode_log = f'dimer_mode_{i}_{attempt}_{slctd_indx}.log'
+            temp_files = [temp_log, temp_opt_log, temp_traj, temp_mode_log]
             attempt_vasp_dir = f"VASP_{i}_{attempt}" if is_vasp else None
             if attempt_vasp_dir is not None:
                 temp_files.append(attempt_vasp_dir)
@@ -178,6 +180,7 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                     displacement_dict=displacement_dict,
                     dimer_control_kwargs=config_dict["DimerControl"],
                     control_logfile=temp_log,
+                    mode_logfile=temp_mode_log,                                       
                     logfile=temp_opt_log, trajectory=temp_traj,
                     engine=config_dict["ourDimer"]["engine"],
                     kappa_kwargs={

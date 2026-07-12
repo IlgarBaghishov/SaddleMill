@@ -15,10 +15,14 @@ from saddlemill.config import (load_config, load_method, get_trajes_and_indices,
 
 def check_and_print_status(futures, total):
     done, futures = concurrent.futures.wait(futures, timeout=0.1)
-    if len(done)!=0:
-        print(f"{len(futures)} REMAINING  ---  {total-len(futures)} FINISHED  ---  {total} TOTAL")
+    for f in done:
+        try:
+            f.result()
+        except Exception as e:
+            print(f"[worker task died] {e}", flush=True)
+    if done:
+        print(f"{len(futures)} REMAINING --- {total-len(futures)} FINISHED --- {total} TOTAL")
     return futures
-
 
 def main():
 
@@ -30,6 +34,11 @@ def main():
     can_resume = os.path.exists('traj_files_ordered.json')
     previous_results = {}
     redo_info = {}
+
+    from saddlemill.config import _expected_dimer_entries
+    chunk_size = config_dict["Main"]["attempt_chunk_size"]
+    n_expected = _expected_dimer_entries(config_dict)   # None unless Dimer with reaction_types set
+
     if can_resume:
         trajes_and_idxs_old = read_ordered_traj_names()
         if trajes_and_idxs != trajes_and_idxs_old:
@@ -142,12 +151,26 @@ def main():
                         idx += 1
                         continue
                     try:
-                        f = submitter(method, job_id, config_dict, images,
-                                      continuation_data=previous_results.get(job_id),
-                                      entries_to_run=redo_info.get(job_id),
-                                      **extra)
-                        if config_dict["Main"]["executorlib"]: futures.append(f)
-                        submitted += 1
+                        entries = redo_info.get(job_id)
+                        if chunk_size <= 0:
+                            chunks = [entries]                       # off → unchanged
+                        elif entries is None:
+                            # fresh structure: chunk the full expected attempt range
+                            if n_expected is None:
+                                chunks = [None]                      # can't determine count → run all
+                            else:
+                                rng = list(range(n_expected))
+                                chunks = [set(rng[k:k+chunk_size]) for k in range(0, n_expected, chunk_size)]
+                        else:
+                            entries = sorted(entries)
+                            chunks = [set(entries[k:k+chunk_size]) for k in range(0, len(entries), chunk_size)] or [set()]
+                        for ch in chunks:
+                            f = submitter(method, job_id, config_dict, images,
+                                          continuation_data=previous_results.get(job_id),
+                                          entries_to_run=ch,
+                                          **extra)
+                            if config_dict["Main"]["executorlib"]: futures.append(f)
+                            submitted += 1
                     except Exception as e:
                         print(f"CRITICAL ERROR on job {idx} ({src_path}): {e}")
                         # In serial mode, we catch it and move on.
