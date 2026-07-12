@@ -15,10 +15,14 @@ from saddlemill.config import (load_config, load_method, get_trajes_and_indices,
 
 def check_and_print_status(futures, total):
     done, futures = concurrent.futures.wait(futures, timeout=0.1)
-    if len(done)!=0:
-        print(f"{len(futures)} REMAINING  ---  {total-len(futures)} FINISHED  ---  {total} TOTAL")
+    for f in done:
+        try:
+            f.result()
+        except Exception as e:
+            print(f"[worker task died] {e}", flush=True)
+    if done:
+        print(f"{len(futures)} REMAINING --- {total-len(futures)} FINISHED --- {total} TOTAL")
     return futures
-
 
 def main():
 

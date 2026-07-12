@@ -187,15 +187,18 @@ class KappaMinModeAtoms(MinModeAtoms):
         return f_translated
 
     def eigenmode_log(self):
-        if self.mlogfile is not None:
-            fmax_atom = np.sqrt((self.forces0 ** 2).sum(axis=1).max())
-            normal = fmax_atom < self.recover_fmax
-            if normal:
-                g1 = g2 = 1.0
-            else:
-                bk = np.clip(self.beta * self.kappa, -500.0, 500.0)
-                et = np.exp(bk); g1 = (2.0/(1.0+et)) - 1.0; g2 = 1.0 - (1.0/(1.0+et))
-            self.mlogfile.write(
-                'MINMODE:KAPPA: step %i kappa %15.8f fmax %10.6f g1 %8.5f g2 %8.5f normal %d\n'
-                % (self.control.get_counter('optcount'), self.kappa, fmax_atom, g1, g2, int(normal)))
-            self.mlogfile.flush()
+        if self.mlogfile is None or not hasattr(self, 'forces0'):
+            return
+        fmax_atom = np.sqrt((self.forces0 ** 2).sum(axis=1).max())
+        normal = fmax_atom < self.recover_fmax
+        if normal:
+            g1 = g2 = 1.0
+        else:
+            bk = np.clip(self.beta * self.kappa, -500.0, 500.0)
+            et = np.exp(bk); g1 = (2.0/(1.0+et)) - 1.0; g2 = 1.0 - (1.0/(1.0+et))
+        self.mlogfile.write(
+            'MINMODE:KAPPA: step %i kappa %15.8f fmax %10.6f g1 %8.5f g2 %8.5f normal %d\n'
+            % (self.control.get_counter('optcount'), self.kappa, fmax_atom, g1, g2, int(normal)))
+        self.mlogfile.flush()
+
+
