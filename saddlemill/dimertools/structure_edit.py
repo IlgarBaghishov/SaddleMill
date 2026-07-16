@@ -7,6 +7,32 @@ from ase.neighborlist import NeighborList, natural_cutoffs, neighbor_list, mic
 from ase.build import make_supercell
 from ase.data import covalent_radii, atomic_numbers
 
+REUSE_MAX_DIST = 5.0  # Å — max hop/collision distance for *_reuse; tighten to taste
+
+
+def _is_gauss_slot(g, p_percent):
+    """Deterministic, evenly-spread ~p fraction of global attempt indices."""
+    if p_percent <= 0:
+        return False
+    if p_percent >= 100:
+        return True
+    return (g * p_percent) % 100 < p_percent
+
+
+def _gauss_count_before(g, p_percent):
+    """How many global indices in [0, g) are gaussian slots.
+
+    Lets the directed pointer skip gaussian slots so they never consume a
+    ranked pair. Pattern has period 100 in g, so count whole blocks + remainder.
+    """
+    if p_percent <= 0:
+        return 0
+    if p_percent >= 100:
+        return g
+    per_block = sum(1 for k in range(100) if (k * p_percent) % 100 < p_percent)
+    full_blocks, rem = divmod(g, 100)
+    partial = sum(1 for k in range(rem) if (k * p_percent) % 100 < p_percent)
+    return full_blocks * per_block + partial
 
 def turn_into_supercell(atoms, min_length=7.0):
     """Ensure sufficient atoms AND cell dimensions to avoid self-interaction."""
@@ -161,6 +187,84 @@ def _swap_prob(config_dict):
         return 0.1
     return config_dict["ourDimer"].get("gaussian_swap_prob", 0.1)
 
+def _concentrate_params(config_dict):
+    """(prob, power, std) for power-law-concentrated Gaussian swaps.
+    concentrate_prob=0 (default) disables the feature — no behavior change."""
+    d = config_dict["ourDimer"]
+    return (float(d.get("concentrate_prob", 0.0)),
+            float(d.get("concentrate_power", 1.5)),
+            float(d.get("concentrate_std", 0.2)))
+
+
+def _displacement_radius(config_dict, default=3.0):
+    if config_dict is None:
+        return default
+    dc = config_dict.get("DimerControl", {}) or {}
+    try:
+        return float(dc.get("displacement_radius", default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _movable_oc(atoms):
+    """OC movable atoms (tag != 0); substrate (tag 0) is fixed and excluded."""
+    return set(int(i) for i in np.where(atoms.get_tags() != 0)[0])
+
+
+def _atoms_within_radius(atoms, center_idx, radius):
+    cell = atoms.get_cell()
+    deltas = mic(atoms.get_positions() - atoms.positions[center_idx], cell)
+    return np.where(np.linalg.norm(deltas, axis=1) <= radius)[0]
+
+
+def _power_law_vector(natoms, eligible_indices, power, std):
+    """Concentrated random displacement: iid Gaussian on the eligible atoms,
+    each atom's magnitude raised to `power` (ratios sharpen), then renormalized
+    so the total norm equals std*sqrt(3*n_eligible) — the same total an iid
+    Gaussian of this std would inject, just redistributed. power=1 == plain."""
+    d = np.zeros((natoms, 3))
+    idx = np.asarray(sorted(set(int(i) for i in eligible_indices)), dtype=int)
+    if len(idx) == 0:
+        return d
+    d[idx] = np.random.standard_normal((len(idx), 3))
+    mag = np.linalg.norm(d[idx], axis=1, keepdims=True)
+    d[idx] = np.where(mag > 1e-12, d[idx] * mag ** (power - 1), 0.0)
+    total = np.linalg.norm(d)
+    if total > 1e-12:
+        d *= (std * np.sqrt(3 * len(idx))) / total
+    return d
+
+
+def _maybe_concentrate(disp_dict, eligible_indices, natoms, config_dict):
+    """With probability concentrate_prob, replace an ASE Gaussian dict with an
+    explicit power-law-concentrated vector. Returns (dict, was_concentrated)."""
+    q, power, std = _concentrate_params(config_dict)
+    if q <= 0.0 or random.random() >= q:
+        return disp_dict, False
+    vec = _power_law_vector(natoms, eligible_indices, power, std)
+    return {"displacement_vector": vec, "method": "vector"}, True
+
+def _gauss_or_concentrate(atoms_new, center_idx, config_dict):
+    """Return (disp_dict, suffix). Gaussian centered on center_idx; with prob
+    concentrate_prob, a power-law vector over atoms within displacement_radius.
+    suffix: '' for plain Gaussian, '_conc' when concentrated."""
+    q, power, std = _concentrate_params(config_dict)
+    if q > 0.0 and random.random() < q:
+        radius = _displacement_radius(config_dict)
+        eligible = _atoms_within_radius(atoms_new, int(center_idx), radius)
+        vec = _power_law_vector(len(atoms_new), eligible, power, std)
+        return {"displacement_vector": vec, "method": "vector"}, "_conc"
+    return {"displacement_center": int(center_idx)}, ""
+
+
+def _maybe_gauss_or_concentrate(disp_dict, center_idx, atoms_new, config_dict, p):
+    """Return (disp_dict, suffix). With prob p swap the directed vector for a
+    Gaussian (possibly concentrated). suffix: '' directed, '_gauss' plain swap,
+    '_gauss_conc' concentrated swap."""
+    if random.random() >= p:
+        return disp_dict, ""
+    gdict, gsuffix = _gauss_or_concentrate(atoms_new, center_idx, config_dict)
+    return gdict, "_gauss" + gsuffix
 
 def _resolve_attempts_per_type(num_per_type, reaction_types_list):
     """Map num_attempts_per_type onto a per-type count list.
@@ -355,52 +459,83 @@ def get_vacancy_attempts(atoms, config_dict, num_attempts):
 
 
 # --- Hop attempts (interstitial mechanism) ---
-
 def get_hop_reuse_attempts(atoms, num_attempts, config_dict=None):
-    """Displace an existing lattice atom halfway toward its nearest interstitial site.
-
-    No atoms are added or removed. The directed displacement gives the dimer a
-    physically motivated starting point for the interstitial hop transition state.
-    With 10% probability, Gaussian noise is used instead to allow discovery of
-    unexpected paths.
+    """Displace an existing lattice atom halfway toward an interstitial site.
+ 
+    (atom, site) pairs are ranked by dist*radius (short hops of small atoms
+    first) and consumed deterministically in order. Pairs farther apart than
+    REUSE_MAX_DIST are discarded. A deterministic ~p fraction of attempts are
+    swapped for a Gaussian displacement; those swaps do NOT advance the ranked
+    pointer, so they never steal a directed guess. If the ranked list is
+    exhausted, remaining attempts fall back to Gaussian.
     """
     sites = find_interstitial_sites(atoms)
-
     if len(sites) == 0:
         warnings.warn("Found no interstitial sites; skipping hop_reuse.")
         return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
-
+ 
     cell = atoms.get_cell()
     p = _swap_prob(config_dict)
+    p_percent = int(round(p * 100))
     positions = atoms.get_positions()
-    weights = _get_atom_selection_weights(atoms)
-    site_idx_list = _shuffled_site_indices(len(sites), num_attempts)
+    numbers = atoms.get_atomic_numbers()
 
-    images = []
-    displacement_dicts = []
-    selected_indices = []
+    offset = 0
+    if config_dict is not None:
+        try:
+            offset = int(config_dict["ourDimer"].get("bulk_reuse_offset", 0))
+        except (KeyError, TypeError):
+            pass
 
-    for attempt in range(num_attempts):
-        atom_idx = np.random.choice(len(atoms), p=weights)
-        atom_pos = positions[atom_idx]
 
-        # Use pre-shuffled site for diversity across attempts
-        site_a = sites[site_idx_list[attempt]]
-        delta = mic(site_a - atom_pos, cell)
-
+    # 1. Score every in-range (atom, site) pair; rank best (lowest) first.
+    # ONE vectorized mic() call for all pairs. Per-pair mic() calls re-run the
+    # full general_find_mic path (Minkowski reduction + image enumeration) on
+    # EVERY call for triclinic cells — that was the bulk Phase-2 stall.
+    n_at, n_st = len(positions), len(sites)
+    deltas = mic((sites[None, :, :] - positions[:, None, :]).reshape(-1, 3),
+                 cell).reshape(n_at, n_st, 3)
+    dists = np.linalg.norm(deltas, axis=-1)                    # (n_at, n_st)
+    scores = dists * covalent_radii[numbers][:, None]
+    a_ix, s_ix = np.nonzero(dists <= REUSE_MAX_DIST)           # atom-major order
+    order = np.argsort(scores[a_ix, s_ix], kind="stable")      # stable, like list.sort
+    scored_pairs = [(float(scores[a_ix[k], s_ix[k]]), int(a_ix[k]),
+                     deltas[a_ix[k], s_ix[k]]) for k in order]
+    n_valid = len(scored_pairs)
+    if n_valid == 0:
+        warnings.warn("hop_reuse: no (atom, site) pairs within REUSE_MAX_DIST; "
+                      "using Gaussian fallback.")
+ 
+    images, displacement_dicts, selected_indices = [], [], []
+ 
+    for i in range(num_attempts):
+        g = offset + i
+        ptr = g - _gauss_count_before(g, p_percent)
+        use_gauss = (ptr >= n_valid) or _is_gauss_slot(g, p_percent)
+ 
         atoms_new = atoms.copy()
-        atoms_new.info['reaction_type'] = 'hop_reuse'
-
-        disp_vector = np.zeros((len(atoms_new), 3))
-        disp_vector[atom_idx] = 0.5 * delta
-
-        images.append(atoms_new)
-        displacement_dicts.append(_maybe_gaussian(
-            {"displacement_vector": disp_vector, "method": "vector"}, atom_idx, p=p))
-        selected_indices.append(int(atom_idx))
-
+ 
+        if use_gauss:
+            # Center on the next directed atom if one exists, else a random atom.
+            if n_valid > 0:
+                center_idx = scored_pairs[ptr % n_valid][1]
+            else:
+                center_idx = random.randrange(len(atoms))
+            disp, suffix = _gauss_or_concentrate(atoms_new, center_idx, config_dict)
+            atoms_new.info['reaction_type'] = 'hop_reuse_gauss' + suffix   # -> _gauss or _gauss_conc
+            images.append(atoms_new)
+            displacement_dicts.append(disp)
+            selected_indices.append(int(center_idx))
+        else:
+            _, atom_idx, delta = scored_pairs[ptr]
+            atoms_new.info['reaction_type'] = 'hop_reuse'
+            disp_vector = np.zeros((len(atoms_new), 3))
+            disp_vector[atom_idx] = 0.5 * delta
+            images.append(atoms_new)
+            displacement_dicts.append({"displacement_vector": disp_vector, "method": "vector"})
+            selected_indices.append(int(atom_idx))
+ 
     return images, displacement_dicts, selected_indices
-
 
 def get_hop_insert_attempts(atoms, num_attempts, config_dict=None):
     """Insert a new small atom at an interstitial site, displace halfway to nearest neighbor site.
@@ -447,68 +582,96 @@ def get_hop_insert_attempts(atoms, num_attempts, config_dict=None):
 
 
 # --- Kickout attempts (interstitialcy / kick-out mechanism) ---
-
 def get_kickout_reuse_attempts(atoms, num_attempts, config_dict=None):
-    """Interstitialcy kick-out using only existing atoms (no atoms added or removed).
-
-    For each attempt:
-    1. Pick an interstitial site A.
-    2. The atom nearest to site A is the 'kicked' atom — it will be displaced toward
-       site B (nearest other interstitial site), as if pushed out of the way.
-    3. A separate 'kicker' atom (randomly selected, weighted by inverse covalent radius,
-       excluding the kicked atom) is displaced toward site A.
-
-    The original lattice structure is preserved in frame 0; only the displacement
-    vectors encode the mechanism. With 10% probability, Gaussian noise is used instead.
+    """Interstitialcy knock-on (kick-out) using only existing atoms.
+ 
+    Triplets (void=site_b, kicked, kicker) are ranked and consumed
+    deterministically. A triplet is dropped if the kicked atom is farther than
+    REUSE_MAX_DIST from the void, or the kicker is farther than REUSE_MAX_DIST
+    from the kicked atom. Gaussian swaps do NOT advance the ranked pointer;
+    exhaustion falls back to Gaussian.
     """
     sites = find_interstitial_sites(atoms)
-
     if len(sites) < 2:
         warnings.warn("Found fewer than 2 interstitial sites; skipping kickout_reuse.")
         return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
-
+ 
     cell = atoms.get_cell()
     p = _swap_prob(config_dict)
+    p_percent = int(round(p * 100))
     positions = atoms.get_positions()
-    weights = _get_atom_selection_weights(atoms)
-    site_idx_list = _shuffled_site_indices(len(sites), num_attempts)
+    numbers = atoms.get_atomic_numbers()
 
-    images = []
-    displacement_dicts = []
-    selected_indices = []
+    offset = 0
+    if config_dict is not None:
+        try:
+            offset = int(config_dict["ourDimer"].get("bulk_reuse_offset", 0))
+        except (KeyError, TypeError):
+            pass
 
-    for attempt in range(num_attempts):
-        site_a_idx = site_idx_list[attempt]
-        site_a = sites[site_a_idx]
-
-        # Sort all atoms by distance to site A.
-        # Nearest  → kicked (gets displaced when the kicker arrives at site A).
-        # 2nd nearest → kicker (hops into site A, physically close so displacement is sensible).
-        dists_to_a = np.linalg.norm(mic(positions - site_a, cell), axis=1)
-        sorted_by_dist = np.argsort(dists_to_a)
-        kicked_idx = int(sorted_by_dist[0])
-        kicker_idx = int(sorted_by_dist[1])
-        kicked_pos = positions[kicked_idx]
-        kicker_pos = positions[kicker_idx]
-
-        # Site B: nearest interstitial to kicked atom (exclude site A)
-        other_sites = np.delete(sites, site_a_idx, axis=0)
-        site_b, _ = _nearest_site(kicked_pos, other_sites, cell)
-
+    # 1. Score in-range triplets (true kick-out); rank best (lowest) first.
+    # TWO vectorized mic() calls replace the ~2*N_sites per-site calls.
+    n_at, n_st = len(positions), len(sites)
+    d_sa = np.linalg.norm(
+        mic((positions[None, :, :] - sites[:, None, :]).reshape(-1, 3),
+            cell).reshape(n_st, n_at, 3), axis=-1)             # (n_st, n_at)
+    d_aa = np.linalg.norm(
+        mic((positions[None, :, :] - positions[:, None, :]).reshape(-1, 3),
+            cell).reshape(n_at, n_at, 3), axis=-1)             # (n_at, n_at)
+    radii = covalent_radii[numbers]
+ 
+    scored_triplets = []
+    for si in range(n_st):
+        kicked_idx = int(np.argmin(d_sa[si]))
+        dist_void = d_sa[si, kicked_idx]
+        if dist_void > REUSE_MAX_DIST:
+            continue
+ 
+        for kicker_idx in np.argsort(d_aa[kicked_idx])[1:6]:   # skip self at index 0
+            kicker_idx = int(kicker_idx)
+            dist_collision = d_aa[kicked_idx, kicker_idx]
+            if dist_collision > REUSE_MAX_DIST:
+                continue
+            score = (dist_void * radii[kicked_idx]) + (dist_collision * radii[kicker_idx])
+            scored_triplets.append((score, sites[si], kicked_idx, kicker_idx))
+    scored_triplets.sort(key=lambda x: x[0])
+    n_valid = len(scored_triplets)
+    if n_valid == 0:
+        warnings.warn("kickout_reuse: no triplets within REUSE_MAX_DIST; "
+                      "using Gaussian fallback.")
+ 
+    images, displacement_dicts, selected_indices = [], [], []
+ 
+    for i in range(num_attempts):
+        g = offset + i
+        ptr = g - _gauss_count_before(g, p_percent)
+        use_gauss = (ptr >= n_valid) or _is_gauss_slot(g, p_percent)
+ 
         atoms_new = atoms.copy()
-        atoms_new.info['reaction_type'] = 'kickout_reuse'
-
-        disp_vector = np.zeros((len(atoms_new), 3))
-        disp_vector[kicker_idx] = 0.5 * mic(site_a - kicker_pos, cell)
-        disp_vector[kicked_idx] = 0.5 * mic(site_b - kicked_pos, cell)
-
-        images.append(atoms_new)
-        displacement_dicts.append(_maybe_gaussian(
-            {"displacement_vector": disp_vector, "method": "vector"}, kicker_idx, p=p))
-        selected_indices.append(int(kicker_idx))
-
+ 
+        if use_gauss:
+            if n_valid > 0:
+                center_idx = scored_triplets[ptr % n_valid][3]  # kicker
+            else:
+                center_idx = random.randrange(len(atoms))
+            disp, suffix = _gauss_or_concentrate(atoms_new, center_idx, config_dict)
+            atoms_new.info['reaction_type'] = 'kickout_reuse_gauss' + suffix   # -> _gauss or _gauss_conc
+            images.append(atoms_new)
+            displacement_dicts.append(disp)
+            selected_indices.append(int(center_idx))
+        else:
+            _, site_b, kicked_idx, kicker_idx = scored_triplets[ptr]
+            kicked_pos = positions[kicked_idx]
+            kicker_pos = positions[kicker_idx]
+            atoms_new.info['reaction_type'] = 'kickout_reuse'
+            disp_vector = np.zeros((len(atoms_new), 3))
+            disp_vector[kicker_idx] = 0.5 * mic(kicked_pos - kicker_pos, cell)
+            disp_vector[kicked_idx] = 0.5 * mic(site_b - kicked_pos, cell)
+            images.append(atoms_new)
+            displacement_dicts.append({"displacement_vector": disp_vector, "method": "vector"})
+            selected_indices.append(int(kicker_idx))
+ 
     return images, displacement_dicts, selected_indices
-
 
 def get_kickout_insert_attempts(atoms, num_attempts, config_dict=None):
     """Insert a new similar-sized atom at interstitial site; it kicks nearest lattice atom out.
@@ -566,6 +729,7 @@ def get_kickout_insert_attempts(atoms, num_attempts, config_dict=None):
     return images, displacement_dicts, selected_indices
 
 
+
 # --- Ring attempts (coordinated position swaps; ring_size=2 covers pairwise exchange) ---
 
 def _find_ring(neighbors_dict, seed, ring_size, max_retries=50):
@@ -614,7 +778,7 @@ def _build_neighbor_dict(atoms, cutoff=3.5):
     return neighbors_dict
 
 
-def _make_ring_attempt(atoms, neighbors_dict, cell, ring_size, reaction_type, p=0.1):
+def _make_ring_attempt(atoms, neighbors_dict, cell, ring_size, reaction_type, config_dict, p=0.1):
     """Create a single ring swap attempt. Returns (image, disp_dict, index) or None."""
     seed = random.randrange(len(atoms))
     ring = _find_ring(neighbors_dict, seed, ring_size)
@@ -649,7 +813,9 @@ def _make_ring_attempt(atoms, neighbors_dict, cell, ring_size, reaction_type, p=
 
     atoms_new.info['reaction_type'] = reaction_type
     disp_dict = {"displacement_vector": disp_vector, "method": "vector"}
-    return (atoms_new, _maybe_gaussian(disp_dict, int(ring[0]), p=p), int(ring[0]))
+    disp, suffix = _maybe_gauss_or_concentrate(disp_dict, int(ring[0]), atoms_new, config_dict, p)
+    atoms_new.info['reaction_type'] = reaction_type + suffix
+    return (atoms_new, disp, int(ring[0]))
 
 
 def get_ring_attempts(atoms, config_dict, num_attempts):
@@ -676,7 +842,7 @@ def get_ring_attempts(atoms, config_dict, num_attempts):
     images, displacement_dicts, selected_indices = [], [], []
     for _ in range(num_attempts):
         size = random.choice(ring_sizes)
-        result = _make_ring_attempt(atoms, neighbors_dict, cell, size, 'ring', p=p)
+        result = _make_ring_attempt(atoms, neighbors_dict, cell, size, 'ring', config_dict, p=p)
         if result:
             images.append(result[0])
             displacement_dicts.append(result[1])
@@ -725,6 +891,109 @@ def _sample_adsorbate_atoms(adsorbate_indices, num_needed):
 
 # --- OC reaction types ---
 
+def get_adsorbate_attempts(atoms, config_dict, num_attempts):
+    """Noise on all adsorbate atoms; concentrate_prob swaps in a power-law kick."""
+    adsorbate_indices = _get_oc_adsorbate_indices(atoms)
+    if len(adsorbate_indices) == 0:
+        warnings.warn("No adsorbate atoms (tag=2) found; skipping 'adsorbate'.")
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
+
+    mask = np.zeros(len(atoms), dtype=bool)
+    mask[adsorbate_indices] = True
+    mask = mask.tolist()
+    eligible = [int(i) for i in adsorbate_indices]
+
+    images, displacement_dicts, selected_indices = [], [], []
+    for _ in range(num_attempts):
+        atoms_new = atoms.copy()
+        disp, conc = _maybe_concentrate({"mask": mask}, eligible, len(atoms_new), config_dict)
+        atoms_new.info['reaction_type'] = 'adsorbate_conc' if conc else 'adsorbate'
+        images.append(atoms_new)
+        displacement_dicts.append(disp)
+        selected_indices.append(-1)
+    return images, displacement_dicts, selected_indices
+
+
+def get_adsorbate_surface_attempts(atoms, config_dict, num_attempts):
+    """Noise on adsorbate + neighboring substrate; concentrate over movable atoms."""
+    adsorbate_indices = _get_oc_adsorbate_indices(atoms)
+    if len(adsorbate_indices) == 0:
+        warnings.warn("No adsorbate atoms (tag=2) found; skipping 'adsorbate_surface'.")
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
+
+    mask = _get_oc_neighbor_mask(atoms, adsorbate_indices)
+    movable = _movable_oc(atoms)
+    eligible = [i for i, m in enumerate(mask) if m and i in movable]
+
+    images, displacement_dicts, selected_indices = [], [], []
+    for _ in range(num_attempts):
+        atoms_new = atoms.copy()
+        disp, conc = _maybe_concentrate({"mask": mask}, eligible, len(atoms_new), config_dict)
+        atoms_new.info['reaction_type'] = 'adsorbate_surface_conc' if conc else 'adsorbate_surface'
+        images.append(atoms_new)
+        displacement_dicts.append(disp)
+        selected_indices.append(-1)
+    return images, displacement_dicts, selected_indices
+
+
+def get_adsorbate_atom_neighbors_attempts(atoms, config_dict, num_attempts):
+    """Broad Gaussian on one adsorbate atom, neighbors dragged."""
+    adsorbate_indices = _get_oc_adsorbate_indices(atoms)
+    if len(adsorbate_indices) == 0:
+        warnings.warn("No adsorbate atoms (tag=2) found; skipping 'adsorbate_atom_neighbors'.")
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
+
+    q = _concentrate_params(config_dict)[0]
+    radius = _displacement_radius(config_dict)
+    movable = _movable_oc(atoms)
+
+    chosen = _sample_adsorbate_atoms(adsorbate_indices, num_attempts)
+    images, displacement_dicts, selected_indices = [], [], []
+    for idx in chosen:
+        atoms_new = atoms.copy()
+        disp = {"displacement_center": int(idx)}
+        if q > 0.0:
+            near = _atoms_within_radius(atoms_new, int(idx), radius)
+            eligible = [int(i) for i in near if int(i) in movable]
+        else:
+            eligible = [int(idx)]
+        disp, conc = _maybe_concentrate(disp, eligible, len(atoms_new), config_dict)
+        atoms_new.info['reaction_type'] = 'adsorbate_atom_neighbors_conc' if conc else 'adsorbate_atom_neighbors'
+        images.append(atoms_new)
+        displacement_dicts.append(disp)
+        selected_indices.append(int(idx))
+    return images, displacement_dicts, selected_indices
+
+
+def get_surface_attempts(atoms, config_dict, num_attempts):
+    """Broad Gaussian on one surface atom (tag=1), neighbors dragged."""
+    tags = atoms.get_tags()
+    surface_indices = np.where(tags == 1)[0]
+    if len(surface_indices) == 0:
+        warnings.warn("No surface atoms (tag=1) found; skipping 'surface'.")
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
+
+    q = _concentrate_params(config_dict)[0]
+    radius = _displacement_radius(config_dict)
+    movable = _movable_oc(atoms)
+
+    chosen = _sample_adsorbate_atoms(surface_indices, num_attempts)
+    images, displacement_dicts, selected_indices = [], [], []
+    for idx in chosen:
+        atoms_new = atoms.copy()
+        disp = {"displacement_center": int(idx)}
+        if q > 0.0:
+            near = _atoms_within_radius(atoms_new, int(idx), radius)
+            eligible = [int(i) for i in near if int(i) in movable]
+        else:
+            eligible = [int(idx)]
+        disp, conc = _maybe_concentrate(disp, eligible, len(atoms_new), config_dict)
+        atoms_new.info['reaction_type'] = 'surface_conc' if conc else 'surface'
+        images.append(atoms_new)
+        displacement_dicts.append(disp)
+        selected_indices.append(int(idx))
+    return images, displacement_dicts, selected_indices
+    
 def get_adsorbate_atom_attempts(atoms, config_dict, num_attempts):
     """Tight Gaussian on one adsorbate atom (gauss_std=0.2, single atom)."""
     adsorbate_indices = _get_oc_adsorbate_indices(atoms)
@@ -741,46 +1010,6 @@ def get_adsorbate_atom_attempts(atoms, config_dict, num_attempts):
         displacement_dicts.append({"displacement_center": int(idx), "gauss_std": 0.2, "number_of_atoms": 1})
         selected_indices.append(int(idx))
     return images, displacement_dicts, selected_indices
-
-
-def get_adsorbate_atom_neighbors_attempts(atoms, config_dict, num_attempts):
-    """Broad Gaussian on one adsorbate atom (default DimerControl std, neighbors dragged)."""
-    adsorbate_indices = _get_oc_adsorbate_indices(atoms)
-    if len(adsorbate_indices) == 0:
-        warnings.warn("No adsorbate atoms (tag=2) found; skipping 'adsorbate_atom_neighbors'.")
-        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
-
-    chosen = _sample_adsorbate_atoms(adsorbate_indices, num_attempts)
-    images, displacement_dicts, selected_indices = [], [], []
-    for idx in chosen:
-        atoms_new = atoms.copy()
-        atoms_new.info['reaction_type'] = 'adsorbate_atom_neighbors'
-        images.append(atoms_new)
-        displacement_dicts.append({"displacement_center": int(idx)})
-        selected_indices.append(int(idx))
-    return images, displacement_dicts, selected_indices
-
-
-def get_adsorbate_attempts(atoms, config_dict, num_attempts):
-    """Random noise mask on all adsorbate atoms (internal rearrangement)."""
-    adsorbate_indices = _get_oc_adsorbate_indices(atoms)
-    if len(adsorbate_indices) == 0:
-        warnings.warn("No adsorbate atoms (tag=2) found; skipping 'adsorbate'.")
-        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
-
-    mask = np.zeros(len(atoms), dtype=bool)
-    mask[adsorbate_indices] = True
-    mask = mask.tolist()
-
-    images, displacement_dicts, selected_indices = [], [], []
-    for _ in range(num_attempts):
-        atoms_new = atoms.copy()
-        atoms_new.info['reaction_type'] = 'adsorbate'
-        images.append(atoms_new)
-        displacement_dicts.append({"mask": mask})
-        selected_indices.append(-1)
-    return images, displacement_dicts, selected_indices
-
 
 def get_diffusion_attempts(atoms, config_dict, num_attempts):
     """Uniform translation of all adsorbate atoms in a random 3D direction."""
@@ -804,6 +1033,46 @@ def get_diffusion_attempts(atoms, config_dict, num_attempts):
         images.append(atoms_new)
     return images, displacement_dicts, selected_indices
 
+def get_all_movable_attempts(atoms, config_dict, num_attempts):
+    """Noise on all movable atoms (tag != 0); concentrate_prob swaps in a power-law kick."""
+    movable = _movable_oc(atoms)
+    if not movable:
+        warnings.warn("No movable atoms (tag != 0) found; skipping 'all_movable'.")
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
+
+    # Boolean mask for standard Gaussian noise if concentrate_prob fails
+    mask = [i in movable for i in range(len(atoms))]
+    eligible = list(movable)
+
+    images, displacement_dicts, selected_indices = [], [], []
+    for _ in range(num_attempts):
+        atoms_new = atoms.copy()
+        
+        # This will return a power-law vector if concentrate_prob triggers, 
+        # otherwise it returns the standard boolean mask for ASE to use.
+        disp, conc = _maybe_concentrate({"mask": mask}, eligible, len(atoms_new), config_dict)
+        
+        atoms_new.info['reaction_type'] = 'all_movable_conc' if conc else 'all_movable'
+        images.append(atoms_new)
+        displacement_dicts.append(disp)
+        selected_indices.append(-1)
+        
+    return images, displacement_dicts, selected_indices
+
+def get_all_atoms_attempts(atoms, config_dict, num_attempts):
+    """Full random Gaussian over ALL atoms (bulk; no fixed substrate).
+    concentrate_prob=0 -> plain mask Gaussian; >0 -> power-law over all atoms."""
+    eligible = list(range(len(atoms)))
+    mask = [True] * len(atoms)
+    images, displacement_dicts, selected_indices = [], [], []
+    for _ in range(num_attempts):
+        atoms_new = atoms.copy()
+        disp, conc = _maybe_concentrate({"mask": mask}, eligible, len(atoms_new), config_dict)
+        atoms_new.info['reaction_type'] = 'all_atoms_conc' if conc else 'all_atoms'
+        images.append(atoms_new)
+        displacement_dicts.append(disp)
+        selected_indices.append(-1)
+    return images, displacement_dicts, selected_indices
 
 def get_rotation_attempts(atoms, config_dict, num_attempts):
     """Rigid-body rotation of adsorbate around its center of mass."""
@@ -839,45 +1108,6 @@ def get_rotation_attempts(atoms, config_dict, num_attempts):
         selected_indices.append(-1)
         images.append(atoms_new)
     return images, displacement_dicts, selected_indices
-
-
-def get_adsorbate_surface_attempts(atoms, config_dict, num_attempts):
-    """Random noise mask on adsorbate + neighboring substrate atoms."""
-    adsorbate_indices = _get_oc_adsorbate_indices(atoms)
-    if len(adsorbate_indices) == 0:
-        warnings.warn("No adsorbate atoms (tag=2) found; skipping 'adsorbate_surface'.")
-        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
-
-    mask = _get_oc_neighbor_mask(atoms, adsorbate_indices)
-
-    images, displacement_dicts, selected_indices = [], [], []
-    for _ in range(num_attempts):
-        atoms_new = atoms.copy()
-        atoms_new.info['reaction_type'] = 'adsorbate_surface'
-        images.append(atoms_new)
-        displacement_dicts.append({"mask": mask})
-        selected_indices.append(-1)
-    return images, displacement_dicts, selected_indices
-
-
-def get_surface_attempts(atoms, config_dict, num_attempts):
-    """Broad Gaussian on one surface atom (tag=1)."""
-    tags = atoms.get_tags()
-    surface_indices = np.where(tags == 1)[0]
-    if len(surface_indices) == 0:
-        warnings.warn("No surface atoms (tag=1) found; skipping 'surface'.")
-        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
-
-    chosen = _sample_adsorbate_atoms(surface_indices, num_attempts)
-    images, displacement_dicts, selected_indices = [], [], []
-    for idx in chosen:
-        atoms_new = atoms.copy()
-        atoms_new.info['reaction_type'] = 'surface'
-        images.append(atoms_new)
-        displacement_dicts.append({"displacement_center": int(idx)})
-        selected_indices.append(int(idx))
-    return images, displacement_dicts, selected_indices
-
 
 def get_custom_attempts(atoms, config_dict, num_attempts):
     """No overrides — displacement fully controlled by [DimerControl] settings."""
@@ -926,9 +1156,11 @@ _BULK_REACTION_TYPE_DISPATCH = {
     "kickout_insert": lambda atoms, config_dict, n: get_kickout_insert_attempts(atoms, n, config_dict),
     "ring": lambda atoms, config_dict, n: get_ring_attempts(atoms, config_dict, n),
     "initial_guess": lambda atoms, config_dict, n: get_initial_guess_attempts(atoms),
+    "all_atoms": lambda atoms, config_dict, n: get_all_atoms_attempts(atoms, config_dict, n),
 }
 
 _OC_REACTION_TYPE_DISPATCH = {
+    "all_movable": lambda atoms, config_dict, n: get_all_movable_attempts(atoms, config_dict, n),
     "adsorbate_atom": lambda atoms, config_dict, n: get_adsorbate_atom_attempts(atoms, config_dict, n),
     "adsorbate_atom_neighbors": lambda atoms, config_dict, n: get_adsorbate_atom_neighbors_attempts(atoms, config_dict, n),
     "adsorbate": lambda atoms, config_dict, n: get_adsorbate_attempts(atoms, config_dict, n),
