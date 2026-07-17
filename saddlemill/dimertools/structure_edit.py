@@ -1066,6 +1066,48 @@ def get_all_atoms_attempts(atoms, config_dict, num_attempts):
         selected_indices.append(-1)
     return images, displacement_dicts, selected_indices
 
+def get_random_bubble_attempts(atoms, config_dict, num_attempts):
+    """Localized noise on a random atom and its neighbors within displacement_radius.
+    
+    Picks a random center atom. Finds all atoms within displacement_radius. 
+    If concentrate_prob is set, applies power-law concentration *only* to this bubble.
+    Otherwise, applies standard Gaussian noise to the bubble via displacement_center.
+    """
+    radius = _displacement_radius(config_dict, default=4.0)
+    
+    # If running OpenCatalyst (OC), restrict centers and eligible atoms to movable ones
+    movable = _movable_oc(atoms) if config_dict["ourDimer"]["dataset_type"] == "oc" else set(range(len(atoms)))
+    
+    if not movable:
+        warnings.warn("No movable atoms found; skipping 'random_bubble'.")
+        return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
+
+    movable_list = list(movable)
+    images, displacement_dicts, selected_indices = [], [], []
+    
+    for _ in range(num_attempts):
+        atoms_new = atoms.copy()
+        
+        # Pick a random movable atom to be the center of the bubble
+        center_idx = random.choice(movable_list)
+        
+        # Find who is inside the bubble
+        near_indices = _atoms_within_radius(atoms_new, center_idx, radius)
+        eligible = [int(i) for i in near_indices if int(i) in movable]
+        
+        # We start with a base dict telling ASE to center the Gaussian here
+        base_disp = {"displacement_center": int(center_idx)}
+        
+        # If concentrate_prob > 0, this intercepts the base_disp and returns a custom power-law vector
+        disp, conc = _maybe_concentrate(base_disp, eligible, len(atoms_new), config_dict)
+        
+        atoms_new.info['reaction_type'] = 'random_bubble_conc' if conc else 'random_bubble'
+        images.append(atoms_new)
+        displacement_dicts.append(disp)
+        selected_indices.append(int(center_idx))
+        
+    return images, displacement_dicts, selected_indices
+
 def get_rotation_attempts(atoms, config_dict, num_attempts):
     """Rigid-body rotation of adsorbate around its center of mass."""
     adsorbate_indices = _get_oc_adsorbate_indices(atoms)
@@ -1149,6 +1191,7 @@ _BULK_REACTION_TYPE_DISPATCH = {
     "ring": lambda atoms, config_dict, n: get_ring_attempts(atoms, config_dict, n),
     "initial_guess": lambda atoms, config_dict, n: get_initial_guess_attempts(atoms),
     "all_atoms": lambda atoms, config_dict, n: get_all_atoms_attempts(atoms, config_dict, n),
+    "random_bubble": lambda atoms, config_dict, n: get_random_bubble_attempts(atoms, config_dict, n),
 }
 
 _OC_REACTION_TYPE_DISPATCH = {
@@ -1162,6 +1205,7 @@ _OC_REACTION_TYPE_DISPATCH = {
     "surface": lambda atoms, config_dict, n: get_surface_attempts(atoms, config_dict, n),
     "custom": lambda atoms, config_dict, n: get_custom_attempts(atoms, config_dict, n),
     "initial_guess": lambda atoms, config_dict, n: get_initial_guess_attempts(atoms),
+    "random_bubble": lambda atoms, config_dict, n: get_random_bubble_attempts(atoms, config_dict, n),
 }
 
 # Backward-compat alias
