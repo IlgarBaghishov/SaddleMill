@@ -1,347 +1,307 @@
+import os
+import sys
+import traceback
+import random
+import zipfile
 import numpy as np
-from ase.mep.dimer import DimerEigenmodeSearch, MinModeAtoms, perpendicular_vector, parallel_vector, DimerControl
-
-norm = np.linalg.norm
-
-
-class IsolatedDimerControl(DimerControl):
-    """DimerControl that owns its own parameter dict.
-
-    ASE's DimerControl stores `parameters` as a class-level attribute and never
-    copies it per instance, so EVERY DimerControl in the process shares one dict:
-    constructing a second control overwrites the rotation parameters
-    (max_num_rot, f_rot_max, ...) of every control built earlier. The kappa-dimer
-    needs two live controls at once (Phase-A `control` and Phase-B `kappa_control`)
-    holding different values, so the shared dict silently collapses them to
-    whichever was built last. Snapshotting the defaults onto the instance before
-    super().__init__() fills them in keeps each control independent. Stored values
-    are scalars, so a shallow copy is sufficient.
-    """
-    def __init__(self, *args, **kwargs):
-        self.parameters = dict(type(self).parameters)
-        super().__init__(*args, **kwargs)
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
+from ase.neighborlist import natural_cutoffs, neighbor_list
+from ase.io import Trajectory
+from ase.mep import DimerControl, MinModeAtoms, MinModeTranslate
+from ase.calculators.singlepoint import SinglePointCalculator
+from saddlemill.dimertools.structure_edit import get_attempts
+from saddlemill.tools import (backup_flux_logs, get_task_name, resolve_vasp_calc,
+                              remove_vasp_heavies, finalize_if_vasp_interactive,
+                              archive_and_clear_temp_files)
 
 
-class CGRotationMixin:
-    """Polak-Ribiere conjugate-gradient rotation (tsase KSSDimer rotationOpt='cg').
+class StopRun(Exception):
+    pass
 
-    ASE's DimerEigenmodeSearch rotates in the plane spanned by the eigenmode and
-    the INSTANTANEOUS rotational force -- steepest descent, no memory. tsase's
-    rotation_plane() instead mixes the previous search direction in with a PR
-    coefficient, with a hard restart (gamma=0) when successive rotational forces
-    stay too parallel:
 
-        a = |<F, F_old>|; b = <F_old, F_old>
-        gamma = <F, F - F_old> / b   if a <= 0.5 b and b != 0, else 0
-        T     = F + gamma * T_old,   then re-orthogonalized to the eigenmode
+def _setup_dimer(atoms, calc, eigenmode=None, displacement_dict=None,
+                 dimer_control_kwargs=None, control_logfile=None,
+                 logfile=None, trajectory=None,
+                 engine="ase", kappa_kwargs=None, kappa_control_kwargs=None):
+    """Create MinModeAtoms and MinModeTranslate optimizer for dimer method.
 
-    That memory is what lets the rotation converge in fewer force calls on the
-    noisy soft-mode landscapes where the plain search jitters. CG state lives on
-    the search object, which is constructed fresh each translation step, so the
-    memory resets per step -- same as tsase's iteration==0 reset.
+    Does not run the optimization. Caller attaches callbacks and calls
+    dim_rlx.run().
+
+    Returns (d_atoms, dim_rlx).
+
+    kappa_kwargs: KappaMinModeAtoms knobs (beta, recover_fmax).
+    kappa_control_kwargs: DimerControl kwargs for the Phase-B (kappa) rotation;
+        None -> KappaMinModeAtoms builds its own tuned default.    
+    beta - how abrupt changes in kappa change the force.
+    recover_fmax - what fmax to switch back to normal dimer. 
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._cg_f_old = None
-        self._cg_dir = None
+    atoms.calc = calc
+    eig_kw = {'eigenmodes': [np.array(eigenmode)]} if eigenmode is not None else {}
 
-    def _cg_mix(self, f_rot):
-        f_old, d_old = self._cg_f_old, self._cg_dir
-        if f_old is None or d_old is None or f_old.shape != f_rot.shape:
-            mixed = f_rot.copy()
-        else:
-            a = abs(np.vdot(f_rot, f_old))
-            b = np.vdot(f_old, f_old)
-            if a <= 0.5 * b and b > 1e-30:
-                gamma = np.vdot(f_rot, f_rot - f_old) / b
-            else:
-                gamma = 0.0
-            mixed = f_rot + gamma * d_old
-        # rotation direction must stay perpendicular to the current dimer axis
-        mixed = perpendicular_vector(mixed, self.eigenmode)
-        self._cg_f_old = f_rot.copy()
-        self._cg_dir = mixed.copy()
-        return mixed
+    if engine == "kappa":
+        from saddlemill.dimertools.kappa_dimer import KappaMinModeAtoms, IsolatedDimerControl
 
+        d_control = IsolatedDimerControl(logfile=control_logfile, **(dimer_control_kwargs or {}))
+        kw = dict(kappa_kwargs or {})
+        if kappa_control_kwargs:
+            kw["kappa_control"] = IsolatedDimerControl(logfile=control_logfile, **kappa_control_kwargs)
 
-class CGDimerEigenmodeSearch(CGRotationMixin, DimerEigenmodeSearch):
-    """Phase-A rotation with CG mixing; otherwise identical to ASE's search."""
+        d_atoms = KappaMinModeAtoms(atoms, control=d_control, **eig_kw, **kw)
+    elif engine == "ase":
+        d_control = DimerControl(logfile=control_logfile, **(dimer_control_kwargs or {}))
+        d_atoms = MinModeAtoms(atoms, d_control, **eig_kw)
+    else:
+        raise ValueError(f"Unknown [ourDimer] engine={engine!r}; expected 'ase' or 'kappa'.")
 
-    def get_rotational_force(self):
-        return self._cg_mix(super().get_rotational_force())
+    if displacement_dict:
+        d_atoms.displace(**displacement_dict)
+    else:
+        d_atoms.displace(displacement_vector=np.random.randn(len(atoms), 3) * 1e-10,
+                         method='vector')
+    dim_rlx = MinModeTranslate(d_atoms, trajectory=trajectory, logfile=logfile)
+    return d_atoms, dim_rlx
 
+def _refine_eigenmode(atoms, calc, eigenmode, dimer_control_kwargs=None,
+                      control_logfile=None):
+    """Refine eigenmode via dimer rotation only (no translation).
 
-class KappaEigenmodeSearch(CGRotationMixin, DimerEigenmodeSearch):
+    Works on a copy of *atoms* — the original is never modified.
+    Returns (refined_eigenmode, curvature).
     """
-    Phase B Rotation: Constrains the dimer rotation to the isopotential hyperplane
-    and applies CG mixing. Inherits the converge_to_eigenmode() loop from ASE,
-    overriding only the rotational force calculation.
-
-    Order of operations per rotation: raw rotational force -> project onto the
-    plane perpendicular to the true force (the isopotential constraint) -> CG mix
-    with the previous direction -> re-impose the constraint (the mixed-in history
-    can leak a component along f_hat).
-    """
-
-    def get_rotational_force(self):
-        rot_force = super().get_rotational_force()
-
-        true_forces = self.dimeratoms.forces0
-        fnorm = norm(true_forces)
-        if fnorm < 1e-8:
-            return self._cg_mix(rot_force)
-
-        f_hat = true_forces / fnorm
-        constrained = perpendicular_vector(rot_force, f_hat)
-        mixed = self._cg_mix(constrained)
-        return perpendicular_vector(mixed, f_hat)
-
-    def log(self, f_rot_A, angle):
-        """Log each rotational step."""
-        # NYI Log for the trial angle
-        if self.logfile is not None:
-            if angle:
-                l = 'DIM:ROT: %7d %9d %9.4f %9.4f %9.4f\n' % \
-                    (self.control.get_counter('optcount'),
-                     self.control.get_counter('rotcount'),
-                     self.get_curvature(), np.degrees(angle), norm(f_rot_A))
-            else:
-                l = 'DIM:ROT: %7d %9d %9.4f %9s %9.4f\n' % \
-                    (self.control.get_counter('optcount'),
-                     self.control.get_counter('rotcount'),
-                     self.get_curvature(), '---------', norm(f_rot_A))
-            self.logfile.write(l)
-
-    def update_eigenmode(self, eigenmode):
-        """Update the eigenmode in the MinModeAtoms object."""
-        fnorm = norm(self.dimeratoms.forces0)
-        if fnorm > 1e-8:
-            f_hat = self.dimeratoms.forces0 / fnorm
-            eigenmode = perpendicular_vector(eigenmode, f_hat)
-            eigenmode = eigenmode / norm(eigenmode)
-        self.eigenmode = eigenmode
-        self.update_virtual_positions()
-        self.control.increment_counter('rotcount')
+    refine_atoms = atoms.copy()
+    refine_atoms.calc = calc
+    d_control = DimerControl(logfile=control_logfile,
+                             **(dimer_control_kwargs or {}))
+    d_atoms = MinModeAtoms(refine_atoms, d_control,
+                           eigenmodes=[np.array(eigenmode)])
+    d_atoms.displace(displacement_vector=np.random.randn(len(refine_atoms), 3) * 1e-10,
+                     method='vector')
+    # get_forces() triggers eigenmode rotation (up to max_num_rot iterations).
+    # No translation — only the eigenmode direction and curvature are updated.
+    d_atoms.get_forces()
+    return d_atoms.get_eigenmode(), float(d_atoms.get_curvature())
 
 
-class KappaMinModeAtoms(MinModeAtoms):
-    """
-    Extended MinModeAtoms to handle the Phase A/B double rotation and
-    the kappa-weighted translation forces.
+def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executorlib_worker_id=None, **kwargs):
 
-    Phase B (kappa rotation + gammas) is SKIPPED entirely whenever its output
-    would be unused, which is two independent cases re-evaluated every step:
+    rank = executorlib_worker_id
 
-      1. curvature_A > 0 (above an inflection, not a saddle-like region):
-         translation drags straight up along the mode, exactly like the stock
-         ASE dimer and the k-dimer paper's "drag up directly" branch. Neither
-         kappa nor the gammas enter that force, so the constrained rotation
-         would be wasted force calls.
-      2. fmax < recover_fmax (the releaseF idea): normal-dimer regime,
-         gamma_1 = gamma_2 = 1, kappa unused.
+    run_offset = int(os.environ.get("SM_RUN_OFFSET", "0"))
+    seed = i + run_offset * 1000
 
-    Kappa on/off state (`self.kappa_active`):
-      - hysteresis=False (default): active iff fmax >= recover_fmax, re-evaluated
-        every step.
-      - hysteresis=True: two thresholds. Kappa turns OFF when fmax drops below
-        recover_fmax and only turns back ON when fmax rises above reactivate_fmax
-        (> recover_fmax). Prevents rapid flip-flopping when fmax hovers at the
-        boundary. Fallback cost: after an off->on flip, self.kappa_mode is stale;
-        it is re-projected onto the current isopotential plane before Phase B.
+    random.seed(seed)
+    np.random.seed(seed)
 
-    cg_rotation=True applies Polak-Ribiere CG mixing to BOTH rotations
-    (Phase A via CGDimerEigenmodeSearch, Phase B via KappaEigenmodeSearch).
-    Set cg_rotation=False to recover the previous steepest-descent behavior.
-    """
-    def __init__(self, atoms, beta=2.0, recover_fmax=0.3, kappa_control=None,
-                 hysteresis=False, reactivate_fmax=0.45, cg_rotation=True,
-                 **kwargs):
-        super().__init__(atoms, **kwargs)
+    method_name = config_dict["Main"]["method"]
+    status_file = f"{method_name}_status_csvs/status_rank_{rank}.csv"
+    my_output_file = f"{method_name}_trajes/collected_ts_rank_{rank}.traj"
+    zip_name = f"{method_name}_debug_zips/structure_rank_{rank}_data.zip"
+    task_name = get_task_name(config_dict)
+    is_vasp = config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive")
 
-        # Tuning parameters for the translation step
-        self.beta = beta           # Steepness of the switching function
-        self.kappa = 0.0           # Initialize isopotential curvature
-        self.recover_fmax = recover_fmax # max atom force norm (like EDIFFG). to determine if to switch back to normal dimer method.
-        self.hysteresis = bool(hysteresis)
-        self.reactivate_fmax = float(reactivate_fmax)
-        self.cg_rotation = bool(cg_rotation)
-        if self.hysteresis and self.reactivate_fmax < self.recover_fmax:
-            raise ValueError(
-                f"kappa_reactivate_fmax ({self.reactivate_fmax}) must be >= "
-                f"kappa_recover_fmax ({self.recover_fmax}) for hysteresis to make sense.")
-        self.kappa_active = True   # start in kappa mode (fmax is high at the start)
-        if kappa_control is not None:
-            self.kappa_control = kappa_control
+    max_consecutive_errors = config_dict["Main"]["max_consecutive_errors"]
+    if consecutive_errors is not None and consecutive_errors[0] >= max_consecutive_errors > 0:
+        print(f"Rank {rank}: {consecutive_errors[0]} consecutive structures errored. Killing worker for restart.", flush=True)
+        backup_flux_logs(rank)
+        sys.exit(1)
+
+    def log_status(attempt, slctd_indx, status_msg, n_force_calls=0):
+        with open(status_file, 'a') as f:
+            f.write(f'{i},{rank},{attempt},{slctd_indx},{n_force_calls},"{status_msg}"\n')
+
+    # --- MAIN LOOP ---
+    any_attempt_succeeded = False
+    all_attempts_none = False
+
+    continuation_data = kwargs.get('continuation_data')  # {attempt_id: Atoms} or None
+    entries_to_run = kwargs.get('entries_to_run')        # set of attempt_ids or None
+
+    with Trajectory(my_output_file, 'a') as writer:
+
+        attempt = "init"
+        slctd_indx = -1
+        temp_files = []
+
+        generated = get_attempts(atoms_orig, config_dict)
+        all_attempts_none = all(a is None for a in generated[0])
+        if all_attempts_none:
+            print(f"Rank {rank} WARNING on structure {i}: "
+                  "All attempts failed to generate.", flush=True)
+
+        attempts_iter = enumerate(zip(*generated))
+
+        for attempt, (atoms, displacement_dict, slctd_indx) in attempts_iter:
+
+            if entries_to_run is not None and attempt not in entries_to_run:
+                continue
+
+            if atoms is None:
+                log_status(attempt, -1, "error: failed to generate attempt")
+                continue
+
+            # Use continuation structure if available for this attempt
+            if continuation_data and attempt in continuation_data:
+                atoms = continuation_data[attempt]
+                displacement_dict = {"displacement_vector": np.random.randn(len(atoms), 3) * 1e-10, "method": "vector"}
+
+            temp_log = f'dimer_control_{i}_{attempt}_{slctd_indx}.log'
+            temp_opt_log = f'dimer_opt_{i}_{attempt}_{slctd_indx}.log'
+            temp_traj = f'dimer_{i}_{attempt}_{slctd_indx}.traj'
+            temp_files = [temp_log, temp_opt_log, temp_traj]
+            attempt_vasp_dir = f"VASP_{i}_{attempt}" if is_vasp else None
+            if attempt_vasp_dir is not None:
+                temp_files.append(attempt_vasp_dir)
+            attempt_calc = None
+
+            try:
+                # Handle constraints:
+                if atoms.constraints:
+                    free_indices = [atom.index for atom in atoms if atom.index not in atoms.constraints[0].get_indices()]
+                else:
+                    free_indices = [atom.index for atom in atoms]
+
+                # Use existing eigenmode if available (top level from
+                # get_attempts/initial_guess, or orig_info from continuation),
+                # otherwise let ASE derive one from the displacement.
+                eigenmode = atoms.info.get('eigenmode')
+                if eigenmode is None:
+                    eigenmode = atoms.info.get('orig_info', {}).get('eigenmode')
+                if eigenmode is not None:
+                    eigenmode = np.array(eigenmode)
+
+                attempt_calc = resolve_vasp_calc(config_dict, calc, i, attempt, "ourDimer", atoms=atoms)
+                d_atoms, dim_rlx = _setup_dimer(
+                    atoms, attempt_calc, eigenmode=eigenmode,
+                    displacement_dict=displacement_dict,
+                    dimer_control_kwargs=config_dict["DimerControl"],
+                    control_logfile=temp_log,
+                    logfile=temp_opt_log, trajectory=temp_traj,
+                    engine=config_dict["ourDimer"]["engine"],
+                    kappa_kwargs={
+                        "beta": config_dict["ourDimer"]["kappa_beta"],
+                        "recover_fmax": config_dict["ourDimer"]["kappa_recover_fmax"],
+                    },
+                    kappa_control_kwargs=(config_dict.get("Kappa") or None),
+                )
+
+                # PR Check — skip early steps to let the dimer rotate
+                # the eigenmode (initial displacement can look delocalized,
+                # especially for diffusion/rotation types).
+                delocalization_start_step = max(1, int(0.1 * config_dict["Main"]["steps"]))
+
+                def check_delocalization():
+                    if dim_rlx.nsteps < delocalization_start_step:
+                        return
+                    mode = d_atoms.get_eigenmode()
+                    v2 = (mode**2).sum(axis=1)
+                    v2 = v2[free_indices]
+                    sum_v2 = np.sum(v2)
+                    if sum_v2 < 1e-12: return
+                    pr = (sum_v2**2) / (len(v2) * np.sum(v2**2))
+                    if pr > config_dict["ourDimer"]["delocalization_threshold"]:
+                        raise StopRun(f"Eigenmode Delocalized (PR={pr:.3f})")
+
+                def check_desorption():
+                    check_atoms = d_atoms.atoms
+                    cutoffs = natural_cutoffs(check_atoms, mult=2.0)
+                    i, j = neighbor_list('ij', check_atoms, cutoffs)
+                    adjacency = csr_matrix((np.ones(len(i)), (i, j)), shape=(len(check_atoms), len(check_atoms)))
+                    n_components, labels = connected_components(adjacency, connection='weak')
+                    if n_components > 1:
+                        raise StopRun(f"Adsorbate desorbed")
+
+                dim_rlx.attach(check_delocalization, interval=5)
+                dim_rlx.attach(check_desorption, interval=5)
+
+                stop_reason = None
+                stopped_early = False
+                converged = False
+                try:
+                    converged = dim_rlx.run(fmax=config_dict["Main"]["fmax"], steps=config_dict["Main"]["steps"])
+                except StopRun as e:
+                    stopped_early = True
+                    stop_reason = str(e)
+                    converged = False
+
+                if converged:
+                    status = "converged"
+                elif not converged and not stopped_early:
+                    # Extension check
+                    fmax_check = np.sqrt((d_atoms.get_forces()**2).sum(axis=1).max()) < config_dict['ourDimer']['extension_check_fmax']
+                    curvature_check = d_atoms.get_curvature() < config_dict['ourDimer']['extension_check_curvature']
+                    if fmax_check and curvature_check:
+                        try:
+                            converged = dim_rlx.run(fmax=config_dict["Main"]["fmax"], steps=150)
+                        except StopRun as e:
+                            stopped_early = True
+                            stop_reason = str(e)
+                            converged = False
+
+                        if converged:
+                            status = "converged_after_extension"
+                        else:
+                            status = "not_converged_after_extension"
+                    else:
+                        status = "not_converged"
+                else:
+                    status = "not_converged_StopRun"
+
+                # Metadata
+                eigenmode = d_atoms.get_eigenmode()
+                curvature = d_atoms.get_curvature()
+                n_force_calls = d_atoms.control.get_counter('forcecalls')
+                energy = atoms.get_potential_energy()
+                forces = atoms.get_forces()
+                finalize_if_vasp_interactive(config_dict, attempt_calc)
+                if attempt_vasp_dir is not None:
+                    remove_vasp_heavies(attempt_vasp_dir)
+
+                atoms.info['eigenmode'] = eigenmode
+                atoms.info['curvature'] = float(curvature)
+                atoms.info['n_force_calls'] = int(n_force_calls)
+                atoms.info['converged'] = 1 if converged else 0
+                atoms.info['src_index'] = i
+                atoms.info['attempt_id'] = attempt
+                atoms.info['stoprun'] = 1 if stopped_early else 0
+                atoms.info['selected_index'] = slctd_indx
+                orig = atoms.info.get('orig_info', {})
+                atoms.info['reaction_type'] = atoms.info.get('reaction_type', orig.get('reaction_type', 'unknown'))
+                if stop_reason and "desorbed" in stop_reason:
+                    status = "converged_to_desorption"
+                    atoms.info['converged'] = 1
+                    atoms.info['reaction_type'] = 'desorption'
+                atoms.info['status'] = status
+                atoms.info['task_name'] = task_name
+                atoms.wrap()
+                atoms.calc = SinglePointCalculator(atoms, energy=energy, forces=forces)
+
+                writer.write(atoms)
+
+                # Clean up temp files (the zip block below walks directories too,
+                # so the per-attempt VASP dir is captured automatically).
+                archive_and_clear_temp_files(temp_files, zip_name, prefix="",
+                                   enabled=config_dict['Main']['zip'])
+
+                log_status(attempt, slctd_indx, status, n_force_calls)
+                any_attempt_succeeded = True
+
+            except Exception as e:
+                print(f"Rank {rank} FAILED on structure {i}, attempt {attempt}: {e}", flush=True)
+                print(f"\nTraceback details:\n{traceback.format_exc()}", flush=True)
+                if attempt_calc is not None:
+                    finalize_if_vasp_interactive(config_dict, attempt_calc)
+                archive_and_clear_temp_files(temp_files, zip_name, prefix="ERROR_",
+                                   enabled=config_dict['Main']['zip'])
+                log_status(attempt, slctd_indx, f"error: {str(e)}")
+
+    # Track consecutive structure-level errors for worker health
+    if consecutive_errors is not None:
+        if any_attempt_succeeded:
+            consecutive_errors[0] = 0
+        elif all_attempts_none:
+            pass  # Data issue (e.g., no adsorbate atoms), not a worker error
         else:
-            # tighter rotation than Phase A: converge kappa each step.
-            # IsolatedDimerControl so building this does NOT clobber self.control's
-            # rotation parameters (see IsolatedDimerControl docstring).
-            self.kappa_control = IsolatedDimerControl(
-               dimer_separation=self.control.get_parameter('dimer_separation'),
-                f_rot_min=0.01, f_rot_max=2.0,   # don't bail after one rotation
-                max_num_rot=4,
-                logfile=self.control.logfile, eigenmode_logfile=self.control.logfile)
-        self.kappa_mode = None
-
-    def _update_kappa_state(self, fmax_atom):
-        """Update self.kappa_active from the current per-atom fmax.
-
-        No hysteresis: active <=> fmax >= recover_fmax (memoryless, old condition).
-        Hysteresis:    active -> inactive when fmax < recover_fmax;
-                       inactive -> active when fmax > reactivate_fmax;
-                       otherwise hold the previous state (the dead band).
-        """
-        if self.hysteresis:
-            if self.kappa_active and fmax_atom < self.recover_fmax:
-                self.kappa_active = False
-            elif not self.kappa_active and fmax_atom > self.reactivate_fmax:
-                self.kappa_active = True
-        else:
-            self.kappa_active = fmax_atom >= self.recover_fmax
-
-    def find_eigenmodes(self, order=1):
-        """
-        Launches eigenmode search and kappa search.
-        Overrides ASE's standard eigenmode search to run Phase A and Phase B.
-        Phase B (kappa rotation) is skipped whenever its output would be unused:
-        positive Phase-A curvature (translation is a pure drag-up; see
-        get_projected_forces) or kappa inactive (normal-dimer regime).
-        """
-        if order > 1:
-            raise NotImplementedError("Kappa-dimer only supports 1st order saddles.")
-
-        # ---------------------------------------------------------
-        # PHASE A: Standard unconstrained rotation to find eigenmode and curvature_A
-        # ---------------------------------------------------------
-        SearchA = CGDimerEigenmodeSearch if self.cg_rotation else DimerEigenmodeSearch
-        search_A = SearchA(self, self.control, eigenmode=self.eigenmodes[0])
-        search_A.converge_to_eigenmode()
-        search_A.set_up_for_optimization_step()
-
-        eigenmode = search_A.get_eigenmode()
-        curvature_A = search_A.get_curvature()
-
-        # Store true minimum mode and curvature
-        self.eigenmodes[0] = eigenmode
-        self.curvatures[0] = curvature_A
-
-        # ---------------------------------------------------------
-        # Skip Phase B when its output cannot be used (cheapest checks first)
-        # ---------------------------------------------------------
-        if curvature_A > 0.0:
-            # Above an inflection: get_projected_forces drags straight up along
-            # the mode ("drag up directly"); kappa and the gammas never enter.
-            self.kappa = 0.0
-            return
-
-        fmax_atom = np.sqrt((self.forces0 ** 2).sum(axis=1).max())
-        self._update_kappa_state(fmax_atom)
-        if not self.kappa_active:
-            # Normal-dimer regime: skip the constrained rotation entirely.
-            # kappa_mode is kept as-is so a hysteresis reactivation has a warm
-            # (if stale) starting guess; it gets re-projected onto the new
-            # isopotential plane below when Phase B next runs.
-            self.kappa = 0.0
-            return
-
-        # ---------------------------------------------------------
-        # PHASE B: Constrained rotation to find kappa_mode and kappa
-        # ---------------------------------------------------------
-        true_forces = self.forces0
-        force_norm = norm(true_forces)
-        f_hat = true_forces / force_norm if force_norm > 1e-8 else None
-
-
-        def fresh_guess(): # If its the first start, it will give the eigenmode projected onto the isopotential hyperplane as the initial guess.
-            if f_hat is None:
-                return eigenmode.copy()
-            g = perpendicular_vector(eigenmode, f_hat)
-            if norm(g) > 1e-8:
-                return g / norm(g)
-            dummy = np.random.randn(*eigenmode.shape)
-            g = perpendicular_vector(dummy, f_hat)
-            return g / norm(g)
-
-
-        if self.kappa_mode is not None and f_hat is not None:
-            guess = perpendicular_vector(self.kappa_mode, f_hat)
-            guess = guess / norm(guess) if norm(guess) > 1e-8 else fresh_guess()
-        else:
-            guess = fresh_guess()
-
-        search_B = KappaEigenmodeSearch(self, self.kappa_control, eigenmode=guess)
-        search_B.converge_to_eigenmode()
-        self.kappa_mode = search_B.get_eigenmode().copy()
-
-        curvature_kappa = search_B.get_curvature()
-        true_forces = self.forces0
-        force_norm = norm(true_forces)
-
-        self.kappa = -(curvature_kappa / force_norm) if force_norm >1e-8 else 0.0
-
-    def get_projected_forces(self, pos=None):
-        """
-        Overrides the translation force calculation to apply the kappa penalty
-        and switching functions.
-
-        Positive curvature: pure inversion along the mode (f = -f_parallel),
-        matching stock ASE MinModeAtoms and the k-dimer paper's "drag up
-        directly" branch. The previous version blended the gammas here too,
-        which deviated from the reference behavior AND paid for a Phase-B
-        rotation whose output never entered the force.
-
-        When kappa is inactive (self.kappa_active False, set in find_eigenmodes
-        for this step) this reduces exactly to the standard dimer translation
-        force (gamma_1 = gamma_2 = 1).
-        """
-        # Get true forces at the current center
-        if pos is not None:
-            forces = self.get_forces(real=True, pos=pos).copy()
-        else:
-            forces = self.forces0.copy()
-
-        eigenmode = self.eigenmodes[0]
-
-        # 1. Calculate standard parallel and perpendicular force components
-        f_parallel = parallel_vector(forces, eigenmode)
-        f_perp = forces - f_parallel
-
-        # 2. Positive curvature: drag up directly (stock-dimer branch).
-        if self.curvatures[0] > 0.0:
-            return -f_parallel
-
-        # 3. Switching functions. The on/off decision lives in _update_kappa_state
-        # (called from find_eigenmodes each step) so rotation and translation
-        # always agree within a step -- no re-thresholding here.
-        if not self.kappa_active:
-            gamma_1 = 1.0
-            gamma_2 = 1.0
-        else:
-            bk = np.clip(self.beta * self.kappa, -500.0, 500.0)
-            exp_term = np.exp(bk)
-            gamma_1 = (2.0 / (1.0 + exp_term)) - 1.0
-            gamma_2 = 1.0 - (1.0 / (1.0 + exp_term))
-
-        # 4. Construct the final modified translation force
-        # A standard dimer is simply: f_translated = f_perp - f_parallel
-        # The kappa dimer dynamically blends components and adds the lateral penalty
-        f_translated = -(gamma_1 * f_parallel) + (gamma_2 * f_perp)
-
-        return f_translated
-
-    def eigenmode_log(self):
-        if self.mlogfile is None or not hasattr(self, 'forces0'):
-            return
-        fmax_atom = np.sqrt((self.forces0 ** 2).sum(axis=1).max())
-        dragup = self.curvatures[0] > 0.0
-        if dragup or not self.kappa_active:
-            g1 = g2 = 1.0
-        else:
-            bk = np.clip(self.beta * self.kappa, -500.0, 500.0)
-            et = np.exp(bk); g1 = (2.0/(1.0+et)) - 1.0; g2 = 1.0 - (1.0/(1.0+et))
-        self.mlogfile.write(
-            'MINMODE:KAPPA: step %i kappa %15.8f fmax %10.6f g1 %8.5f g2 %8.5f normal %d hyst %d dragup %d\n'
-            % (self.control.get_counter('optcount'), self.kappa, fmax_atom, g1, g2,
-               int(not self.kappa_active), int(self.hysteresis), int(dragup)))
-        self.mlogfile.flush()
+            consecutive_errors[0] += 1
