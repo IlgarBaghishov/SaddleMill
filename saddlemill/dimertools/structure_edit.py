@@ -7,8 +7,9 @@ from ase.neighborlist import NeighborList, natural_cutoffs, neighbor_list, mic
 from ase.build import make_supercell
 from ase.data import covalent_radii, atomic_numbers
 
-REUSE_MAX_DIST = 5.0  # Å — max hop/collision distance for *_reuse; tighten to taste
-
+REUSE_MAX_DIST = 5.0  # Å — max hop/collision distance for *_reuse; tighten to taste. I saw a Rb hop of 4.0 angstroms. hop_reuse
+KICKOUT_VOID_DIST = 5.0   # Å — max kicked-atom -> void hop (an adjacent void) kickout_reuse
+KICKOUT_COLL_DIST = 5.0   # Å — max kicker <-> kicked contact (roughly first shell) kickout_reuse
 
 def _is_gauss_slot(g, p_percent):
     """Deterministic, evenly-spread ~p fraction of global attempt indices."""
@@ -584,23 +585,27 @@ def get_hop_insert_attempts(atoms, num_attempts, config_dict=None):
 # --- Kickout attempts (interstitialcy / kick-out mechanism) ---
 def get_kickout_reuse_attempts(atoms, num_attempts, config_dict=None):
     """Interstitialcy knock-on (kick-out) using only existing atoms.
- 
-    Triplets (void=site_b, kicked, kicker) are ranked and consumed
-    deterministically. A triplet is dropped if the kicked atom is farther than
-    REUSE_MAX_DIST from the void, or the kicker is farther than REUSE_MAX_DIST
-    from the kicked atom. Gaussian swaps do NOT advance the ranked pointer;
-    exhaustion falls back to Gaussian.
+
+    Enumerates EVERY in-range (void, kicked, kicker) triplet — every atom near a
+    void is a candidate kicked, every atom near that kicked is a candidate kicker
+    (no nearest-only or fixed-neighbor-count restriction). A triplet is kept only
+    if the kicked atom is within KICKOUT_VOID_DIST of the void and the kicker is
+    within KICKOUT_COLL_DIST of the kicked atom. Kicker moves into the kicked
+    atom's site (collision); kicked moves into the void. Same deterministic
+    consumption / gaussian-swap / exhaustion behavior as hop_reuse.
     """
     sites = find_interstitial_sites(atoms)
     if len(sites) < 2:
         warnings.warn("Found fewer than 2 interstitial sites; skipping kickout_reuse.")
         return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
- 
+
     cell = atoms.get_cell()
     p = _swap_prob(config_dict)
     p_percent = int(round(p * 100))
     positions = atoms.get_positions()
     numbers = atoms.get_atomic_numbers()
+    n = len(atoms)
+    radii = covalent_radii[numbers]
 
     offset = 0
     if config_dict is not None:
@@ -608,71 +613,58 @@ def get_kickout_reuse_attempts(atoms, num_attempts, config_dict=None):
             offset = int(config_dict["ourDimer"].get("bulk_reuse_offset", 0))
         except (KeyError, TypeError):
             pass
+    # Pairwise atom-atom and atom-void distances (MIC), computed once.
+    atom_dist = np.linalg.norm(
+        mic((positions[:, None, :] - positions[None, :, :]).reshape(-1, 3), cell), axis=1
+    ).reshape(n, n)
+    void_dist = np.linalg.norm(
+        mic((positions[:, None, :] - sites[None, :, :]).reshape(-1, 3), cell), axis=1
+    ).reshape(n, len(sites))
 
-    # 1. Score in-range triplets (true kick-out); rank best (lowest) first.
-    # TWO vectorized mic() calls replace the ~2*N_sites per-site calls.
-    n_at, n_st = len(positions), len(sites)
-    d_sa = np.linalg.norm(
-        mic((positions[None, :, :] - sites[:, None, :]).reshape(-1, 3),
-            cell).reshape(n_st, n_at, 3), axis=-1)             # (n_st, n_at)
-    d_aa = np.linalg.norm(
-        mic((positions[None, :, :] - positions[:, None, :]).reshape(-1, 3),
-            cell).reshape(n_at, n_at, 3), axis=-1)             # (n_at, n_at)
-    radii = covalent_radii[numbers]
- 
+    # Enumerate every in-range (void, kicked, kicker); rank best (lowest) first.
     scored_triplets = []
-    for si in range(n_st):
-        kicked_idx = int(np.argmin(d_sa[si]))
-        dist_void = d_sa[si, kicked_idx]
-        if dist_void > REUSE_MAX_DIST:
-            continue
- 
-        for kicker_idx in np.argsort(d_aa[kicked_idx])[1:6]:   # skip self at index 0
-            kicker_idx = int(kicker_idx)
-            dist_collision = d_aa[kicked_idx, kicker_idx]
-            if dist_collision > REUSE_MAX_DIST:
-                continue
-            score = (dist_void * radii[kicked_idx]) + (dist_collision * radii[kicker_idx])
-            scored_triplets.append((score, sites[si], kicked_idx, kicker_idx))
+    for j in range(len(sites)):
+        for kicked_idx in np.where(void_dist[:, j] <= KICKOUT_VOID_DIST)[0]:
+            dist_void = void_dist[kicked_idx, j]
+            r_kicked = radii[kicked_idx]
+            kicker_candidates = np.where(
+                (atom_dist[kicked_idx] <= KICKOUT_COLL_DIST) & (atom_dist[kicked_idx] > 1e-6))[0]
+            for kicker_idx in kicker_candidates:
+                score = dist_void * r_kicked + atom_dist[kicked_idx, kicker_idx] * radii[kicker_idx]
+                scored_triplets.append((score, j, int(kicked_idx), int(kicker_idx)))
     scored_triplets.sort(key=lambda x: x[0])
     n_valid = len(scored_triplets)
     if n_valid == 0:
-        warnings.warn("kickout_reuse: no triplets within REUSE_MAX_DIST; "
-                      "using Gaussian fallback.")
- 
+        warnings.warn("kickout_reuse: no triplets within cutoffs; using Gaussian fallback.")
+
     images, displacement_dicts, selected_indices = [], [], []
- 
     for i in range(num_attempts):
         g = offset + i
         ptr = g - _gauss_count_before(g, p_percent)
         use_gauss = (ptr >= n_valid) or _is_gauss_slot(g, p_percent)
- 
+
         atoms_new = atoms.copy()
- 
         if use_gauss:
-            if n_valid > 0:
-                center_idx = scored_triplets[ptr % n_valid][3]  # kicker
-            else:
-                center_idx = random.randrange(len(atoms))
+            center_idx = scored_triplets[ptr % n_valid][3] if n_valid > 0 else random.randrange(n)
             disp, suffix = _gauss_or_concentrate(atoms_new, center_idx, config_dict)
-            atoms_new.info['reaction_type'] = 'kickout_reuse_gauss' + suffix   # -> _gauss or _gauss_conc
+            atoms_new.info['reaction_type'] = 'kickout_reuse_gauss' + suffix
             images.append(atoms_new)
             displacement_dicts.append(disp)
             selected_indices.append(int(center_idx))
         else:
-            _, site_b, kicked_idx, kicker_idx = scored_triplets[ptr]
+            _, j, kicked_idx, kicker_idx = scored_triplets[ptr]
+            site_b = sites[j]
             kicked_pos = positions[kicked_idx]
             kicker_pos = positions[kicker_idx]
             atoms_new.info['reaction_type'] = 'kickout_reuse'
-            disp_vector = np.zeros((len(atoms_new), 3))
+            disp_vector = np.zeros((n, 3))
             disp_vector[kicker_idx] = 0.5 * mic(kicked_pos - kicker_pos, cell)
             disp_vector[kicked_idx] = 0.5 * mic(site_b - kicked_pos, cell)
             images.append(atoms_new)
             displacement_dicts.append({"displacement_vector": disp_vector, "method": "vector"})
             selected_indices.append(int(kicker_idx))
- 
     return images, displacement_dicts, selected_indices
-
+    
 def get_kickout_insert_attempts(atoms, num_attempts, config_dict=None):
     """Insert a new similar-sized atom at interstitial site; it kicks nearest lattice atom out.
 
