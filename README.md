@@ -292,7 +292,8 @@ By default the `[Vasp]` section *is* your INCAR — every tag you list there is 
 
 ```ini
 [ourVasp]
-input_generator = omat24_static   # omat24_static | omat24_relax | oc20
+input_generator = omat24_static   # omat24_static | omat24_relax | cheap_omat
+                                  #   | oc20 | cheap_oc20 | oc22 | cheap_oc22
                                   #   ...or 'my_pkg.my_module:my_func'
                                   #   ...or '/path/to/my_inputs.py:my_func'
 
@@ -304,7 +305,9 @@ xc = PBE
 
 Per-tag precedence is **`[Vasp]` key → `input_generator` output → ASE/VASP default**: a tag you set in `[Vasp]` always wins; a tag the generator supplies is used when `[Vasp]` is silent; a tag in neither falls back to ASE's default. The generator contributes only electronic/accuracy settings — ionic-driver tags (`IBRION`/`NSW`/`POTIM`/`EDIFFG`) are stripped, since SaddleMill drives the geometry through ASE.
 
-A custom generator is any function `generator(atoms) -> dict` returning ASE-`Vasp` kwargs (lowercased INCAR tags plus `kpts`/`gamma`/`setups`/`magmom`); point `input_generator` at it as `module:func` or `file.py:func`. The built-ins need `fairchem-data-omat` (`omat24_*`) or `fairchem-data-oc` (`oc20`) installed (see Installation above).
+A custom generator is any function `generator(atoms) -> dict` returning ASE-`Vasp` kwargs (lowercased INCAR tags plus `kpts`/`gamma`/`setups`/`magmom`); point `input_generator` at it as `module:func` or `file.py:func`. The `omat24_*`/`cheap_omat` built-ins need `fairchem-data-omat` and `oc20`/`cheap_oc20` need `fairchem-data-oc` installed (see Installation above); `oc22`/`cheap_oc22` are self-contained (the exact Meta OC22 settings are frozen inside SaddleMill, since the upstream `OC22_dataset` code is deprecated and today's pymatgen has drifted from what Meta ran).
+
+The `oc22` built-in reproduces the OC22 dataset's level of theory exactly (arXiv:2206.08917): PBE + Materials Project Hubbard U, spin-polarized with MP-default initial moments (magmoms already on the atoms win), ENCUT 500, Γ-centered `ceil(30/a) × ceil(30/b) × 1` meshes, 2022-era MPRelaxSet POTCAR setups, and dipole correction only when the structure has tag=2 adsorbate atoms (Meta applied it to adsorbate+slabs only). Meta used the PBE 5.4 POTCAR library — add `pp_version = 54` in `[Vasp]` if your `$VASP_PP_PATH` has versioned `potpaw_PBE.54` folders. The `cheap_oc20`/`cheap_oc22` variants follow the `cheap_omat` recipe: the in-plane k-point multiplier is halved (40→20 / 30→15) and POTCARs are lightened (`minimal` base, soft `_s` O/C/N, f-in-core lanthanides kept) so ENCUT can drop to ~300 via `[Vasp]` — spin, U and the functional are untouched, so the cheap pass stays on the same PES; reconverge with the exact preset afterwards.
 
 ### Extra input files (`extra_input_files`), e.g. VTST MODECAR
 

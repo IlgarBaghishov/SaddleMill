@@ -37,7 +37,8 @@ def custom_gen_file(tmp_path):
 
 class TestLoadInputGenerator:
     def test_builtin_names_resolve_to_callables(self):
-        for name in ("omat24_static", "omat24_relax", "cheap_omat", "oc20"):
+        for name in ("omat24_static", "omat24_relax", "cheap_omat", "oc20",
+                     "cheap_oc20", "oc22", "cheap_oc22"):
             gen = load_input_generator(name)
             assert callable(gen)
 
@@ -184,6 +185,121 @@ def test_oc20_translation():
     assert kw["kpts"][2] == 1            # surface: single k-point along vacuum axis
     assert kw["gga"] == "RP"             # RPBE
     assert kw.get("setups") == "minimal"
+
+
+def test_cheap_oc20():
+    """cheap_oc20 = OC20 with the k-point multiplier halved (40 -> 20) + soft
+    _s O/C/N on the minimal base; everything else (RPBE, ENCUT 350) untouched."""
+    pytest.importorskip("fairchem.data.oc")
+    from ase.build import fcc111
+    slab = fcc111("Cu", size=(2, 2, 3), vacuum=8.0)
+    cheap = load_input_generator("cheap_oc20")(slab)
+    full = load_input_generator("oc20")(slab)
+
+    assert np.prod(cheap["kpts"]) < np.prod(full["kpts"])   # lighter in-plane mesh
+    assert cheap["kpts"][2] == 1
+    assert cheap["setups"] == {"base": "minimal", "O": "_s", "C": "_s", "N": "_s"}
+    assert cheap["gga"] == "RP" and cheap["encut"] == full["encut"]  # physics untouched
+    assert _DRIVER_KEYS.isdisjoint(cheap)
+
+
+# --- OC22 (exact Meta settings, hardcoded -- no pymatgen/fairchem needed) ----
+
+def _oc22_adslab(with_adsorbate=True, magmoms=None):
+    """Small Fe-oxide slab; tag=2 marks the OH adsorbate (the OC convention)."""
+    slab = Atoms("Fe4O4",
+                 positions=[(x * 2.0, y * 2.0, 8.0) for x in range(2) for y in range(2)]
+                 + [(x * 2.0 + 1.0, y * 2.0 + 1.0, 9.5) for x in range(2) for y in range(2)],
+                 cell=[8.7, 8.7, 30.0], pbc=True)
+    slab.set_tags([1] * 4 + [0] * 4)
+    if with_adsorbate:
+        ads = Atoms("OH", positions=[(2.0, 2.0, 11.0), (2.0, 2.0, 12.0)])
+        tags = list(slab.get_tags()) + [2, 2]
+        slab = slab + ads
+        slab.set_tags(tags)
+    if magmoms is not None:
+        slab.set_initial_magnetic_moments(magmoms)
+    return slab
+
+
+def test_oc22_exact_settings():
+    slab = _oc22_adslab()
+    kw = load_input_generator("oc22")(slab)
+
+    assert _DRIVER_KEYS.isdisjoint(kw)
+    # Level of theory: PBE, spin-polarized, ENCUT 500, EDIFF 1e-4.
+    assert kw["gga"] == "PE" and kw["ispin"] == 2
+    assert kw["encut"] == 500.0 and kw["ediff"] == 1e-4
+    assert kw["ismear"] == 0 and kw["sigma"] == 0.05
+    assert kw["algo"] == "Fast" and kw["prec"] == "Accurate"
+    assert kw["lreal"] is False and kw["lasph"] is True
+    assert kw["nelm"] == 60 and kw["nelmin"] == 8
+    # Gamma-centered ceil(30/a) x ceil(30/b) x 1: ceil(30/8.7) = 4.
+    assert kw["kpts"] == (4, 4, 1) and kw["gamma"] is True
+    # MP Hubbard U on Fe (element-keyed, so ASE's re-sort can't misassign it).
+    assert kw["ldau"] is True and kw["ldautype"] == 2
+    assert kw["ldau_luj"] == {"Fe": {"L": 2, "U": 5.3, "J": 0.0}}
+    assert kw["lmaxmix"] == 4                       # d-block present
+    # MP default moments: ferromagnetic Fe (5), 0.6 elsewhere, atoms order.
+    assert kw["magmom"] == [5] * 4 + [0.6] * 6
+    # 2022 MPRelaxSet POTCAR mapping (suffixed elements only; O stays bare).
+    assert kw["setups"] == {"Fe": "_pv"}
+    # No pymatgen-era-drift keys.
+    assert "enaug" not in kw
+
+
+def test_oc22_dipole_only_with_tag2_adsorbate():
+    with_ads = load_input_generator("oc22")(_oc22_adslab(True))
+    clean = load_input_generator("oc22")(_oc22_adslab(False))
+
+    assert with_ads["ldipol"] is True and with_ads["idipol"] == 3
+    assert len(with_ads["dipol"]) == 3              # mass-weighted COM, fractional
+    assert all(k not in clean for k in ("ldipol", "idipol", "dipol"))
+
+
+def test_oc22_no_u_without_u_element_or_anion():
+    # Ti has no MP U value -> oxide still gets no LDAU tags at all.
+    tio = Atoms("TiO2", positions=[(0, 0, 0), (1.5, 1.5, 1.5), (3, 3, 3)],
+                cell=[6, 6, 30], pbc=True)
+    kw = load_input_generator("oc22")(tio)
+    assert not any(k.startswith("ldau") for k in kw)
+    assert kw["lmaxmix"] == 4                       # LMAXMIX rule is U-independent
+
+    # Fe without O/F (most electronegative element is not O/F) -> no U either.
+    fe = Atoms("Fe2", positions=[(0, 0, 0), (2, 0, 0)], cell=[8, 8, 30], pbc=True)
+    assert not any(k.startswith("ldau") for k in load_input_generator("oc22")(fe))
+
+
+def test_oc22_atoms_magmoms_win():
+    # Structures carrying initial moments keep them (ASE writes MAGMOM itself).
+    slab = _oc22_adslab(magmoms=[2.0] * 10)
+    assert "magmom" not in load_input_generator("oc22")(slab)
+
+
+def test_cheap_oc22():
+    """cheap_oc22 = OC22 with k-product halved (30 -> 15) + minimal-base light
+    POTCARs (soft O/C/N); spin, U and all electronic knobs untouched."""
+    slab = _oc22_adslab()
+    cheap = load_input_generator("cheap_oc22")(slab)
+    full = load_input_generator("oc22")(slab)
+
+    assert np.prod(cheap["kpts"]) < np.prod(full["kpts"])
+    assert cheap["setups"] == {"base": "minimal", "O": "_s", "C": "_s", "N": "_s"}
+    assert cheap["ispin"] == 2 and cheap["ldau_luj"] == full["ldau_luj"]  # same PES
+    assert cheap["encut"] == full["encut"]          # electronics left to [Vasp]
+
+
+def test_cheap_oc22_lanthanide_fcore():
+    """cheap_oc22 keeps OC22's f-in-core lanthanide POTCARs (_3, Yb _2); the
+    minimal base would otherwise pick f-in-valence ones that don't converge."""
+    atoms = Atoms("YbNdO", positions=[(0, 0, 0), (3, 0, 0), (6, 0, 0)],
+                  cell=[12, 8, 30], pbc=True)
+    cheap = load_input_generator("cheap_oc22")(atoms)
+    full = load_input_generator("oc22")(atoms)
+
+    assert cheap["setups"]["Nd"] == "_3" == full["setups"]["Nd"]
+    assert cheap["setups"]["Yb"] == "_2" == full["setups"]["Yb"]  # OC22-era choice
+    assert cheap["setups"]["base"] == "minimal"
 
 
 # --- extra_input_files / MODECAR -------------------------------------------

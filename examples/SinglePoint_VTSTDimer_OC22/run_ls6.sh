@@ -1,0 +1,27 @@
+#!/bin/bash
+##SBATCH -N 64
+##SBATCH --ntasks-per-node=128
+##SBATCH -p normal
+##SBATCH -t 48:00:00
+#SBATCH -N 2
+#SBATCH --ntasks-per-node=128
+#SBATCH -p development
+#SBATCH -t 02:00:00
+#SBATCH -A YOUR_ALLOCATION
+#SBATCH -J sp_vtstdimer_oc22
+
+pwd; hostname -f; date
+
+CONDA_BASE=$(dirname $(dirname $CONDA_EXE))
+source $CONDA_BASE/etc/profile.d/conda.sh
+conda activate saddlemill
+
+ml unload xalt python3
+ml load impi cuda/12.8
+
+export VASP_PP_PATH=/home1/07700/sjung3/vasp
+export PATH=/home1/07700/sjung3/vasp/vasp.6.6.0_dposmax/bin:$PATH
+which vasp_std
+srun -N $SLURM_NNODES -n $SLURM_NNODES --mpi=pmi2 flux start python -u -m saddlemill
+
+date

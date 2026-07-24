@@ -97,7 +97,7 @@ class ConfigManager:
         # SaddleMill-side VASP-input orchestration (the [Vasp] section itself is a
         # pure pass-through to ASE's Vasp calculator and never holds our keys).
         "ourVasp": {
-            "input_generator": None,    # built-in (omat24_static|omat24_relax|cheap_omat|oc20) | module:func | file.py:func
+            "input_generator": None,    # built-in (omat24_static|omat24_relax|cheap_omat|oc20|cheap_oc20|oc22|cheap_oc22) | module:func | file.py:func
             "extra_input_files": None,  # built-in (modecar) | module:func | file.py:func | space-separated list
             "extra_outputs": None,      # built-in (vtst_dimer) | module:func | file.py:func | space-separated list
         },
