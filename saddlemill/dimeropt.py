@@ -13,7 +13,7 @@ from ase.calculators.singlepoint import SinglePointCalculator
 from saddlemill.dimertools.structure_edit import get_attempts
 from saddlemill.tools import (backup_flux_logs, get_task_name, resolve_vasp_calc,
                               remove_vasp_heavies, finalize_if_vasp_interactive,
-                              archive_and_clear_temp_files)
+                              archive_and_clear_temp_files, csv_safe_status)
 
 
 class StopRun(Exception):
@@ -110,7 +110,7 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
 
     def log_status(attempt, slctd_indx, status_msg, n_force_calls=0):
         with open(status_file, 'a') as f:
-            f.write(f'{i},{rank},{attempt},{slctd_indx},{n_force_calls},"{status_msg}"\n')
+            f.write(f'{i},{rank},{attempt},{slctd_indx},{n_force_calls},"{csv_safe_status(status_msg)}"\n')
 
     # --- MAIN LOOP ---
     any_attempt_succeeded = False

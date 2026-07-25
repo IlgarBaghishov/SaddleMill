@@ -8,7 +8,7 @@ from ase.calculators.singlepoint import SinglePointCalculator
 from saddlemill.tools import (check_reaction, check_adsorbate_reaction, backup_flux_logs,
                               get_task_name, resolve_vasp_calc, remove_vasp_heavies,
                               finalize_if_vasp_interactive, archive_and_clear_temp_files,
-                              vasp_final_scf_converged)
+                              vasp_final_scf_converged, csv_safe_status)
 from saddlemill.dimeropt import _refine_eigenmode
 
 
@@ -45,7 +45,7 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
 
     def log_status(status_msg):
         with open(status_file, 'a') as f:
-            f.write(f'{i},{rank},"{status_msg}"\n')
+            f.write(f'{i},{rank},"{csv_safe_status(status_msg)}"\n')
 
     # --- MAIN LOOP ---
     with Trajectory(my_output_file, 'a') as writer:
@@ -125,7 +125,7 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
 
     def log_status(side_id, parent_source_idx, status_msg, n_force_calls=0):
         with open(status_file, 'a') as f:
-            f.write(f'{i},{rank},{side_id},{parent_source_idx},{n_force_calls},"{status_msg}"\n')
+            f.write(f'{i},{rank},{side_id},{parent_source_idx},{n_force_calls},"{csv_safe_status(status_msg)}"\n')
 
     # 3. Initialize list to track temp files from BOTH optimizations
     temp_files = []
@@ -354,7 +354,7 @@ def singlepoint(i, config_dict, atoms, calc, consecutive_errors=None,
 
     def log_status(status_msg):
         with open(status_file, 'a') as f:
-            f.write(f'{i},{rank},"{status_msg}"\n')
+            f.write(f'{i},{rank},"{csv_safe_status(status_msg)}"\n')
 
     vasp_calc = None
     vasp_dir = f"VASP_{i}" if is_vasp else None

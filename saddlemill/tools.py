@@ -61,6 +61,21 @@ def passes_input_filter(images, config_dict):
     return any(fnmatch.fnmatchcase(status or '', p) for p in patterns)
 
 
+def csv_safe_status(status_msg):
+    """Collapse a status message to a single CSV-safe field value.
+
+    Status lines are written by hand as ``...,"{status_msg}"`` (not via
+    ``csv.writer``). A multi-line or quote-bearing message — e.g. a VASP/MPI
+    crash dump captured as an error status — would otherwise spill across
+    physical lines and break ``csv``-based parsing in ``read_status_csv_rows``.
+    Collapsing every whitespace run (including newlines) to a single space and
+    replacing embedded double-quotes keeps the value on one line inside its
+    surrounding quotes. Normal single-word statuses (``converged`` etc.) are
+    returned unchanged.
+    """
+    return " ".join(str(status_msg).split()).replace('"', "'")
+
+
 def get_task_name(config_dict):
     """Return [FAIRChemCalculator] task_name if FAIRChem is the calculator, else None."""
     if config_dict["Main"]["Calculator"] == "FAIRChemCalculator":

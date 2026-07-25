@@ -16,7 +16,7 @@ from saddlemill.catsunami.ocpneb import OCPNEB, _find_segment_ci
 from saddlemill.dimeropt import _setup_dimer
 from saddlemill.tools import (backup_flux_logs, get_task_name, remove_vasp_heavies,
                               finalize_if_vasp_interactive, vasp_incar_kwargs,
-                              resolve_vasp_calc_class)
+                              resolve_vasp_calc_class, csv_safe_status)
 
 
 def _expand_band(neb, fmax_threshold, max_num_frames, num_frames, calc):
@@ -214,7 +214,7 @@ def nebopt(i, config_dict, images, calc, Optimizer, consecutive_errors=None, exe
 
     def log_status(status_msg, sub_band_id=0):
         with open(status_file, 'a') as f:
-            f.write(f'{i},{rank},{sub_band_id},"{status_msg}"\n')
+            f.write(f'{i},{rank},{sub_band_id},"{csv_safe_status(status_msg)}"\n')
 
     perform_aseidpp = False
     num_images = len(images)

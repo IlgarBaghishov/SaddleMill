@@ -23,7 +23,9 @@ from saddlemill.config import (
     load_method,
     load_optimizer,
     _load_optimizer,
+    read_status_csv_rows,
 )
+from saddlemill.tools import csv_safe_status
 from tests.conftest import make_config_dict
 
 
@@ -816,3 +818,67 @@ class TestArchiveAndClean:
         cleaned = archive_and_clean_csvs(config, [0], {"converged"})
         assert not csv_path.exists()
         assert 0 in cleaned
+
+
+class TestCsvSafeStatus:
+    """csv_safe_status() keeps a status message on one CSV-safe line."""
+
+    def test_normal_status_unchanged(self):
+        # Backwards compatibility: ordinary statuses are byte-identical.
+        for s in ("converged", "not_converged", "converged_CI",
+                  "error: scf_not_converged"):
+            assert csv_safe_status(s) == s
+
+    def test_newlines_collapsed(self):
+        assert "\n" not in csv_safe_status("a\nb\r\nc")
+        assert csv_safe_status("a\nb\r\nc") == "a b c"
+
+    def test_embedded_quotes_replaced(self):
+        assert '"' not in csv_safe_status('process "name" killed')
+
+    def test_round_trips_as_single_field(self):
+        """A multi-line, quote-bearing error written with the real writer
+        format parses back as exactly one row with an integer job_id."""
+        import csv as _csv
+        import io
+        msg = ('error: vasp returned an error: 1 stderr 1\n'
+               'forrtl: error (78): process killed (SIGTERM)\n'
+               'Process "name": [prterun] Exit code: 1\n'
+               '----------------------------------------')
+        line = f'7,3,"{csv_safe_status(msg)}"\n'  # exact SinglePoint writer format
+        rows = [r for r in _csv.reader(io.StringIO(line)) if r]
+        assert len(rows) == 1
+        assert int(rows[0][0]) == 7 and rows[0][1] == "3"
+        assert "\n" not in rows[0][2] and '"' not in rows[0][2]
+
+
+class TestReadStatusCsvRobustness:
+    """read_status_csv_rows() tolerates legacy multi-line-error spillover."""
+
+    def _write(self, tmp_path, method, raw):
+        d = tmp_path / f"{method}_status_csvs"
+        d.mkdir()
+        (d / "status_rank_0.csv").write_text(raw)
+
+    def test_wellformed_rows_all_returned(self, tmp_path):
+        method = "SinglePoint"
+        self._write(tmp_path, method,
+                    '0,0,"converged"\n1,0,"not_converged"\n2,0,"converged"\n')
+        rows = read_status_csv_rows(method, str(tmp_path))
+        assert len(rows) == 3
+        assert [int(r[0]) for r in rows] == [0, 1, 2]
+
+    def test_skips_spillover_fragments(self, tmp_path, capsys):
+        """Garbage continuation lines (non-integer first field), exactly as a
+        pre-fix crash dump left them, are dropped without raising."""
+        method = "SinglePoint"
+        raw = (
+            '0,0,"converged"\n'
+            'terminated by signals sent by prterun (as reported here).\n'  # spillover
+            '----------------------------------------------------------\n'  # spillover
+            '1,0,"not_converged"\n'
+        )
+        self._write(tmp_path, method, raw)
+        rows = read_status_csv_rows(method, str(tmp_path))  # must not raise
+        assert [int(r[0]) for r in rows] == [0, 1]
+        assert "skipped 2 malformed" in capsys.readouterr().out

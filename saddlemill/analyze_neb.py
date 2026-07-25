@@ -290,19 +290,31 @@ def extract_job_files(rank, job_id, temp_dir):
 def load_status_csv():
     """Load all CSV status files and identify not-converged jobs."""
     jobs = {}  # (rank, job_id) -> {subband_id: status}
+    skipped = 0
     for csv_path in sorted(glob.glob(os.path.join(STATUS_CSV_DIR, "status_rank_*.csv"))):
         with open(csv_path) as f:
             for row in csv.reader(f):
                 if len(row) < 4:
                     continue
-                job_id = int(row[0])
-                rank = int(row[1])
-                subband_id = int(row[2])
+                # Same guard as config.read_status_csv_rows(): a legacy
+                # multi-line error message spilled across physical lines, and a
+                # fragment carrying >=4 commas survives the length check above.
+                # Every real NEB row starts with three integers.
+                try:
+                    job_id = int(row[0])
+                    rank = int(row[1])
+                    subband_id = int(row[2])
+                except ValueError:
+                    skipped += 1
+                    continue
                 status = row[3].strip().strip('"')
                 key = (rank, job_id)
                 if key not in jobs:
                     jobs[key] = {}
                 jobs[key][subband_id] = status
+    if skipped:
+        print(f"Warning: skipped {skipped} malformed status row(s) in "
+              f"{STATUS_CSV_DIR} (legacy multi-line error-message spillover).")
 
     selected = {}
     for key, subbands in jobs.items():

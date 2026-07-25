@@ -451,14 +451,32 @@ def create_results_directories(config_dict):
 
 
 def read_status_csv_rows(method_name, directory="."):
-    """Read all status CSV rows. Returns list of lists of strings (one per row)."""
+    """Read all status CSV rows. Returns list of lists of strings (one per row).
+
+    Rows whose first field is not an integer job_id are skipped: they are
+    fragments of a malformed multi-line status field (a legacy VASP/MPI crash
+    dump that spilled across physical lines before status messages were
+    sanitized on write). Every well-formed status line begins with the integer
+    job index, so this discards only the spillover and never a real entry. A
+    warning is printed if any rows are skipped.
+    """
     csv_dir = os.path.join(directory, f"{method_name}_status_csvs")
     rows = []
+    skipped = 0
     for csv_path in sorted(glob.glob(os.path.join(csv_dir, "status_rank_*.csv"))):
         with open(csv_path) as fh:
             for row in csv.reader(fh):
-                if row:
-                    rows.append(row)
+                if not row:
+                    continue
+                try:
+                    int(row[0])
+                except ValueError:
+                    skipped += 1
+                    continue
+                rows.append(row)
+    if skipped:
+        print(f"Warning: skipped {skipped} malformed status row(s) in "
+              f"{csv_dir} (legacy multi-line error-message spillover).")
     return rows
 
 
