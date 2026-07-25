@@ -3,12 +3,17 @@ SaddleMill itself).
 
 VASP's VTST dimer requires the ``DROTMAX`` INCAR tag to be an *integer*; a
 decimal form such as ``10.000000`` is silently rejected and VASP falls back to
-its default (``RotMax 4``). ASE historically filed ``drotmax`` under
+its default (``RotMax 4``). ASE **<= 3.28** filed ``drotmax`` under
 ``float_keys``, so its ``write_incar`` formatted it with ``FLOAT_FORMAT``
-(``'5.6f'``) and emitted ``DROTMAX = 10.000000`` even when handed an ``int``.
-The linked ASE must instead classify ``drotmax`` as an integer key so that a
-config value of ``drotmax = 10`` (which SaddleMill's ConfigManager infers as a
-Python ``int``) is written as ``DROTMAX = 10``.
+(``'5.6f'``) and emitted ``DROTMAX = 10.000000`` even when handed an ``int``;
+that release line needed a manual patch. ASE **3.29.0** fixed this upstream, and
+the ``pyproject.toml`` pin (``ase>=3.29.0``) now enforces it.
+
+This test is kept as a guard on the *linked* ASE rather than on SaddleMill: it
+asserts the property directly, so it still fails loudly if an environment is
+resolved or downgraded to a pre-3.29 ASE, where a config value of
+``drotmax = 10`` (which SaddleMill's ConfigManager infers as a Python ``int``)
+would silently be written as ``DROTMAX = 10.000000``.
 
 This test only generates and parses INCAR text — it never runs VASP and needs
 no POTCARs.

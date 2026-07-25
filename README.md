@@ -131,7 +131,7 @@ conda create --prefix $WORK/conda_libraries/saddlemill --clone executorlib
 
 pip config set global.cache-dir "/path/to/your/cache/directory"  # like $SCRATCH/.cache/pip
 
-pip install "fairchem-core>=2.19.0" "ase>=3.26.0" scipy==1.16
+pip install "fairchem-core>=2.19.0" "ase>=3.29.0" scipy==1.16
 # If you want Vasp inpute files to be created like in omat/oc20:
 pip install fairchem-data-omat
 # If you will need some of the catsunami functionality or create Vasp input files for oc20
@@ -144,12 +144,12 @@ pip install "torch==2.9.0+cu128" --index-url https://download.pytorch.org/whl/cu
 
 ```
 
-**VTST + VASP (manual ASE patch required for now):** ASE ≤ 3.28 writes the integer INCAR tag `DROTMAX` as a float (`10.000000`), which VASP's VTST dimer silently ignores (falls back to `RotMax 4`). Until fixed upstream, patch the installed ASE — in `ase/calculators/vasp/create_input.py`, move `'drotmax'` from `float_keys` to `int_keys`. The `ase` version pin will be bumped to the fixed release once available. (Guarded by `tests/test_ase_vasp_incar.py`.)
+**VTST + VASP (needs `ase>=3.29.0`):** ASE ≤ 3.28 wrote the integer INCAR tag `DROTMAX` as a float (`10.000000`), which VASP's VTST dimer silently ignores (falls back to `RotMax 4`), and had to be patched by hand. ASE 3.29.0 fixed this upstream — `drotmax` is now an integer key — so the pin is `>=3.29.0` and no patch is needed. If you are stuck on an older ASE, move `'drotmax'` from `float_keys` to `int_keys` in `ase/calculators/vasp/create_input.py`. (Guarded by `tests/test_ase_vasp_incar.py`.)
 
 **In-house CPU cluster (VASP-only):** the `saddlemill` env is already the app env (no `--clone`); VASP needs no `fairchem-core`/`torch`. Install only:
 
 ```bash
-pip install "ase>=3.26.0" scipy==1.16 fairchem-data-omat fairchem-data-oc
+pip install "ase>=3.29.0" scipy==1.16 fairchem-data-omat fairchem-data-oc
 ```
 
 Add `fairchem-core>=2.19.0` only for the FAIRChem calculator or `.aselmdb` I/O.
