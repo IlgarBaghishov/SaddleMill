@@ -98,6 +98,8 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
 
     method_name = config_dict["Main"]["method"]
     status_file = f"{method_name}_status_csvs/status_rank_{rank}.csv"
+    rxn_file = f"{method_name}_rxn_csvs/rxn_rank_{rank}.csv"
+    os.makedirs(f"{method_name}_rxn_csvs", exist_ok=True)
     my_output_file = f"{method_name}_trajes/collected_ts_rank_{rank}.traj"
     zip_name = f"{method_name}_debug_zips/structure_rank_{rank}_data.zip"
     task_name = get_task_name(config_dict)
@@ -112,6 +114,9 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
     def log_status(attempt, slctd_indx, status_msg, n_force_calls=0):
         with open(status_file, 'a') as f:
             f.write(f'{i},{rank},{attempt},{slctd_indx},{n_force_calls},"{status_msg}"\n')
+    def log_rxn(attempt, reaction_type, converged, n_force_calls):
+        with open(rxn_file, 'a') as f:
+            f.write(f'{i},{attempt},{reaction_type},{int(converged)},{n_force_calls}\n')
 
     # --- MAIN LOOP ---
     any_attempt_succeeded = False
@@ -289,6 +294,8 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                                    enabled=config_dict['Main']['zip'])
 
                 log_status(attempt, slctd_indx, status, n_force_calls)
+                log_rxn(attempt, atoms.info['reaction_type'],
+                        atoms.info['converged'], atoms.info['n_force_calls'])
                 any_attempt_succeeded = True
 
             except Exception as e:
