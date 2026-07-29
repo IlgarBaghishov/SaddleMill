@@ -1,5 +1,10 @@
 import os
 import sys
+import csv
+import math
+import time
+import tempfile
+from collections import deque
 import traceback
 import random
 import zipfile
@@ -18,6 +23,307 @@ from saddlemill.tools import (backup_flux_logs, get_task_name, resolve_vasp_calc
 
 class StopRun(Exception):
     pass
+
+
+MODE_DIAGNOSTIC_FIELDS = [
+    "trace_id",
+    "trace_start_unix_ns",
+    "src_index",
+    "rank",
+    "attempt_id",
+    "selected_index",
+    "reaction_type",
+    "translation_step",
+    "force_calls",
+    "curvature",
+    "participation_ratio",
+    "angle_from_previous_deg",
+    "angle_from_initial_deg",
+    "pre_post_angle_w5_deg",
+    "pre_coherence_w5",
+    "post_coherence_w5",
+    "atom_participation_overlap_w5",
+    "pre_post_angle_w10_deg",
+    "pre_coherence_w10",
+    "post_coherence_w10",
+    "atom_participation_overlap_w10",
+]
+
+REACTION_DIAGNOSTIC_FIELDS = [
+    "src_index",
+    "rank",
+    "attempt_id",
+    "selected_index",
+    "configured_reaction_type",
+    "initial_reaction_type",
+    "final_reaction_type",
+    "converged",
+    "n_force_calls",
+    "status",
+    "classification_source",
+    "classification_confidence",
+]
+
+
+def _append_csv_row(path, fieldnames, row):
+    """Append one row and create a header only for a new/empty shard."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    is_new = not os.path.exists(path) or os.path.getsize(path) == 0
+    with open(path, "a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if is_new:
+            writer.writeheader()
+        writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+def _remove_csv_rows(path, match):
+    """Atomically remove prior diagnostic rows for one active attempt.
+
+    SaddleMill's normal resume cleanup does not know about these new diagnostic
+    CSVs. Removing only the matching diagnostic rows keeps them aligned with
+    the active status/output entry when an attempt is rerun.
+    """
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return
+
+    with open(path, newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames
+        if not fieldnames or not all(key in fieldnames for key in match):
+            return
+        rows = []
+        found = False
+        for row in reader:
+            is_match = all(
+                str(row.get(key, "")) == str(value)
+                for key, value in match.items()
+            )
+            if is_match:
+                found = True
+            else:
+                rows.append(row)
+
+    if not found:
+        return
+
+    directory = os.path.dirname(path) or "."
+    with tempfile.NamedTemporaryFile(
+        mode="w", newline="", dir=directory, delete=False
+    ) as handle:
+        temp_path = handle.name
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(temp_path, path)
+
+
+def _split_reaction_types(config_dict):
+    value = config_dict.get("ourDimer", {}).get("reaction_types", [])
+    if isinstance(value, str):
+        return value.split()
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    return []
+
+
+def _configured_attempt_reaction_types(config_dict):
+    """Return the configured base reaction type for each attempt index."""
+    reaction_types = _split_reaction_types(config_dict)
+    if "initial_guess" in reaction_types:
+        return ["initial_guess"]
+
+    counts_value = config_dict.get("ourDimer", {}).get(
+        "num_attempts_per_type", 1
+    )
+    if isinstance(counts_value, str):
+        parts = counts_value.split()
+        counts = [int(item) for item in parts] if len(parts) > 1 else [int(parts[0])]
+    elif isinstance(counts_value, (list, tuple)):
+        counts = [int(item) for item in counts_value]
+    else:
+        counts = [int(counts_value)]
+
+    if len(counts) == 1:
+        counts *= len(reaction_types)
+    if len(counts) != len(reaction_types):
+        return []
+
+    configured = []
+    for reaction_type, count in zip(reaction_types, counts):
+        configured.extend([reaction_type] * count)
+    return configured
+
+
+def _safe_float(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return ""
+    return value if np.isfinite(value) else ""
+
+
+def _normalize_mode(mode, free_indices):
+    arr = np.asarray(mode, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        raise ValueError(f"Expected eigenmode shape (N, 3), got {arr.shape}")
+    arr = arr[np.asarray(free_indices, dtype=int)]
+    norm = float(np.linalg.norm(arr))
+    if norm < 1e-14:
+        raise ValueError("Eigenmode norm over free atoms is approximately zero")
+    return arr / norm
+
+
+def _mode_angle_deg(mode_a, mode_b):
+    """Projective angle: mode and -mode are treated as identical."""
+    dot = float(np.vdot(mode_a.ravel(), mode_b.ravel()).real)
+    dot = float(np.clip(abs(dot), 0.0, 1.0))
+    return math.degrees(math.acos(dot))
+
+
+def _sign_align_modes(modes):
+    """Sequentially sign-align a mode sequence without changing directions."""
+    aligned = [np.array(modes[0], copy=True)]
+    for mode in modes[1:]:
+        candidate = np.array(mode, copy=True)
+        if np.vdot(aligned[-1].ravel(), candidate.ravel()).real < 0.0:
+            candidate *= -1.0
+        aligned.append(candidate)
+    return aligned
+
+
+def _window_mode_statistics(history, window):
+    history = list(history)
+    if len(history) < 2 * window:
+        return ("", "", "", "")
+
+    pre = _sign_align_modes(history[-2 * window:-window])
+    post = _sign_align_modes(history[-window:])
+
+    pre_sum = np.sum(pre, axis=0)
+    post_sum = np.sum(post, axis=0)
+    pre_norm = float(np.linalg.norm(pre_sum))
+    post_norm = float(np.linalg.norm(post_sum))
+    if pre_norm < 1e-14 or post_norm < 1e-14:
+        return ("", "", "", "")
+
+    pre_mean = pre_sum / pre_norm
+    post_mean = post_sum / post_norm
+    angle = _mode_angle_deg(pre_mean, post_mean)
+    pre_coherence = pre_norm / window
+    post_coherence = post_norm / window
+
+    pre_weights = np.mean(
+        [np.sum(mode * mode, axis=1) for mode in pre], axis=0
+    )
+    post_weights = np.mean(
+        [np.sum(mode * mode, axis=1) for mode in post], axis=0
+    )
+    pre_weights /= pre_weights.sum()
+    post_weights /= post_weights.sum()
+    atom_overlap = float(np.sum(np.sqrt(pre_weights * post_weights)))
+
+    return angle, pre_coherence, post_coherence, atom_overlap
+
+
+class ModeDiagnosticRecorder:
+    """Write one sign-invariant eigenmode diagnostic row per translation state.
+
+    ASE calls optimizer observers once at step 0 after the initial force/mode
+    evaluation, and then after every translation step. Therefore the first row
+    is the rotated mode at the initial displaced geometry, not the unrefined
+    random seed direction.
+    """
+
+    def __init__(self, path, src_index, rank, attempt_id, selected_index,
+                 reaction_type, d_atoms, dim_rlx, free_indices):
+        self.path = path
+        self.src_index = src_index
+        self.rank = rank
+        self.attempt_id = attempt_id
+        self.selected_index = selected_index
+        self.reaction_type = reaction_type
+        self.d_atoms = d_atoms
+        self.dim_rlx = dim_rlx
+        self.free_indices = list(free_indices)
+        self.trace_start_unix_ns = time.time_ns()
+        self.trace_id = (
+            f"{src_index}-{attempt_id}-{rank}-"
+            f"{os.getpid()}-{self.trace_start_unix_ns}"
+        )
+        self.history = deque(maxlen=20)
+        self.initial_mode = None
+        self.disabled = False
+        self.warned = False
+
+    def __call__(self):
+        if self.disabled:
+            return
+        try:
+            mode = _normalize_mode(
+                self.d_atoms.get_eigenmode(), self.free_indices
+            )
+            if self.initial_mode is None:
+                self.initial_mode = np.array(mode, copy=True)
+
+            previous_angle = (
+                _mode_angle_deg(self.history[-1], mode)
+                if self.history else 0.0
+            )
+            initial_angle = _mode_angle_deg(self.initial_mode, mode)
+            self.history.append(np.array(mode, copy=True))
+
+            atom_weights = np.sum(mode * mode, axis=1)
+            participation_ratio = 1.0 / (
+                len(atom_weights) * np.sum(atom_weights * atom_weights)
+            )
+            w5 = _window_mode_statistics(self.history, 5)
+            w10 = _window_mode_statistics(self.history, 10)
+
+            try:
+                curvature = self.d_atoms.get_curvature()
+            except Exception:
+                curvature = ""
+            try:
+                force_calls = self.d_atoms.control.get_counter("forcecalls")
+            except Exception:
+                force_calls = ""
+
+            _append_csv_row(
+                self.path,
+                MODE_DIAGNOSTIC_FIELDS,
+                {
+                    "trace_id": self.trace_id,
+                    "trace_start_unix_ns": self.trace_start_unix_ns,
+                    "src_index": self.src_index,
+                    "rank": self.rank,
+                    "attempt_id": self.attempt_id,
+                    "selected_index": self.selected_index,
+                    "reaction_type": self.reaction_type,
+                    "translation_step": self.dim_rlx.nsteps,
+                    "force_calls": force_calls,
+                    "curvature": _safe_float(curvature),
+                    "participation_ratio": participation_ratio,
+                    "angle_from_previous_deg": previous_angle,
+                    "angle_from_initial_deg": initial_angle,
+                    "pre_post_angle_w5_deg": w5[0],
+                    "pre_coherence_w5": w5[1],
+                    "post_coherence_w5": w5[2],
+                    "atom_participation_overlap_w5": w5[3],
+                    "pre_post_angle_w10_deg": w10[0],
+                    "pre_coherence_w10": w10[1],
+                    "post_coherence_w10": w10[2],
+                    "atom_participation_overlap_w10": w10[3],
+                },
+            )
+        except Exception as exc:
+            self.disabled = True
+            if not self.warned:
+                self.warned = True
+                print(
+                    f"Mode diagnostics disabled for structure {self.src_index}, "
+                    f"attempt {self.attempt_id}: {exc}",
+                    flush=True,
+                )
 
 
 def _setup_dimer(atoms, calc, eigenmode=None, displacement_dict=None,
@@ -97,9 +403,15 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
     np.random.seed(seed)
 
     method_name = config_dict["Main"]["method"]
-    status_file = f"{method_name}_status_csvs/status_rank_{rank}.csv"
+    status_dir = f"{method_name}_status_csvs"
+    status_file = f"{status_dir}/status_rank_{rank}.csv"
+    reaction_file = f"{status_dir}/reaction_rank_{rank}.csv"
+    # Preserve the existing compact reaction CSV for compatibility.
     rxn_file = f"{method_name}_rxn_csvs/rxn_rank_{rank}.csv"
+    mode_file = f"{method_name}_mode_csvs/mode_rank_{rank}.csv"
+    os.makedirs(status_dir, exist_ok=True)
     os.makedirs(f"{method_name}_rxn_csvs", exist_ok=True)
+    os.makedirs(f"{method_name}_mode_csvs", exist_ok=True)
     my_output_file = f"{method_name}_trajes/collected_ts_rank_{rank}.traj"
     zip_name = f"{method_name}_debug_zips/structure_rank_{rank}_data.zip"
     task_name = get_task_name(config_dict)
@@ -111,12 +423,42 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
         backup_flux_logs(rank)
         sys.exit(1)
 
+    configured_attempt_types = _configured_attempt_reaction_types(config_dict)
+
+    def configured_reaction_type(attempt):
+        if isinstance(attempt, int) and 0 <= attempt < len(configured_attempt_types):
+            return configured_attempt_types[attempt]
+        return "unknown"
+
     def log_status(attempt, slctd_indx, status_msg, n_force_calls=0):
         with open(status_file, 'a') as f:
             f.write(f'{i},{rank},{attempt},{slctd_indx},{n_force_calls},"{status_msg}"\n')
-    def log_rxn(attempt, reaction_type, converged, n_force_calls):
+
+    def log_rxn_legacy(attempt, reaction_type, converged, n_force_calls):
         with open(rxn_file, 'a') as f:
             f.write(f'{i},{attempt},{reaction_type},{int(converged)},{n_force_calls}\n')
+
+    def log_reaction(attempt, slctd_indx, configured_type, initial_type,
+                     final_type, converged, n_force_calls, status_msg,
+                     source="runtime_metadata", confidence="exact"):
+        _append_csv_row(
+            reaction_file,
+            REACTION_DIAGNOSTIC_FIELDS,
+            {
+                "src_index": i,
+                "rank": rank,
+                "attempt_id": attempt,
+                "selected_index": slctd_indx,
+                "configured_reaction_type": configured_type,
+                "initial_reaction_type": initial_type,
+                "final_reaction_type": final_type,
+                "converged": int(bool(converged)),
+                "n_force_calls": int(n_force_calls or 0),
+                "status": status_msg,
+                "classification_source": source,
+                "classification_confidence": confidence,
+            },
+        )
 
     # --- MAIN LOOP ---
     any_attempt_succeeded = False
@@ -144,14 +486,53 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
             if entries_to_run is not None and attempt not in entries_to_run:
                 continue
 
+            configured_type = configured_reaction_type(attempt)
+            initial_reaction_type = configured_type
+            reaction_source = "configured_attempt_order"
+
+            # Keep the new diagnostic shards aligned with the active result on
+            # resume/retry. Existing status/output cleanup remains unchanged.
+            diagnostic_key = {"src_index": i, "attempt_id": attempt}
+            # Reaction metadata is one active row per attempt. Mode traces are
+            # append-only and carry a unique trace_id, avoiding an expensive
+            # rewrite of a potentially large mode-history shard on resume.
+            _remove_csv_rows(reaction_file, diagnostic_key)
+
             if atoms is None:
-                log_status(attempt, -1, "error: failed to generate attempt")
+                status_msg = "error: failed to generate attempt"
+                log_status(attempt, -1, status_msg)
+                log_reaction(
+                    attempt, -1, configured_type, configured_type,
+                    configured_type, False, 0, status_msg,
+                    source="configured_attempt_order",
+                    confidence="base_type_only",
+                )
                 continue
 
-            # Use continuation structure if available for this attempt
+            initial_reaction_type = atoms.info.get(
+                "reaction_type",
+                atoms.info.get("orig_info", {}).get(
+                    "reaction_type", configured_type
+                ),
+            )
+            reaction_source = "generated_attempt_metadata"
+
+            # Use continuation structure if available for this attempt.
             if continuation_data and attempt in continuation_data:
                 atoms = continuation_data[attempt]
                 displacement_dict = {"displacement_vector": np.random.randn(len(atoms), 3) * 1e-10, "method": "vector"}
+                continuation_reaction_type = atoms.info.get(
+                    "reaction_type",
+                    atoms.info.get("orig_info", {}).get(
+                        "reaction_type", initial_reaction_type
+                    ),
+                )
+                # A previous desorption label is an outcome, not the attempt's
+                # initialization mechanism. Preserve the freshly generated
+                # mechanism in that case.
+                if continuation_reaction_type != "desorption":
+                    initial_reaction_type = continuation_reaction_type
+                reaction_source = "continuation_metadata"
 
             temp_log = f'dimer_control_{i}_{attempt}_{slctd_indx}.log'
             temp_opt_log = f'dimer_opt_{i}_{attempt}_{slctd_indx}.log'
@@ -162,6 +543,8 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
             if attempt_vasp_dir is not None:
                 temp_files.append(attempt_vasp_dir)
             attempt_calc = None
+            d_atoms = None
+            dim_rlx = None
 
             try:
                 # Handle constraints:
@@ -185,7 +568,7 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                     displacement_dict=displacement_dict,
                     dimer_control_kwargs=config_dict["DimerControl"],
                     control_logfile=temp_log,
-                    mode_logfile=temp_mode_log,                                       
+                    mode_logfile=temp_mode_log,
                     logfile=temp_opt_log, trajectory=temp_traj,
                     engine=config_dict["ourDimer"]["engine"],
                     kappa_kwargs={
@@ -194,6 +577,21 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                     },
                     kappa_control_kwargs=(config_dict.get("Kappa") or None),
                 )
+
+                # Diagnostic only: this observer never raises into the optimizer
+                # and does not trigger force evaluations or alter the mode.
+                mode_recorder = ModeDiagnosticRecorder(
+                    mode_file,
+                    src_index=i,
+                    rank=rank,
+                    attempt_id=attempt,
+                    selected_index=slctd_indx,
+                    reaction_type=initial_reaction_type,
+                    d_atoms=d_atoms,
+                    dim_rlx=dim_rlx,
+                    free_indices=free_indices,
+                )
+                dim_rlx.attach(mode_recorder, interval=1)
 
                 # PR Check — skip early steps to let the dimer rotate
                 # the eigenmode (initial displacement can look delocalized,
@@ -294,8 +692,22 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                                    enabled=config_dict['Main']['zip'])
 
                 log_status(attempt, slctd_indx, status, n_force_calls)
-                log_rxn(attempt, atoms.info['reaction_type'],
-                        atoms.info['converged'], atoms.info['n_force_calls'])
+                log_rxn_legacy(
+                    attempt, atoms.info['reaction_type'],
+                    atoms.info['converged'], atoms.info['n_force_calls']
+                )
+                log_reaction(
+                    attempt,
+                    slctd_indx,
+                    configured_type,
+                    initial_reaction_type,
+                    atoms.info['reaction_type'],
+                    atoms.info['converged'],
+                    atoms.info['n_force_calls'],
+                    status,
+                    source=reaction_source,
+                    confidence="exact",
+                )
                 any_attempt_succeeded = True
 
             except Exception as e:
@@ -305,7 +717,27 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                     finalize_if_vasp_interactive(config_dict, attempt_calc)
                 archive_and_clear_temp_files(temp_files, zip_name, prefix="ERROR_",
                                    enabled=config_dict['Main']['zip'])
-                log_status(attempt, slctd_indx, f"error: {str(e)}")
+                status_msg = f"error: {str(e)}"
+                try:
+                    error_force_calls = (
+                        d_atoms.control.get_counter('forcecalls')
+                        if d_atoms is not None else 0
+                    )
+                except Exception:
+                    error_force_calls = 0
+                log_status(attempt, slctd_indx, status_msg, error_force_calls)
+                log_reaction(
+                    attempt,
+                    slctd_indx,
+                    configured_type,
+                    initial_reaction_type,
+                    initial_reaction_type,
+                    False,
+                    error_force_calls,
+                    status_msg,
+                    source=reaction_source,
+                    confidence="exact" if reaction_source != "configured_attempt_order" else "base_type_only",
+                )
 
     # Track consecutive structure-level errors for worker health
     if consecutive_errors is not None:
