@@ -91,6 +91,8 @@ class ConfigManager:
             "extension_check_fmax": 0.4,
             "extension_check_curvature": -0.2,
             "engine": "ase",            # ase (stock ASE dimer) | kappa
+            "rotation_optimizer": "ase",    # ase | lbfgs
+            "translation_optimizer": "ase", # ase | lbfgs | hybrid
             "kappa_beta": 2.0,          # only used when engine = kappa
             "kappa_recover_fmax": 0.3,  # only used when engine = kappa
             "vasp_command": None,
@@ -100,6 +102,28 @@ class ConfigManager:
             "concentrate_power": 1.5,    # 1 = plain gaussian, 1.5 = gentle, 2 = your "squaring", 3+ = very peaked
             "concentrate_std": 0.2,      # sets total kick norm = std*sqrt(3*n_eligible); matches adsorbate_atom's std
 
+        },
+        "ourDimerLBFGS": {
+            # Inert unless an L-BFGS optimizer is explicitly selected.
+            "rotation_memory": 10,
+            "translation_memory": 10,
+            "rotation_initial_hessian": 1.0,
+            "translation_initial_hessian": 1.0,
+            "rotation_dynamic_h0": False,
+            "translation_dynamic_h0": False,
+            "translation_damping": 1.0,
+            "curvature_epsilon": 1.0e-12,
+            "reset_translation_on_regime_change": True,
+        },
+        "ourDimerHybrid": {
+            # Dormant unless translation_optimizer=hybrid and enabled=True.
+            "enabled": False,
+            "enter_fmax": 0.30,
+            "exit_fmax": 0.50,
+            "enter_curvature": -0.05,
+            "exit_curvature": 0.00,
+            "enter_stable_steps": 3,
+            "exit_stable_steps": 2,
         },
         # SaddleMill-side VASP-input orchestration (the [Vasp] section itself is a
         # pure pass-through to ASE's Vasp calculator and never holds our keys).
@@ -281,6 +305,71 @@ def load_method(config_dict):
         )
 
     calc_name = config_dict["Main"]["Calculator"]
+
+    # SaddleMill L-BFGS dimer validation
+    if method_name == "Dimer":
+        dimer_cfg = config_dict["ourDimer"]
+        rotation_optimizer = str(
+            dimer_cfg.get("rotation_optimizer", "ase")
+        ).lower()
+        translation_optimizer = str(
+            dimer_cfg.get("translation_optimizer", "ase")
+        ).lower()
+        if rotation_optimizer not in {"ase", "lbfgs"}:
+            raise ValueError(
+                "[ourDimer] rotation_optimizer must be ase or lbfgs; "
+                f"got {rotation_optimizer!r}."
+            )
+        if translation_optimizer not in {"ase", "lbfgs", "hybrid"}:
+            raise ValueError(
+                "[ourDimer] translation_optimizer must be ase, lbfgs, or "
+                f"hybrid; got {translation_optimizer!r}."
+            )
+
+        lbfgs_cfg = config_dict.get("ourDimerLBFGS", {}) or {}
+        for key in ("rotation_memory", "translation_memory"):
+            if int(lbfgs_cfg.get(key, 10)) < 1:
+                raise ValueError(f"[ourDimerLBFGS] {key} must be >= 1")
+        for key in (
+            "rotation_initial_hessian",
+            "translation_initial_hessian",
+            "translation_damping",
+        ):
+            if float(lbfgs_cfg.get(key, 1.0)) <= 0.0:
+                raise ValueError(f"[ourDimerLBFGS] {key} must be > 0")
+        if float(lbfgs_cfg.get("curvature_epsilon", 1.0e-12)) < 0.0:
+            raise ValueError(
+                "[ourDimerLBFGS] curvature_epsilon must be >= 0"
+            )
+
+        hybrid_cfg = config_dict.get("ourDimerHybrid", {}) or {}
+        if float(hybrid_cfg.get("exit_fmax", 0.50)) < float(
+            hybrid_cfg.get("enter_fmax", 0.30)
+        ):
+            raise ValueError(
+                "[ourDimerHybrid] exit_fmax must be >= enter_fmax"
+            )
+        if float(hybrid_cfg.get("exit_curvature", 0.0)) < float(
+            hybrid_cfg.get("enter_curvature", -0.05)
+        ):
+            raise ValueError(
+                "[ourDimerHybrid] exit_curvature must be >= "
+                "enter_curvature"
+            )
+        if int(hybrid_cfg.get("enter_stable_steps", 3)) < 1 or int(
+            hybrid_cfg.get("exit_stable_steps", 2)
+        ) < 1:
+            raise ValueError(
+                "[ourDimerHybrid] stable-step counts must be >= 1"
+            )
+        if translation_optimizer == "hybrid" and not bool(
+            hybrid_cfg.get("enabled", False)
+        ):
+            print(
+                "Note: translation_optimizer=hybrid but "
+                "[ourDimerHybrid] enabled=False; translation remains in "
+                "the ASE state."
+            )
     if method_name == "SinglePoint":
         if calc_name not in ("FAIRChemCalculator", "Vasp", "VaspInteractive"):
             raise NotImplementedError(
@@ -667,7 +756,7 @@ def archive_and_clean_csvs(config_dict, job_ids, categories_to_clean):
         return {}
     method_name = config_dict['Main']['method']
     status_dir = f"{method_name}_status_csvs"
-    csv_files = glob.glob(os.path.join(status_dir, "*.csv"))
+    csv_files = glob.glob(os.path.join(status_dir, "status_rank_*.csv"))
     if not csv_files:
         return {}
 

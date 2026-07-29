@@ -64,6 +64,50 @@ REACTION_DIAGNOSTIC_FIELDS = [
     "classification_confidence",
 ]
 
+OPTIMIZER_DIAGNOSTIC_FIELDS = [
+    "record_type",
+    "trace_id",
+    "trace_start_unix_ns",
+    "src_index",
+    "rank",
+    "attempt_id",
+    "selected_index",
+    "reaction_type",
+    "accepted_translation_step",
+    "translation_algorithm",
+    "hybrid_state",
+    "hybrid_switch_event",
+    "projected_fmax",
+    "curvature",
+    "translation_regime",
+    "step_norm",
+    "rotation_optimizer",
+    "rotation_steps",
+    "rotation_lbfgs_history_size",
+    "rotation_lbfgs_pairs_accepted",
+    "rotation_lbfgs_pairs_rejected",
+    "rotation_lbfgs_resets",
+    "rotation_lbfgs_fallbacks",
+    "kappa_rotation_optimizer",
+    "kappa_rotation_steps",
+    "kappa_rotation_lbfgs_pairs_accepted",
+    "kappa_rotation_lbfgs_pairs_rejected",
+    "translation_lbfgs_history_size",
+    "translation_lbfgs_pairs_accepted_total",
+    "translation_lbfgs_pairs_rejected_total",
+    "translation_lbfgs_resets",
+    "translation_lbfgs_last_reset_reason",
+    "force_calls_step_entry",
+    "force_calls_center_and_rotation",
+    "force_calls_translation_trial",
+    "force_calls_cumulative_after_step",
+    "final_force_calls",
+    "force_calls_final_evaluation",
+    "final_translation_steps",
+    "converged",
+    "status",
+]
+
 
 def _append_csv_row(path, fieldnames, row):
     """Append one row and create a header only for a new/empty shard."""
@@ -326,49 +370,160 @@ class ModeDiagnosticRecorder:
                 )
 
 
+
+class OptimizerDiagnosticRecorder:
+    """Write one row per accepted translation and one final summary row."""
+
+    def __init__(self, path, mode_recorder, d_atoms, dim_rlx):
+        self.path = path
+        self.mode_recorder = mode_recorder
+        self.d_atoms = d_atoms
+        self.dim_rlx = dim_rlx
+        self.last_serial = 0
+        self.last_cumulative_after_step = 0
+        self.summary_written = False
+
+    def _base_row(self):
+        recorder = self.mode_recorder
+        return {
+            "trace_id": recorder.trace_id,
+            "trace_start_unix_ns": recorder.trace_start_unix_ns,
+            "src_index": recorder.src_index,
+            "rank": recorder.rank,
+            "attempt_id": recorder.attempt_id,
+            "selected_index": recorder.selected_index,
+            "reaction_type": recorder.reaction_type,
+        }
+
+    def __call__(self):
+        diagnostics = getattr(self.dim_rlx, "last_step_diagnostics", None)
+        if not diagnostics:
+            return
+        serial = int(diagnostics.get("diagnostic_serial", 0))
+        if serial <= self.last_serial:
+            return
+        row = self._base_row()
+        row["record_type"] = "step"
+        row.update(diagnostics)
+        _append_csv_row(self.path, OPTIMIZER_DIAGNOSTIC_FIELDS, row)
+        self.last_serial = serial
+        try:
+            self.last_cumulative_after_step = int(
+                diagnostics.get("force_calls_cumulative_after_step", 0)
+            )
+        except (TypeError, ValueError):
+            self.last_cumulative_after_step = 0
+
+    def write_summary(self, status, converged):
+        if self.summary_written:
+            return
+        # Flush a last accepted step if the observer was interrupted by StopRun.
+        self()
+        row = self._base_row()
+        final_force_calls = self.d_atoms.control.get_counter("forcecalls")
+        row.update({
+            "record_type": "summary",
+            "final_force_calls": final_force_calls,
+            "force_calls_final_evaluation": (
+                int(final_force_calls) - self.last_cumulative_after_step
+            ),
+            "final_translation_steps": self.dim_rlx.nsteps,
+            "converged": int(bool(converged)),
+            "status": status,
+        })
+        _append_csv_row(self.path, OPTIMIZER_DIAGNOSTIC_FIELDS, row)
+        self.summary_written = True
+
+
 def _setup_dimer(atoms, calc, eigenmode=None, displacement_dict=None,
                  dimer_control_kwargs=None, control_logfile=None,
-                 mode_logfile=None,
-                 logfile=None, trajectory=None,
-                 engine="ase", kappa_kwargs=None, kappa_control_kwargs=None):
-    """Create MinModeAtoms and MinModeTranslate optimizer for dimer method.
+                 mode_logfile=None, logfile=None, trajectory=None,
+                 engine="ase", kappa_kwargs=None, kappa_control_kwargs=None,
+                 rotation_optimizer="ase", translation_optimizer="ase",
+                 rotation_lbfgs_options=None,
+                 translation_lbfgs_options=None, hybrid_options=None):
+    """Create the selected dimer engine, rotation solver, and translator.
 
-    Does not run the optimization. Caller attaches callbacks and calls
-    dim_rlx.run().
-
-    Returns (d_atoms, dim_rlx).
-
-    kappa_kwargs: KappaMinModeAtoms knobs (beta, recover_fmax).
-    kappa_control_kwargs: DimerControl kwargs for the Phase-B (kappa) rotation;
-        None -> KappaMinModeAtoms builds its own tuned default.    
-    beta - how abrupt changes in kappa change the force.
-    recover_fmax - what fmax to switch back to normal dimer. 
+    The default ``ase/ase/ase`` combination preserves the stock scientific
+    method.  L-BFGS and hybrid behavior is opt-in through [ourDimer].
     """
+    from saddlemill.dimertools.lbfgs_dimer import (
+        ConfigurableRotationMinModeAtoms,
+        DiagnosticMinModeTranslate,
+        HybridMinModeTranslate,
+        LBFGSMinModeTranslate,
+    )
 
     atoms.calc = calc
-    eig_kw = {'eigenmodes': [np.array(eigenmode)]} if eigenmode is not None else {}
+    eig_kw = {"eigenmodes": [np.array(eigenmode)]} if eigenmode is not None else {}
+    rotation_optimizer = str(rotation_optimizer).lower()
+    translation_optimizer = str(translation_optimizer).lower()
 
     if engine == "kappa":
-        from saddlemill.dimertools.kappa_dimer import KappaMinModeAtoms, IsolatedDimerControl
+        from saddlemill.dimertools.kappa_dimer import (
+            KappaMinModeAtoms, IsolatedDimerControl
+        )
 
-        d_control = IsolatedDimerControl(logfile=control_logfile, eigenmode_logfile=mode_logfile, **(dimer_control_kwargs or {}))
+        d_control = IsolatedDimerControl(
+            logfile=control_logfile,
+            eigenmode_logfile=mode_logfile,
+            **(dimer_control_kwargs or {}),
+        )
         kw = dict(kappa_kwargs or {})
+        kw.update({
+            "rotation_optimizer": rotation_optimizer,
+            "rotation_lbfgs_options": rotation_lbfgs_options or {},
+        })
         if kappa_control_kwargs:
-            kw["kappa_control"] = IsolatedDimerControl(logfile=control_logfile, **kappa_control_kwargs)
-
+            kw["kappa_control"] = IsolatedDimerControl(
+                logfile=control_logfile, **kappa_control_kwargs
+            )
         d_atoms = KappaMinModeAtoms(atoms, control=d_control, **eig_kw, **kw)
     elif engine == "ase":
-        d_control = DimerControl(logfile=control_logfile, **(dimer_control_kwargs or {}))
-        d_atoms = MinModeAtoms(atoms, d_control, **eig_kw)
+        d_control = DimerControl(
+            logfile=control_logfile,
+            eigenmode_logfile=mode_logfile,
+            **(dimer_control_kwargs or {}),
+        )
+        d_atoms = ConfigurableRotationMinModeAtoms(
+            atoms,
+            control=d_control,
+            rotation_optimizer=rotation_optimizer,
+            rotation_lbfgs_options=rotation_lbfgs_options or {},
+            **eig_kw,
+        )
     else:
-        raise ValueError(f"Unknown [ourDimer] engine={engine!r}; expected 'ase' or 'kappa'.")
+        raise ValueError(
+            f"Unknown [ourDimer] engine={engine!r}; expected 'ase' or 'kappa'."
+        )
 
     if displacement_dict:
         d_atoms.displace(**displacement_dict)
     else:
-        d_atoms.displace(displacement_vector=np.random.randn(len(atoms), 3) * 1e-10,
-                         method='vector')
-    dim_rlx = MinModeTranslate(d_atoms, trajectory=trajectory, logfile=logfile)
+        d_atoms.displace(
+            displacement_vector=np.random.randn(len(atoms), 3) * 1e-10,
+            method="vector",
+        )
+
+    common = dict(trajectory=trajectory, logfile=logfile)
+    if translation_optimizer == "ase":
+        dim_rlx = DiagnosticMinModeTranslate(d_atoms, **common)
+    elif translation_optimizer == "lbfgs":
+        dim_rlx = LBFGSMinModeTranslate(
+            d_atoms, lbfgs_options=translation_lbfgs_options or {}, **common
+        )
+    elif translation_optimizer == "hybrid":
+        dim_rlx = HybridMinModeTranslate(
+            d_atoms,
+            lbfgs_options=translation_lbfgs_options or {},
+            hybrid_options=hybrid_options or {},
+            **common,
+        )
+    else:
+        raise ValueError(
+            "[ourDimer] translation_optimizer must be ase, lbfgs, or hybrid; "
+            f"got {translation_optimizer!r}."
+        )
     return d_atoms, dim_rlx
 
 def _refine_eigenmode(atoms, calc, eigenmode, dimer_control_kwargs=None,
@@ -409,9 +564,11 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
     # Preserve the existing compact reaction CSV for compatibility.
     rxn_file = f"{method_name}_rxn_csvs/rxn_rank_{rank}.csv"
     mode_file = f"{method_name}_mode_csvs/mode_rank_{rank}.csv"
+    optimizer_file = f"{method_name}_optimizer_csvs/optimizer_rank_{rank}.csv"
     os.makedirs(status_dir, exist_ok=True)
     os.makedirs(f"{method_name}_rxn_csvs", exist_ok=True)
     os.makedirs(f"{method_name}_mode_csvs", exist_ok=True)
+    os.makedirs(f"{method_name}_optimizer_csvs", exist_ok=True)
     my_output_file = f"{method_name}_trajes/collected_ts_rank_{rank}.traj"
     zip_name = f"{method_name}_debug_zips/structure_rank_{rank}_data.zip"
     task_name = get_task_name(config_dict)
@@ -424,6 +581,48 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
         sys.exit(1)
 
     configured_attempt_types = _configured_attempt_reaction_types(config_dict)
+
+    lbfgs_cfg = config_dict.get("ourDimerLBFGS", {}) or {}
+    rotation_lbfgs_options = {
+        "memory": int(lbfgs_cfg.get("rotation_memory", 10)),
+        "initial_hessian": float(
+            lbfgs_cfg.get("rotation_initial_hessian", 1.0)
+        ),
+        "dynamic_h0": bool(lbfgs_cfg.get("rotation_dynamic_h0", False)),
+        "curvature_epsilon": float(
+            lbfgs_cfg.get("curvature_epsilon", 1.0e-12)
+        ),
+    }
+    translation_lbfgs_options = {
+        "memory": int(lbfgs_cfg.get("translation_memory", 10)),
+        "initial_hessian": float(
+            lbfgs_cfg.get("translation_initial_hessian", 1.0)
+        ),
+        "dynamic_h0": bool(
+            lbfgs_cfg.get("translation_dynamic_h0", False)
+        ),
+        "curvature_epsilon": float(
+            lbfgs_cfg.get("curvature_epsilon", 1.0e-12)
+        ),
+        "damping": float(lbfgs_cfg.get("translation_damping", 1.0)),
+        "reset_on_regime_change": bool(
+            lbfgs_cfg.get("reset_translation_on_regime_change", True)
+        ),
+    }
+    hybrid_cfg = config_dict.get("ourDimerHybrid", {}) or {}
+    hybrid_options = {
+        "enabled": bool(hybrid_cfg.get("enabled", False)),
+        "enter_fmax": float(hybrid_cfg.get("enter_fmax", 0.30)),
+        "exit_fmax": float(hybrid_cfg.get("exit_fmax", 0.50)),
+        "enter_curvature": float(
+            hybrid_cfg.get("enter_curvature", -0.05)
+        ),
+        "exit_curvature": float(hybrid_cfg.get("exit_curvature", 0.00)),
+        "enter_stable_steps": int(
+            hybrid_cfg.get("enter_stable_steps", 3)
+        ),
+        "exit_stable_steps": int(hybrid_cfg.get("exit_stable_steps", 2)),
+    }
 
     def configured_reaction_type(attempt):
         if isinstance(attempt, int) and 0 <= attempt < len(configured_attempt_types):
@@ -545,6 +744,7 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
             attempt_calc = None
             d_atoms = None
             dim_rlx = None
+            optimizer_recorder = None
 
             try:
                 # Handle constraints:
@@ -576,6 +776,15 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                         "recover_fmax": config_dict["ourDimer"]["kappa_recover_fmax"],
                     },
                     kappa_control_kwargs=(config_dict.get("Kappa") or None),
+                    rotation_optimizer=config_dict["ourDimer"].get(
+                        "rotation_optimizer", "ase"
+                    ),
+                    translation_optimizer=config_dict["ourDimer"].get(
+                        "translation_optimizer", "ase"
+                    ),
+                    rotation_lbfgs_options=rotation_lbfgs_options,
+                    translation_lbfgs_options=translation_lbfgs_options,
+                    hybrid_options=hybrid_options,
                 )
 
                 # Diagnostic only: this observer never raises into the optimizer
@@ -592,6 +801,10 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                     free_indices=free_indices,
                 )
                 dim_rlx.attach(mode_recorder, interval=1)
+                optimizer_recorder = OptimizerDiagnosticRecorder(
+                    optimizer_file, mode_recorder, d_atoms, dim_rlx
+                )
+                dim_rlx.attach(optimizer_recorder, interval=1)
 
                 # PR Check — skip early steps to let the dimer rotate
                 # the eigenmode (initial displacement can look delocalized,
@@ -679,6 +892,8 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                     status = "converged_to_desorption"
                     atoms.info['converged'] = 1
                     atoms.info['reaction_type'] = 'desorption'
+                if optimizer_recorder is not None:
+                    optimizer_recorder.write_summary(status, atoms.info['converged'])
                 atoms.info['status'] = status
                 atoms.info['task_name'] = task_name
                 atoms.wrap()
@@ -715,6 +930,13 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                 print(f"\nTraceback details:\n{traceback.format_exc()}", flush=True)
                 if attempt_calc is not None:
                     finalize_if_vasp_interactive(config_dict, attempt_calc)
+                if optimizer_recorder is not None and d_atoms is not None:
+                    try:
+                        optimizer_recorder.write_summary(
+                            f"error: {str(e)}", False
+                        )
+                    except Exception:
+                        pass
                 archive_and_clear_temp_files(temp_files, zip_name, prefix="ERROR_",
                                    enabled=config_dict['Main']['zip'])
                 status_msg = f"error: {str(e)}"
