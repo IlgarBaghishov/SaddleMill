@@ -81,6 +81,10 @@ OPTIMIZER_DIAGNOSTIC_FIELDS = [
     "curvature",
     "translation_regime",
     "step_norm",
+    "step_clipped",
+    "direction_alignment",
+    "hybrid_history_pairs_at_switch",
+    "hybrid_warm_start_history",
     "rotation_optimizer",
     "rotation_steps",
     "rotation_lbfgs_history_size",
@@ -512,7 +516,7 @@ def _setup_dimer(atoms, calc, eigenmode=None, displacement_dict=None,
         dim_rlx = LBFGSMinModeTranslate(
             d_atoms, lbfgs_options=translation_lbfgs_options or {}, **common
         )
-    elif translation_optimizer == "hybrid":
+    elif translation_optimizer in {"hybrid", "fire_lbfgs"}:
         dim_rlx = HybridMinModeTranslate(
             d_atoms,
             lbfgs_options=translation_lbfgs_options or {},
@@ -521,7 +525,7 @@ def _setup_dimer(atoms, calc, eigenmode=None, displacement_dict=None,
         )
     else:
         raise ValueError(
-            "[ourDimer] translation_optimizer must be ase, lbfgs, or hybrid; "
+            "[ourDimer] translation_optimizer must be ase, lbfgs, or fire_lbfgs; "
             f"got {translation_optimizer!r}."
         )
     return d_atoms, dim_rlx
@@ -622,6 +626,22 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
             hybrid_cfg.get("enter_stable_steps", 3)
         ),
         "exit_stable_steps": int(hybrid_cfg.get("exit_stable_steps", 2)),
+        "minimum_history_pairs": int(
+            hybrid_cfg.get("minimum_history_pairs", 3)
+        ),
+        "warm_start_history": bool(
+            hybrid_cfg.get("warm_start_history", True)
+        ),
+        "reset_history_on_exit": bool(
+            hybrid_cfg.get("reset_history_on_exit", True)
+        ),
+        "fire_dt": float(hybrid_cfg.get("fire_dt", 0.10)),
+        "fire_dtmax": float(hybrid_cfg.get("fire_dtmax", 1.0)),
+        "fire_Nmin": int(hybrid_cfg.get("fire_Nmin", 5)),
+        "fire_finc": float(hybrid_cfg.get("fire_finc", 1.1)),
+        "fire_fdec": float(hybrid_cfg.get("fire_fdec", 0.5)),
+        "fire_astart": float(hybrid_cfg.get("fire_astart", 0.1)),
+        "fire_fa": float(hybrid_cfg.get("fire_fa", 0.99)),
     }
 
     def configured_reaction_type(attempt):

@@ -1,5 +1,7 @@
 import os
 import sys
+import csv
+import time
 import traceback
 import zipfile
 from ase.io import Trajectory
@@ -12,10 +14,143 @@ from saddlemill.tools import (check_reaction, check_adsorbate_reaction, backup_f
 from saddlemill.dimeropt import _refine_eigenmode
 
 
-def relax_structure(config_dict, optimizable, logfile, trajfile, Optimizer):
-    opt = Optimizer(optimizable, logfile=logfile, trajectory=trajfile,
-                    **config_dict[config_dict["Main"]["Optimizer"]])
-    converged = opt.run(fmax=config_dict["Main"]["fmax"], steps=config_dict["Main"]["steps"])
+MINIMIZER_DIAGNOSTIC_FIELDS = [
+    "record_type",
+    "execution_id",
+    "execution_start_unix_ns",
+    "src_index",
+    "rank",
+    "side",
+    "optimizer_step",
+    "active_optimizer",
+    "switch_event",
+    "fmax",
+    "step_norm",
+    "step_clipped",
+    "direction_alignment",
+    "warm_start_history",
+    "history_pairs_at_switch",
+    "lbfgs_history_size",
+    "lbfgs_pairs_accepted_total",
+    "lbfgs_pairs_rejected_total",
+    "lbfgs_history_resets",
+    "lbfgs_last_reset_reason",
+    "fire_dt",
+    "final_active_optimizer",
+    "switch_count",
+    "total_optimizer_steps",
+    "converged",
+    "status",
+]
+
+
+def _append_optimizer_csv(path, row):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    is_new = not os.path.exists(path) or os.path.getsize(path) == 0
+    with open(path, "a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=MINIMIZER_DIAGNOSTIC_FIELDS)
+        if is_new:
+            writer.writeheader()
+        writer.writerow({key: row.get(key, "") for key in MINIMIZER_DIAGNOSTIC_FIELDS})
+
+
+class MinimizerDiagnosticRecorder:
+    """Record FIRE/L-BFGS state without requesting energy or force calls."""
+
+    def __init__(self, path, optimizer, metadata):
+        self.path = path
+        self.optimizer = optimizer
+        self.metadata = dict(metadata or {})
+        self.execution_start_unix_ns = time.time_ns()
+        self.execution_id = (
+            f"{self.metadata.get('src_index', 'unknown')}-"
+            f"{self.metadata.get('side', '')}-"
+            f"{self.metadata.get('rank', 'unknown')}-"
+            f"{os.getpid()}-{self.execution_start_unix_ns}"
+        )
+        self.last_serial = 0
+        self.summary_written = False
+
+    def __call__(self):
+        diagnostics = getattr(self.optimizer, "last_step_diagnostics", None)
+        if not diagnostics:
+            return
+        serial = int(diagnostics.get("diagnostic_serial", 0))
+        if serial <= self.last_serial:
+            return
+        row = dict(self.metadata)
+        row.update({
+            "execution_id": self.execution_id,
+            "execution_start_unix_ns": self.execution_start_unix_ns,
+        })
+        row.update(diagnostics)
+        row["record_type"] = "step"
+        _append_optimizer_csv(self.path, row)
+        self.last_serial = serial
+
+    def write_summary(self, status, converged):
+        if self.summary_written:
+            return
+        self()
+        summary = getattr(self.optimizer, "hybrid_summary", None)
+        row = dict(self.metadata)
+        row.update({
+            "execution_id": self.execution_id,
+            "execution_start_unix_ns": self.execution_start_unix_ns,
+        })
+        row["record_type"] = "summary"
+        if callable(summary):
+            row.update(summary())
+        row.update({
+            "total_optimizer_steps": self.optimizer.get_number_of_steps(),
+            "converged": int(bool(converged)),
+            "status": status,
+        })
+        _append_optimizer_csv(self.path, row)
+        self.summary_written = True
+
+
+def _optimizer_kwargs(config_dict):
+    name = str(config_dict["Main"]["Optimizer"])
+    if name.lower() in {"firelbfgs", "fire_lbfgs", "warmfirelbfgs"}:
+        return dict(config_dict.get("FIRELBFGS", {}) or {})
+    return dict(config_dict.get(name, {}) or {})
+
+
+def relax_structure(
+    config_dict,
+    optimizable,
+    logfile,
+    trajfile,
+    Optimizer,
+    diagnostic_path=None,
+    diagnostic_metadata=None,
+):
+    opt = Optimizer(
+        optimizable,
+        logfile=logfile,
+        trajectory=trajfile,
+        **_optimizer_kwargs(config_dict),
+    )
+    recorder = None
+    if diagnostic_path is not None and hasattr(opt, "last_step_diagnostics"):
+        recorder = MinimizerDiagnosticRecorder(
+            diagnostic_path, opt, diagnostic_metadata
+        )
+        opt.attach(recorder, interval=1)
+    try:
+        converged = opt.run(
+            fmax=config_dict["Main"]["fmax"],
+            steps=config_dict["Main"]["steps"],
+        )
+    except Exception as exc:
+        if recorder is not None:
+            recorder.write_summary(f"error: {exc}", False)
+        raise
+    if recorder is not None:
+        recorder.write_summary(
+            "converged" if converged else "not_converged", converged
+        )
     return converged, opt.get_number_of_steps()
 
 
@@ -60,7 +195,16 @@ def geomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=None, exe
 
         try:
             optimizable = FrechetCellFilter(atoms) if config_dict['our'+method_name]['relax_cell'] else atoms
-            converged, n_force_calls = relax_structure(config_dict, optimizable, temp_opt_log, temp_traj, Optimizer)
+            optimizer_diag = f"{method_name}_optimizer_csvs/optimizer_rank_{rank}.csv"
+            converged, n_force_calls = relax_structure(
+                config_dict,
+                optimizable,
+                temp_opt_log,
+                temp_traj,
+                Optimizer,
+                diagnostic_path=optimizer_diag,
+                diagnostic_metadata={"src_index": i, "rank": rank, "side": ""},
+            )
             energy = atoms.get_potential_energy()
             forces = atoms.get_forces()
             finalize_if_vasp_interactive(config_dict, vasp_calc)
@@ -225,7 +369,20 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
                     temp_files.extend([log_f, traj_f])
 
                     optimizable = FrechetCellFilter(min_atoms) if config_dict['our'+method_name]['relax_cell'] else min_atoms
-                    conv, side_nfc = relax_structure(config_dict, optimizable, log_f, traj_f, Optimizer)
+                    optimizer_diag = f"{method_name}_optimizer_csvs/optimizer_rank_{rank}.csv"
+                    conv, side_nfc = relax_structure(
+                        config_dict,
+                        optimizable,
+                        log_f,
+                        traj_f,
+                        Optimizer,
+                        diagnostic_path=optimizer_diag,
+                        diagnostic_metadata={
+                            "src_index": i,
+                            "rank": rank,
+                            "side": side,
+                        },
+                    )
                     energy = min_atoms.get_potential_energy()
                     forces = min_atoms.get_forces()
                     if is_vasp:

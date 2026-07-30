@@ -491,7 +491,13 @@ class DiagnosticMinModeTranslate(_TranslationDiagnosticsMixin, MinModeTranslate)
 
 
 class LBFGSTranslationModel:
-    """Persistent translation history shared by pure and hybrid translators."""
+    """Persistent secant history shared by pure and hybrid translators.
+
+    ``observe`` may be called while FIRE is taking the actual steps.  The
+    resulting pairs are the same physical ``s`` and ``y`` observations that
+    L-BFGS would have collected itself, so the live history can be used
+    immediately when the hybrid enters its L-BFGS state.
+    """
 
     def __init__(
         self,
@@ -515,44 +521,92 @@ class LBFGSTranslationModel:
         self.previous_position = None
         self.previous_force = None
         self.regime = None
+        self.last_regime_changed = False
+        self.last_direction_alignment = ""
+        self.last_step_clipped = False
 
     def reset(self, reason):
         self.history.reset(reason)
         self.previous_position = None
         self.previous_force = None
+        self.last_direction_alignment = ""
+        self.last_step_clipped = False
 
-    def compute_step(self, positions, force, maximum_translation, regime="standard"):
-        r = np.asarray(positions, dtype=float)
-        f = np.asarray(force, dtype=float)
-        if self.regime is None:
-            self.regime = regime
-        elif regime != self.regime:
-            if self.reset_on_regime_change:
-                self.reset(f"translation_regime:{self.regime}->{regime}")
-            self.regime = regime
+    def _set_regime(self, regime):
+        regime = str(regime)
+        changed = self.regime is not None and regime != self.regime
+        self.last_regime_changed = bool(changed)
+        if changed and self.reset_on_regime_change:
+            old = self.regime
+            self.reset(f"translation_regime:{old}->{regime}")
+        self.regime = regime
+        return changed
 
-        rflat = r.reshape(-1)
-        fflat = f.reshape(-1)
+    def observe(self, positions, force, regime="standard"):
+        """Add the current accepted state to the secant history.
+
+        The optimizer that generated the preceding displacement is irrelevant:
+        FIRE-, CG-, and L-BFGS-generated accepted steps all provide a valid
+        candidate secant observation when the force definition is unchanged.
+        """
+        self._set_regime(regime)
+        rflat = np.asarray(positions, dtype=float).reshape(-1)
+        fflat = np.asarray(force, dtype=float).reshape(-1)
+        added = False
         if self.previous_position is not None:
             s = rflat - self.previous_position
-            y = self.previous_force - fflat
-            self.history.add_pair(s, y)
-
-        direction = self.history.apply(fflat).reshape(f.shape)
-        if (
-            not np.all(np.isfinite(direction))
-            or norm(direction) < 1.0e-14
-            or np.vdot(direction, f).real <= 0.0
-        ):
-            self.reset("non_descent_translation_direction")
-            direction = (1.0 / self.history.initial_hessian) * f
-
-        step = self.damping * direction
-        step, step_norm = _global_step_clip(step, maximum_translation)
-
+            if norm(s) > 1.0e-15:
+                # y = gradient_new - gradient_old = force_old - force_new.
+                y = self.previous_force - fflat
+                added = self.history.add_pair(s, y)
         self.previous_position = rflat.copy()
         self.previous_force = fflat.copy()
-        return step, step_norm
+        return added
+
+    def direction(self, force):
+        f = np.asarray(force, dtype=float)
+        direction = self.history.apply(f.reshape(-1)).reshape(f.shape)
+        denom = float(norm(direction) * norm(f))
+        self.last_direction_alignment = (
+            float(np.vdot(direction, f).real / denom) if denom > 0.0 else -1.0
+        )
+        valid = (
+            np.all(np.isfinite(direction))
+            and norm(direction) >= 1.0e-14
+            and np.vdot(direction, f).real > 0.0
+        )
+        return direction, bool(valid)
+
+    def compute_step(
+        self,
+        positions,
+        force,
+        maximum_translation,
+        regime="standard",
+        observe=True,
+        fallback_to_force=True,
+    ):
+        r = np.asarray(positions, dtype=float)
+        f = np.asarray(force, dtype=float)
+        if observe:
+            self.observe(r, f, regime=regime)
+        else:
+            self._set_regime(regime)
+
+        direction, valid = self.direction(f)
+        if not valid:
+            if not fallback_to_force:
+                return None, 0.0, False
+            self.reset("non_descent_translation_direction")
+            self._set_regime(regime)
+            self.observe(r, f, regime=regime)
+            direction = (1.0 / self.history.initial_hessian) * f
+
+        unscaled = self.damping * direction
+        unclipped_norm = float(norm(unscaled))
+        step, step_norm = _global_step_clip(unscaled, maximum_translation)
+        self.last_step_clipped = bool(step_norm + 1.0e-15 < unclipped_norm)
+        return step, step_norm, valid
 
 
 class LBFGSMinModeTranslate(_TranslationDiagnosticsMixin, MinModeTranslate):
@@ -574,12 +628,16 @@ class LBFGSMinModeTranslate(_TranslationDiagnosticsMixin, MinModeTranslate):
             f = self.dimeratoms.get_forces()
         r = self.dimeratoms.get_positions().copy()
         data = self._start_step_diagnostics(f, "lbfgs")
-        step, step_norm = self.lbfgs_model.compute_step(
+        step, step_norm, _ = self.lbfgs_model.compute_step(
             r,
             f,
             maximum_translation=self.max_step,
             regime=getattr(self.dimeratoms, "translation_regime", "standard"),
         )
+        data.update({
+            "direction_alignment": self.lbfgs_model.last_direction_alignment,
+            "step_clipped": int(self.lbfgs_model.last_step_clipped),
+        })
         self.log(f, step_norm)
         self.dimeratoms.set_positions(r + step)
         self.f0 = np.asarray(f).flat.copy()
@@ -589,21 +647,76 @@ class LBFGSMinModeTranslate(_TranslationDiagnosticsMixin, MinModeTranslate):
         )
 
 
+class DimerFIREState:
+    """FIRE dynamical state acting on the projected dimer force."""
+
+    def __init__(
+        self,
+        dt=0.1,
+        dtmax=1.0,
+        Nmin=5,
+        finc=1.1,
+        fdec=0.5,
+        astart=0.1,
+        fa=0.99,
+    ):
+        self.dt_initial = float(dt)
+        self.dt = float(dt)
+        self.dtmax = float(dtmax)
+        self.Nmin = int(Nmin)
+        self.finc = float(finc)
+        self.fdec = float(fdec)
+        self.astart = float(astart)
+        self.a = float(astart)
+        self.fa = float(fa)
+        self.Nsteps = 0
+        self.velocity = None
+
+    def reset(self):
+        self.dt = self.dt_initial
+        self.a = self.astart
+        self.Nsteps = 0
+        self.velocity = None
+
+    def compute_step(self, force, maximum_translation):
+        force = np.asarray(force, dtype=float)
+        flat = force.reshape(-1)
+        if self.velocity is None:
+            self.velocity = np.zeros_like(flat)
+        else:
+            vf = float(np.dot(flat, self.velocity))
+            f2 = float(np.dot(flat, flat))
+            if vf > 0.0 and f2 > 0.0:
+                v2 = float(np.dot(self.velocity, self.velocity))
+                self.velocity = (
+                    (1.0 - self.a) * self.velocity
+                    + self.a * flat / np.sqrt(f2) * np.sqrt(v2)
+                )
+                if self.Nsteps > self.Nmin:
+                    self.dt = min(self.dt * self.finc, self.dtmax)
+                    self.a *= self.fa
+                self.Nsteps += 1
+            else:
+                self.velocity[:] = 0.0
+                self.a = self.astart
+                self.dt *= self.fdec
+                self.Nsteps = 0
+        self.velocity += self.dt * flat
+        raw_step = (self.dt * self.velocity).reshape(force.shape)
+        raw_norm = float(norm(raw_step))
+        step, step_norm = _global_step_clip(raw_step, maximum_translation)
+        return step, step_norm, bool(step_norm + 1.0e-15 < raw_norm)
+
+
 @dataclass
 class HybridDecision:
     state: str
     switch_event: str = ""
+    history_pairs_at_switch: int = 0
 
 
 class HybridDimerStateController:
-    """Two-state ASE -> L-BFGS controller with fmax/curvature hysteresis.
-
-    The controller is inert when ``enabled=False``.  Entry requires both the
-    fmax and curvature conditions for ``enter_stable_steps`` consecutive
-    observations.  Exit requires either exit condition for
-    ``exit_stable_steps`` consecutive observations.  The wider exit thresholds
-    create hysteresis and prevent rapid switching near a boundary.
-    """
+    """FIRE -> L-BFGS controller with fmax/curvature hysteresis."""
 
     def __init__(
         self,
@@ -614,6 +727,8 @@ class HybridDimerStateController:
         exit_curvature=0.00,
         enter_stable_steps=3,
         exit_stable_steps=2,
+        minimum_history_pairs=3,
+        warm_start_history=True,
     ):
         self.enabled = bool(enabled)
         self.enter_fmax = float(enter_fmax)
@@ -622,45 +737,76 @@ class HybridDimerStateController:
         self.exit_curvature = float(exit_curvature)
         self.enter_stable_steps = int(enter_stable_steps)
         self.exit_stable_steps = int(exit_stable_steps)
+        self.minimum_history_pairs = int(minimum_history_pairs)
+        self.warm_start_history = bool(warm_start_history)
         if self.enter_stable_steps < 1 or self.exit_stable_steps < 1:
             raise ValueError("Hybrid stable-step counts must be >= 1")
+        if self.minimum_history_pairs < 0:
+            raise ValueError("minimum_history_pairs must be >= 0")
         if self.exit_fmax < self.enter_fmax:
             raise ValueError("hybrid exit_fmax must be >= enter_fmax")
         if self.exit_curvature < self.enter_curvature:
             raise ValueError(
                 "hybrid exit_curvature must be >= enter_curvature"
             )
-        self.state = "ase"
+        self.state = "fire"
         self._enter_count = 0
         self._exit_count = 0
 
-    def update(self, fmax, curvature) -> HybridDecision:
+    def force_fire(self, event):
+        self.state = "fire"
+        self._enter_count = 0
+        self._exit_count = 0
+        return HybridDecision("fire", str(event), 0)
+
+    def update(self, fmax, curvature, history_size) -> HybridDecision:
         if not self.enabled:
-            return HybridDecision("ase", "")
+            return HybridDecision("fire", "", 0)
 
         fmax = float(fmax)
         curvature = float(curvature)
-        if self.state == "ase":
-            enter = fmax <= self.enter_fmax and curvature <= self.enter_curvature
+        history_ready = (
+            not self.warm_start_history
+            or int(history_size) >= self.minimum_history_pairs
+        )
+        if self.state == "fire":
+            enter = (
+                fmax <= self.enter_fmax
+                and curvature <= self.enter_curvature
+                and history_ready
+            )
             self._enter_count = self._enter_count + 1 if enter else 0
             self._exit_count = 0
             if self._enter_count >= self.enter_stable_steps:
                 self.state = "lbfgs"
                 self._enter_count = 0
-                return HybridDecision("lbfgs", "ase_to_lbfgs")
+                return HybridDecision(
+                    "lbfgs", "fire_to_lbfgs", int(history_size)
+                )
         else:
-            exit_now = fmax >= self.exit_fmax or curvature >= self.exit_curvature
+            exit_now = (
+                fmax >= self.exit_fmax
+                or curvature >= self.exit_curvature
+            )
             self._exit_count = self._exit_count + 1 if exit_now else 0
             self._enter_count = 0
             if self._exit_count >= self.exit_stable_steps:
-                self.state = "ase"
+                self.state = "fire"
                 self._exit_count = 0
-                return HybridDecision("ase", "lbfgs_to_ase")
-        return HybridDecision(self.state, "")
+                return HybridDecision(
+                    "fire", "lbfgs_to_fire_threshold", int(history_size)
+                )
+        return HybridDecision(self.state, "", 0)
 
 
 class HybridMinModeTranslate(_TranslationDiagnosticsMixin, MinModeTranslate):
-    """Dormant-by-default ASE/L-BFGS translation state machine."""
+    """Warm-started FIRE/L-BFGS dimer translation.
+
+    FIRE takes the early accepted translations.  When
+    ``warm_start_history=True``, those same accepted positions and projected
+    forces populate the live L-BFGS history.  Switching therefore does not
+    require passing a restart object or replaying a trajectory.
+    """
 
     def __init__(
         self,
@@ -673,48 +819,134 @@ class HybridMinModeTranslate(_TranslationDiagnosticsMixin, MinModeTranslate):
         super().__init__(dimeratoms, logfile=logfile, trajectory=trajectory)
         self._initialize_step_diagnostics()
         self.lbfgs_model = LBFGSTranslationModel(**dict(lbfgs_options or {}))
-        self.hybrid_controller = HybridDimerStateController(
-            **dict(hybrid_options or {})
+        options = dict(hybrid_options or {})
+        fire_keys = {
+            "fire_dt": "dt",
+            "fire_dtmax": "dtmax",
+            "fire_Nmin": "Nmin",
+            "fire_finc": "finc",
+            "fire_fdec": "fdec",
+            "fire_astart": "astart",
+            "fire_fa": "fa",
+        }
+        fire_options = {
+            target: options.pop(source)
+            for source, target in fire_keys.items()
+            if source in options
+        }
+        self.reset_history_on_exit = bool(
+            options.pop("reset_history_on_exit", True)
         )
+        self.fire_state = DimerFIREState(**fire_options)
+        self.hybrid_controller = HybridDimerStateController(**options)
+        self.warm_start_history = self.hybrid_controller.warm_start_history
 
     def step(self, f=None):
         if f is None:
             f = self.dimeratoms.get_forces()
+        f = np.asarray(f, dtype=float)
+        r = self.dimeratoms.get_positions().copy()
+        regime = getattr(self.dimeratoms, "translation_regime", "standard")
         fmax = _projected_fmax(f)
         curvature = float(self.dimeratoms.get_curvature())
-        decision = self.hybrid_controller.update(fmax, curvature)
+        state_before = self.hybrid_controller.state
 
-        if decision.switch_event == "ase_to_lbfgs":
-            self.lbfgs_model.reset("hybrid_enter_lbfgs")
-            self.cg_init = True
-        elif decision.switch_event == "lbfgs_to_ase":
-            self.lbfgs_model.reset("hybrid_exit_lbfgs")
-            self.cg_init = True
+        # The current state closes the secant pair generated by the previous
+        # accepted step.  During FIRE this is the shadow warm-start update.
+        observed = False
+        if state_before == "lbfgs" or self.warm_start_history:
+            self.lbfgs_model.observe(r, f, regime=regime)
+            observed = True
 
-        r_before = self.dimeratoms.get_positions().copy()
-        if decision.state == "ase":
-            algorithm = "ase_cg" if self.cg_on else "ase_steepest"
-            data = self._start_step_diagnostics(
-                f, algorithm, hybrid_state="ase", switch_event=decision.switch_event
+        if state_before == "lbfgs" and self.lbfgs_model.last_regime_changed:
+            decision = self.hybrid_controller.force_fire(
+                "lbfgs_to_fire_regime_change"
             )
-            MinModeTranslate.step(self, f)
-            step_norm = norm(self.dimeratoms.get_positions() - r_before)
-            self._finish_step_diagnostics(data, step_norm, history=None)
-            return
+            self.fire_state.reset()
+        else:
+            decision = self.hybrid_controller.update(
+                fmax, curvature, self.lbfgs_model.history.size
+            )
+        if decision.switch_event == "fire_to_lbfgs" and not self.warm_start_history:
+            self.lbfgs_model.reset("cold_start_fire_to_lbfgs")
+            self.lbfgs_model.observe(r, f, regime=regime)
+            observed = True
+        elif decision.switch_event == "lbfgs_to_fire_threshold":
+            self.fire_state.reset()
+            if self.reset_history_on_exit:
+                self.lbfgs_model.reset("lbfgs_to_fire_threshold")
+                if self.warm_start_history:
+                    self.lbfgs_model.observe(r, f, regime=regime)
+                    observed = True
 
-        data = self._start_step_diagnostics(
-            f, "lbfgs", hybrid_state="lbfgs", switch_event=decision.switch_event
-        )
-        step, step_norm = self.lbfgs_model.compute_step(
-            r_before,
-            f,
-            maximum_translation=self.max_step,
-            regime=getattr(self.dimeratoms, "translation_regime", "standard"),
-        )
+        if decision.state == "fire":
+            data = self._start_step_diagnostics(
+                f,
+                "fire",
+                hybrid_state="fire",
+                switch_event=decision.switch_event,
+            )
+            step, step_norm, clipped = self.fire_state.compute_step(
+                f, self.max_step
+            )
+            data.update({
+                "direction_alignment": "",
+                "step_clipped": int(clipped),
+                "hybrid_history_pairs_at_switch": int(
+                    decision.history_pairs_at_switch
+                ),
+                "hybrid_warm_start_history": int(self.warm_start_history),
+            })
+        else:
+            data = self._start_step_diagnostics(
+                f,
+                "lbfgs",
+                hybrid_state="lbfgs",
+                switch_event=decision.switch_event,
+            )
+            step, step_norm, valid = self.lbfgs_model.compute_step(
+                r,
+                f,
+                maximum_translation=self.max_step,
+                regime=regime,
+                observe=not observed,
+                fallback_to_force=False,
+            )
+            if not valid or step is None:
+                invalid_alignment = self.lbfgs_model.last_direction_alignment
+                self.lbfgs_model.reset("non_descent_translation_direction")
+                decision = self.hybrid_controller.force_fire(
+                    "lbfgs_to_fire_non_descent"
+                )
+                self.fire_state.reset()
+                if self.warm_start_history:
+                    self.lbfgs_model.observe(r, f, regime=regime)
+                step, step_norm, clipped = self.fire_state.compute_step(
+                    f, self.max_step
+                )
+                data["translation_algorithm"] = "fire"
+                data["hybrid_state"] = "fire"
+                data["hybrid_switch_event"] = decision.switch_event
+                data.update({
+                    "direction_alignment": invalid_alignment,
+                    "step_clipped": int(clipped),
+                })
+            else:
+                data.update({
+                    "direction_alignment": self.lbfgs_model.last_direction_alignment,
+                    "step_clipped": int(self.lbfgs_model.last_step_clipped),
+                })
+            data.update({
+                "hybrid_history_pairs_at_switch": int(
+                    decision.history_pairs_at_switch
+                ),
+                "hybrid_warm_start_history": int(self.warm_start_history),
+            })
+
         self.log(f, step_norm)
-        self.dimeratoms.set_positions(r_before + step)
-        self.f0 = np.asarray(f).flat.copy()
-        self.r0 = r_before.flat.copy()
+        self.dimeratoms.set_positions(r + step)
+        self.f0 = f.flat.copy()
+        self.r0 = r.flat.copy()
         self._finish_step_diagnostics(
             data, step_norm, history=self.lbfgs_model.history
         )

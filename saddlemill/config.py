@@ -56,6 +56,30 @@ class ConfigManager:
             "vasp_command": None,
             "vasp_ncore": None,
         },
+        "FIRELBFGS": {
+            # Used when [Main] Optimizer = FIRELBFGS.  Applies to both
+            # Minimization and each side of DoubleMinimization.
+            "maxstep": 0.2,
+            "fire_dt": 0.1,
+            "fire_dtmax": 1.0,
+            "fire_Nmin": 5,
+            "fire_finc": 1.1,
+            "fire_fdec": 0.5,
+            "fire_astart": 0.1,
+            "fire_fa": 0.99,
+            "lbfgs_memory": 10,
+            "lbfgs_initial_hessian": 70.0,
+            "lbfgs_dynamic_h0": False,
+            "lbfgs_curvature_epsilon": 1.0e-12,
+            "lbfgs_damping": 1.0,
+            "enter_fmax": 0.20,
+            "exit_fmax": 0.35,
+            "enter_stable_steps": 3,
+            "exit_stable_steps": 2,
+            "minimum_history_pairs": 3,
+            "warm_start_history": True,
+            "reset_history_on_exit": True,
+        },
         "ourNEB": {
             "only_endpoints_in_input_traj": False,
             "images_location_in_input_traj": ":",  # can also be 0 or -1, meaning begining or end of file. This defines where are the initial endpoints or the band in the input traj
@@ -92,7 +116,7 @@ class ConfigManager:
             "extension_check_curvature": -0.2,
             "engine": "ase",            # ase (stock ASE dimer) | kappa
             "rotation_optimizer": "ase",    # ase | lbfgs
-            "translation_optimizer": "ase", # ase | lbfgs | hybrid
+            "translation_optimizer": "ase", # ase | lbfgs | fire_lbfgs (hybrid alias accepted)
             "kappa_beta": 2.0,          # only used when engine = kappa
             "kappa_recover_fmax": 0.3,  # only used when engine = kappa
             "vasp_command": None,
@@ -116,7 +140,8 @@ class ConfigManager:
             "reset_translation_on_regime_change": True,
         },
         "ourDimerHybrid": {
-            # Dormant unless translation_optimizer=hybrid and enabled=True.
+            # Dormant unless translation_optimizer=fire_lbfgs (or hybrid alias)
+            # and enabled=True. FIRE steps can populate the live L-BFGS history.
             "enabled": False,
             "enter_fmax": 0.30,
             "exit_fmax": 0.50,
@@ -124,6 +149,16 @@ class ConfigManager:
             "exit_curvature": 0.00,
             "enter_stable_steps": 3,
             "exit_stable_steps": 2,
+            "minimum_history_pairs": 3,
+            "warm_start_history": True,
+            "reset_history_on_exit": True,
+            "fire_dt": 0.10,
+            "fire_dtmax": 1.0,
+            "fire_Nmin": 5,
+            "fire_finc": 1.1,
+            "fire_fdec": 0.5,
+            "fire_astart": 0.1,
+            "fire_fa": 0.99,
         },
         # SaddleMill-side VASP-input orchestration (the [Vasp] section itself is a
         # pure pass-through to ASE's Vasp calculator and never holds our keys).
@@ -305,6 +340,15 @@ def load_method(config_dict):
         )
 
     calc_name = config_dict["Main"]["Calculator"]
+    optimizer_name = str(config_dict["Main"].get("Optimizer", "")).lower()
+    if optimizer_name in {"firelbfgs", "fire_lbfgs", "warmfirelbfgs"} and method_name not in {
+        "Minimization", "DoubleMinimization"
+    }:
+        raise NotImplementedError(
+            "Optimizer=FIRELBFGS is currently supported only for "
+            "Minimization and DoubleMinimization. Dimer translation uses "
+            "[ourDimer] translation_optimizer=fire_lbfgs instead."
+        )
 
     # SaddleMill L-BFGS dimer validation
     if method_name == "Dimer":
@@ -320,10 +364,10 @@ def load_method(config_dict):
                 "[ourDimer] rotation_optimizer must be ase or lbfgs; "
                 f"got {rotation_optimizer!r}."
             )
-        if translation_optimizer not in {"ase", "lbfgs", "hybrid"}:
+        if translation_optimizer not in {"ase", "lbfgs", "hybrid", "fire_lbfgs"}:
             raise ValueError(
                 "[ourDimer] translation_optimizer must be ase, lbfgs, or "
-                f"hybrid; got {translation_optimizer!r}."
+                f"fire_lbfgs; got {translation_optimizer!r}."
             )
 
         lbfgs_cfg = config_dict.get("ourDimerLBFGS", {}) or {}
@@ -362,14 +406,45 @@ def load_method(config_dict):
             raise ValueError(
                 "[ourDimerHybrid] stable-step counts must be >= 1"
             )
-        if translation_optimizer == "hybrid" and not bool(
+        if int(hybrid_cfg.get("minimum_history_pairs", 3)) < 0:
+            raise ValueError(
+                "[ourDimerHybrid] minimum_history_pairs must be >= 0"
+            )
+        for key in ("fire_dt", "fire_dtmax", "fire_finc", "fire_fdec", "fire_astart", "fire_fa"):
+            if float(hybrid_cfg.get(key, 0.1)) <= 0.0:
+                raise ValueError(f"[ourDimerHybrid] {key} must be > 0")
+        if int(hybrid_cfg.get("fire_Nmin", 5)) < 0:
+            raise ValueError("[ourDimerHybrid] fire_Nmin must be >= 0")
+        if translation_optimizer in {"hybrid", "fire_lbfgs"} and not bool(
             hybrid_cfg.get("enabled", False)
         ):
             print(
-                "Note: translation_optimizer=hybrid but "
+                "Note: translation_optimizer=fire_lbfgs but "
                 "[ourDimerHybrid] enabled=False; translation remains in "
-                "the ASE state."
+                "the FIRE state."
             )
+    if method_name in {"Minimization", "DoubleMinimization"} and str(
+        config_dict["Main"].get("Optimizer", "")
+    ).lower() in {"firelbfgs", "fire_lbfgs", "warmfirelbfgs"}:
+        cfg = config_dict.get("FIRELBFGS", {}) or {}
+        if int(cfg.get("lbfgs_memory", 10)) < 1:
+            raise ValueError("[FIRELBFGS] lbfgs_memory must be >= 1")
+        for key in ("maxstep", "fire_dt", "fire_dtmax", "fire_finc", "fire_fdec",
+                    "fire_astart", "fire_fa", "lbfgs_initial_hessian",
+                    "lbfgs_damping", "enter_fmax", "exit_fmax"):
+            if float(cfg.get(key, 1.0)) <= 0.0:
+                raise ValueError(f"[FIRELBFGS] {key} must be > 0")
+        if float(cfg.get("exit_fmax", 0.35)) < float(cfg.get("enter_fmax", 0.20)):
+            raise ValueError("[FIRELBFGS] exit_fmax must be >= enter_fmax")
+        if int(cfg.get("enter_stable_steps", 3)) < 1 or int(
+            cfg.get("exit_stable_steps", 2)
+        ) < 1:
+            raise ValueError("[FIRELBFGS] stable-step counts must be >= 1")
+        if int(cfg.get("minimum_history_pairs", 3)) < 0:
+            raise ValueError("[FIRELBFGS] minimum_history_pairs must be >= 0")
+        if float(cfg.get("lbfgs_curvature_epsilon", 1.0e-12)) < 0.0:
+            raise ValueError("[FIRELBFGS] lbfgs_curvature_epsilon must be >= 0")
+
     if method_name == "SinglePoint":
         if calc_name not in ("FAIRChemCalculator", "Vasp", "VaspInteractive"):
             raise NotImplementedError(
@@ -450,9 +525,12 @@ def _load_optimizer(optimizer_name):
         from ase.optimize import LBFGS as Optimizer
     elif optimizer_name.lower() == "fire":
         from ase.optimize import FIRE as Optimizer
+    elif optimizer_name.lower() in {"firelbfgs", "fire_lbfgs", "warmfirelbfgs"}:
+        from saddlemill.fire_lbfgs import FIRELBFGS as Optimizer
     else:
         raise NotImplementedError(
-            f"Method '{optimizer_name}' is not implemented. Only MDMin, BFGS, LBFGS and FIRE are supported."
+            f"Method '{optimizer_name}' is not implemented. Only MDMin, BFGS, "
+            "LBFGS, FIRE and FIRELBFGS are supported."
         )
     return Optimizer
 
@@ -549,6 +627,10 @@ def create_results_directories(config_dict):
             dirs.append(f"{method_name}_debug_zips")
     else:
         dirs.extend([f"{method_name}_trajes", f"{method_name}_debug_zips"])
+        if method_name in {"Minimization", "DoubleMinimization"} and str(
+            config_dict["Main"].get("Optimizer", "")
+        ).lower() in {"firelbfgs", "fire_lbfgs", "warmfirelbfgs"}:
+            dirs.append(f"{method_name}_optimizer_csvs")
     for d in dirs:
         pathlib.Path(d).mkdir(exist_ok=False)
 
