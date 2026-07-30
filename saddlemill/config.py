@@ -132,9 +132,10 @@ class ConfigManager:
             "rotation_memory": 10,
             "translation_memory": 10,
             "rotation_initial_hessian": 1.0,
-            "translation_initial_hessian": 1.0,
+            # Passed to ASE LBFGS as alpha. The initial inverse Hessian is 1/alpha.
+            "translation_initial_hessian": 70.0,
             "rotation_dynamic_h0": False,
-            "translation_dynamic_h0": False,
+            "translation_dynamic_h0": False,  # compatibility only; ASE LBFGS keeps H0=1/alpha fixed
             "translation_damping": 1.0,
             "curvature_epsilon": 1.0e-12,
             "reset_translation_on_regime_change": True,

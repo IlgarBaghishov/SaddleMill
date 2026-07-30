@@ -18,10 +18,18 @@ norm = np.linalg.norm
 
 
 class IsolatedDimerControl(DimerControl):
-    """DimerControl with a private parameter dictionary per instance."""
+    """DimerControl with an immutable baseline copied per instance.
+
+    ASE stores ``parameters`` as a mutable class dictionary and applies
+    constructor overrides through ``self.parameters``.  Copying the baseline
+    before ``DimerControl.__init__`` prevents one control object's overrides
+    from leaking into later controls in the same worker process.
+    """
+
+    _baseline_parameters = dict(DimerControl.parameters)
 
     def __init__(self, *args, **kwargs):
-        self.parameters = dict(type(self).parameters)
+        self.parameters = dict(self._baseline_parameters)
         super().__init__(*args, **kwargs)
 
 

@@ -457,6 +457,7 @@ def _setup_dimer(atoms, calc, eigenmode=None, displacement_dict=None,
         HybridMinModeTranslate,
         LBFGSMinModeTranslate,
     )
+    from saddlemill.dimertools.kappa_dimer import IsolatedDimerControl
 
     atoms.calc = calc
     eig_kw = {"eigenmodes": [np.array(eigenmode)]} if eigenmode is not None else {}
@@ -464,9 +465,7 @@ def _setup_dimer(atoms, calc, eigenmode=None, displacement_dict=None,
     translation_optimizer = str(translation_optimizer).lower()
 
     if engine == "kappa":
-        from saddlemill.dimertools.kappa_dimer import (
-            KappaMinModeAtoms, IsolatedDimerControl
-        )
+        from saddlemill.dimertools.kappa_dimer import KappaMinModeAtoms
 
         d_control = IsolatedDimerControl(
             logfile=control_logfile,
@@ -484,7 +483,7 @@ def _setup_dimer(atoms, calc, eigenmode=None, displacement_dict=None,
             )
         d_atoms = KappaMinModeAtoms(atoms, control=d_control, **eig_kw, **kw)
     elif engine == "ase":
-        d_control = DimerControl(
+        d_control = IsolatedDimerControl(
             logfile=control_logfile,
             eigenmode_logfile=mode_logfile,
             **(dimer_control_kwargs or {}),
@@ -539,8 +538,10 @@ def _refine_eigenmode(atoms, calc, eigenmode, dimer_control_kwargs=None,
     """
     refine_atoms = atoms.copy()
     refine_atoms.calc = calc
-    d_control = DimerControl(logfile=control_logfile,
-                             **(dimer_control_kwargs or {}))
+    from saddlemill.dimertools.kappa_dimer import IsolatedDimerControl
+    d_control = IsolatedDimerControl(
+        logfile=control_logfile, **(dimer_control_kwargs or {})
+    )
     d_atoms = MinModeAtoms(refine_atoms, d_control,
                            eigenmodes=[np.array(eigenmode)])
     d_atoms.displace(displacement_vector=np.random.randn(len(refine_atoms), 3) * 1e-10,
@@ -600,7 +601,7 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
     translation_lbfgs_options = {
         "memory": int(lbfgs_cfg.get("translation_memory", 10)),
         "initial_hessian": float(
-            lbfgs_cfg.get("translation_initial_hessian", 1.0)
+            lbfgs_cfg.get("translation_initial_hessian", 70.0)
         ),
         "dynamic_h0": bool(
             lbfgs_cfg.get("translation_dynamic_h0", False)

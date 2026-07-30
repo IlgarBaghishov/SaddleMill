@@ -1,16 +1,18 @@
-"""Cartesian L-BFGS solvers for ASE dimer rotation and translation.
+"""Dimer rotation helpers and ASE-backed translation optimizers.
 
-The rotation implementation follows the algorithmic division used by
-Kastner and Sherwood (JCP 128, 014106, 2008): L-BFGS chooses the rotational
-search direction, while ASE's existing trial-angle/Fourier interpolation
-chooses the rotation angle.  A new rotation-search object is constructed at
-every translated geometry, so its L-BFGS history is reset after translation.
+L-BFGS rotation remains a specialized implementation because ASE's ordinary
+Cartesian optimizer cannot directly optimize the normalized dimer mode while
+retaining ASE's trial-angle/Fourier rotation.
 
-The translation implementation keeps a separate L-BFGS history across
-accepted translation steps.  It uses no line search or disposable trial
-translation force evaluation.  The resulting step is globally capped by
-DimerControl.maximum_translation, preserving the existing ASE dimer step-size
-meaning.
+Pure L-BFGS translation now delegates direction generation, secant-history
+updates, initial scaling, damping, and max-step handling to ``ase.optimize.LBFGS``
+on the ``MinModeAtoms`` wrapper.  ``MinModeAtoms.get_forces()`` supplies the
+projected minimum-mode-following force automatically.
+
+The FIRE/L-BFGS hybrid delegates FIRE steps to ``ase.optimize.FIRE`` and
+L-BFGS steps to ``ase.optimize.LBFGS``.  Warm starts rebuild ASE's own L-BFGS
+state from accepted generalized-coordinate/force snapshots; SaddleMill does
+not implement a second L-BFGS two-loop recursion for translation.
 """
 
 from __future__ import annotations
@@ -19,8 +21,11 @@ from collections import deque
 from dataclasses import dataclass
 from math import atan, cos, pi, sin, tan
 from typing import Callable, Optional
+import warnings
 
 import numpy as np
+
+from ase.optimize import FIRE, LBFGS
 
 from ase.mep.dimer import (
     DimerEigenmodeSearch,
@@ -33,6 +38,71 @@ from ase.mep.dimer import (
 )
 
 norm = np.linalg.norm
+
+
+def _ase_lbfgs_container(optimizer):
+    """Return the object that owns ASE L-BFGS history attributes.
+
+    ASE <= 3.28 stores ``iteration/s/y/rho/H0`` directly on ``LBFGS``.
+    ASE >= 3.29 stores them on ``LBFGS.state``.  SaddleMill supports both
+    layouts here while still delegating every actual L-BFGS step/update to ASE.
+    """
+    return getattr(optimizer, "state", optimizer)
+
+
+def _ase_lbfgs_api_name(optimizer):
+    return "state_object" if hasattr(optimizer, "state") else "legacy_direct"
+
+
+def _ase_lbfgs_get(optimizer, name, default=None):
+    return getattr(_ase_lbfgs_container(optimizer), name, default)
+
+
+def _ase_lbfgs_set(optimizer, name, value):
+    setattr(_ase_lbfgs_container(optimizer), name, value)
+
+
+def _ase_lbfgs_increment_iteration(optimizer):
+    _ase_lbfgs_set(
+        optimizer,
+        "iteration",
+        int(_ase_lbfgs_get(optimizer, "iteration", 0)) + 1,
+    )
+
+
+def _ase_lbfgs_history_size(optimizer):
+    return int(len(_ase_lbfgs_get(optimizer, "s", [])))
+
+
+def _ase_lbfgs_pairs_total(optimizer):
+    # The first ASE L-BFGS iteration has no secant pair.
+    return int(max(0, int(_ase_lbfgs_get(optimizer, "iteration", 0)) - 1))
+
+
+def _ase_lbfgs_reset_history(optimizer, memory):
+    """Reset native ASE history without replacing the optimizer wrapper.
+
+    The state-object API needs a new LBFGSMethod instance; the legacy API uses
+    direct lists/scalars.  ``H0`` is preserved in both cases.
+    """
+    if hasattr(optimizer, "state"):
+        old_state = optimizer.state
+        optimizer.state = type(old_state)(
+            memory=int(memory),
+            initial_inverse_hessian=old_state.H0,
+        )
+    else:
+        optimizer.iteration = 0
+        optimizer.s = []
+        optimizer.y = []
+        optimizer.rho = []
+        # Legacy ASE stores H0 and memory directly on the optimizer.
+        optimizer.memory = int(memory)
+
+    optimizer.r0 = None
+    optimizer.f0 = None
+    optimizer.e0 = None
+    optimizer.task = "START"
 
 
 class LimitedMemoryInverseHessian:
@@ -366,6 +436,7 @@ class ConfigurableRotationMinModeAtoms(MinModeAtoms):
         }
 
 
+
 def _force_calls(dimeratoms) -> int:
     try:
         return int(dimeratoms.control.get_counter("forcecalls"))
@@ -375,20 +446,20 @@ def _force_calls(dimeratoms) -> int:
 
 def _projected_fmax(force) -> float:
     force = np.asarray(force, dtype=float)
-    if len(force) == 0:
+    if force.size == 0:
         return 0.0
+    if force.ndim == 1:
+        force = force.reshape(-1, 3)
     return float(np.sqrt((force * force).sum(axis=1).max()))
 
 
-def _global_step_clip(step, maximum_translation):
-    step = np.asarray(step, dtype=float)
-    step_norm = float(norm(step))
-    if not np.isfinite(step_norm):
-        raise RuntimeError("Non-finite L-BFGS translation step")
-    if step_norm > maximum_translation > 0.0:
-        step = step * (maximum_translation / step_norm)
-        step_norm = float(maximum_translation)
-    return step, step_norm
+def _cosine_alignment(direction, force):
+    direction = np.asarray(direction, dtype=float).reshape(-1)
+    force = np.asarray(force, dtype=float).reshape(-1)
+    denom = float(norm(direction) * norm(force))
+    if denom <= 0.0:
+        return ""
+    return float(np.dot(direction, force) / denom)
 
 
 def _flatten_rotation_diagnostics(dimeratoms):
@@ -442,9 +513,10 @@ class _TranslationDiagnosticsMixin:
         data.update(_flatten_rotation_diagnostics(self.dimeratoms))
         return data
 
-    def _finish_step_diagnostics(self, data, step_norm, history=None):
+    def _finish_step_diagnostics(self, data, step_norm, lbfgs_metrics=None):
         after_calls = _force_calls(self.dimeratoms)
         entry_calls = data["force_calls_step_entry"]
+        metrics = dict(lbfgs_metrics or {})
         data.update(
             {
                 "step_norm": float(step_norm),
@@ -454,16 +526,16 @@ class _TranslationDiagnosticsMixin:
                     else ""
                 ),
                 "force_calls_cumulative_after_step": after_calls,
-                "translation_lbfgs_history_size": history.size if history else 0,
-                "translation_lbfgs_pairs_accepted_total": (
-                    history.accepted_pairs_total if history else 0
+                "translation_lbfgs_history_size": metrics.get("history_size", 0),
+                "translation_lbfgs_pairs_accepted_total": metrics.get(
+                    "pairs_accepted_total", 0
                 ),
-                "translation_lbfgs_pairs_rejected_total": (
-                    history.rejected_pairs_total if history else 0
+                "translation_lbfgs_pairs_rejected_total": metrics.get(
+                    "pairs_rejected_total", 0
                 ),
-                "translation_lbfgs_resets": history.reset_count if history else 0,
-                "translation_lbfgs_last_reset_reason": (
-                    history.last_reset_reason if history else ""
+                "translation_lbfgs_resets": metrics.get("reset_count", 0),
+                "translation_lbfgs_last_reset_reason": metrics.get(
+                    "last_reset_reason", ""
                 ),
             }
         )
@@ -473,7 +545,7 @@ class _TranslationDiagnosticsMixin:
 
 
 class DiagnosticMinModeTranslate(_TranslationDiagnosticsMixin, MinModeTranslate):
-    """Stock ASE MinModeTranslate with force-call diagnostics only."""
+    """Stock ASE ``MinModeTranslate`` with diagnostics only."""
 
     def __init__(self, dimeratoms, logfile="-", trajectory=None):
         super().__init__(dimeratoms, logfile=logfile, trajectory=trajectory)
@@ -487,225 +559,245 @@ class DiagnosticMinModeTranslate(_TranslationDiagnosticsMixin, MinModeTranslate)
         data = self._start_step_diagnostics(f, algorithm)
         MinModeTranslate.step(self, f)
         step_norm = norm(self.dimeratoms.get_positions() - r_before)
-        self._finish_step_diagnostics(data, step_norm, history=None)
+        self._finish_step_diagnostics(data, step_norm)
 
 
-class LBFGSTranslationModel:
-    """Persistent secant history shared by pure and hybrid translators.
+class _ASELBFGSState:
+    """Thin state/diagnostic adapter around an actual ASE ``LBFGS`` object.
 
-    ``observe`` may be called while FIRE is taking the actual steps.  The
-    resulting pairs are the same physical ``s`` and ``y`` observations that
-    L-BFGS would have collected itself, so the live history can be used
-    immediately when the hybrid enters its L-BFGS state.
+    No L-BFGS recursion is implemented here.  ``step()`` delegates to ASE.
+    ``rebuild()`` mirrors ASE's own replay loop in generalized coordinates so
+    warm starts also work for filters such as ``FrechetCellFilter``.
     """
 
-    def __init__(
-        self,
-        memory=10,
-        initial_hessian=1.0,
-        dynamic_h0=False,
-        curvature_epsilon=1.0e-12,
-        damping=1.0,
-        reset_on_regime_change=True,
-    ):
-        if float(damping) <= 0.0:
-            raise ValueError("translation damping must be > 0")
-        self.history = LimitedMemoryInverseHessian(
-            memory=memory,
-            initial_hessian=initial_hessian,
-            dynamic_h0=dynamic_h0,
-            curvature_epsilon=curvature_epsilon,
-        )
+    def __init__(self, target, *, maxstep, memory, damping, alpha):
+        self.target = target
+        self.maxstep = float(maxstep)
+        self.memory = int(memory)
         self.damping = float(damping)
-        self.reset_on_regime_change = bool(reset_on_regime_change)
-        self.previous_position = None
-        self.previous_force = None
-        self.regime = None
-        self.last_regime_changed = False
-        self.last_direction_alignment = ""
-        self.last_step_clipped = False
+        self.alpha = float(alpha)
+        self.optimizer = self._new_optimizer()
+        self.reset_count = 0
+        self.last_reset_reason = "initial"
+        self.pairs_rejected_total = 0  # ASE 3.29 LBFGS stores every replay/update pair.
 
-    def reset(self, reason):
-        self.history.reset(reason)
-        self.previous_position = None
-        self.previous_force = None
-        self.last_direction_alignment = ""
-        self.last_step_clipped = False
+    def _new_optimizer(self):
+        return LBFGS(
+            self.target,
+            restart=None,
+            logfile=None,
+            trajectory=None,
+            maxstep=self.maxstep,
+            memory=self.memory,
+            damping=self.damping,
+            alpha=self.alpha,
+            use_line_search=False,
+        )
 
-    def _set_regime(self, regime):
-        regime = str(regime)
-        changed = self.regime is not None and regime != self.regime
-        self.last_regime_changed = bool(changed)
-        if changed and self.reset_on_regime_change:
-            old = self.regime
-            self.reset(f"translation_regime:{old}->{regime}")
-        self.regime = regime
-        return changed
+    def reset(self, reason="manual"):
+        self.optimizer = self._new_optimizer()
+        self.reset_count += 1
+        self.last_reset_reason = str(reason)
 
-    def observe(self, positions, force, regime="standard"):
-        """Add the current accepted state to the secant history.
+    @property
+    def history_size(self):
+        return _ase_lbfgs_history_size(self.optimizer)
 
-        The optimizer that generated the preceding displacement is irrelevant:
-        FIRE-, CG-, and L-BFGS-generated accepted steps all provide a valid
-        candidate secant observation when the force definition is unchanged.
+    @property
+    def pairs_accepted_total(self):
+        # iteration includes the initial no-pair direction; accepted secant
+        # updates are represented directly by the stored s/y lists.
+        return _ase_lbfgs_pairs_total(self.optimizer)
+
+    def metrics(self):
+        return {
+            "history_size": self.history_size,
+            "pairs_accepted_total": self.pairs_accepted_total,
+            "pairs_rejected_total": self.pairs_rejected_total,
+            "reset_count": self.reset_count,
+            "last_reset_reason": self.last_reset_reason,
+            "ase_lbfgs_api": _ase_lbfgs_api_name(self.optimizer),
+        }
+
+    def rebuild(self, snapshots, reason="warm_start_rebuild"):
+        """Rebuild ASE's native state from ``(x, projected_force)`` snapshots.
+
+        The final snapshot is intentionally not replayed.  ASE's next real
+        ``step()`` closes that last secant pair, exactly as its private
+        ``_replay_trajectory`` implementation does for an ordinary trajectory.
         """
-        self._set_regime(regime)
-        rflat = np.asarray(positions, dtype=float).reshape(-1)
-        fflat = np.asarray(force, dtype=float).reshape(-1)
-        added = False
-        if self.previous_position is not None:
-            s = rflat - self.previous_position
-            if norm(s) > 1.0e-15:
-                # y = gradient_new - gradient_old = force_old - force_new.
-                y = self.previous_force - fflat
-                added = self.history.add_pair(s, y)
-        self.previous_position = rflat.copy()
-        self.previous_force = fflat.copy()
-        return added
+        self.reset(reason)
+        opt = self.optimizer
+        r0 = None
+        f0 = None
+        for position, force in list(snapshots)[:-1]:
+            position = np.asarray(position, dtype=float).reshape(-1)
+            force = np.asarray(force, dtype=float).reshape(-1)
+            opt.update(position, force, r0, f0)
+            r0 = position.copy()
+            f0 = force.copy()
+            _ase_lbfgs_increment_iteration(opt)
+        opt.r0 = r0
+        opt.f0 = f0
 
-    def direction(self, force):
-        f = np.asarray(force, dtype=float)
-        direction = self.history.apply(f.reshape(-1)).reshape(f.shape)
-        denom = float(norm(direction) * norm(f))
-        self.last_direction_alignment = (
-            float(np.vdot(direction, f).real / denom) if denom > 0.0 else -1.0
-        )
-        valid = (
-            np.all(np.isfinite(direction))
-            and norm(direction) >= 1.0e-14
-            and np.vdot(direction, f).real > 0.0
-        )
-        return direction, bool(valid)
-
-    def compute_step(
-        self,
-        positions,
-        force,
-        maximum_translation,
-        regime="standard",
-        observe=True,
-        fallback_to_force=True,
-    ):
-        r = np.asarray(positions, dtype=float)
-        f = np.asarray(force, dtype=float)
-        if observe:
-            self.observe(r, f, regime=regime)
-        else:
-            self._set_regime(regime)
-
-        direction, valid = self.direction(f)
-        if not valid:
-            if not fallback_to_force:
-                return None, 0.0, False
-            self.reset("non_descent_translation_direction")
-            self._set_regime(regime)
-            self.observe(r, f, regime=regime)
-            direction = (1.0 / self.history.initial_hessian) * f
-
-        unscaled = self.damping * direction
-        unclipped_norm = float(norm(unscaled))
-        step, step_norm = _global_step_clip(unscaled, maximum_translation)
-        self.last_step_clipped = bool(step_norm + 1.0e-15 < unclipped_norm)
-        return step, step_norm, valid
-
-
-class LBFGSMinModeTranslate(_TranslationDiagnosticsMixin, MinModeTranslate):
-    """No-line-search L-BFGS translation for a MinModeAtoms object."""
-
-    def __init__(
-        self,
-        dimeratoms,
-        logfile="-",
-        trajectory=None,
-        lbfgs_options=None,
-    ):
-        super().__init__(dimeratoms, logfile=logfile, trajectory=trajectory)
-        self._initialize_step_diagnostics()
-        self.lbfgs_model = LBFGSTranslationModel(**dict(lbfgs_options or {}))
-
-    def step(self, f=None):
-        if f is None:
-            f = self.dimeratoms.get_forces()
-        r = self.dimeratoms.get_positions().copy()
-        data = self._start_step_diagnostics(f, "lbfgs")
-        step, step_norm, _ = self.lbfgs_model.compute_step(
-            r,
-            f,
-            maximum_translation=self.max_step,
-            regime=getattr(self.dimeratoms, "translation_regime", "standard"),
-        )
-        data.update({
-            "direction_alignment": self.lbfgs_model.last_direction_alignment,
-            "step_clipped": int(self.lbfgs_model.last_step_clipped),
-        })
-        self.log(f, step_norm)
-        self.dimeratoms.set_positions(r + step)
-        self.f0 = np.asarray(f).flat.copy()
-        self.r0 = r.flat.copy()
-        self._finish_step_diagnostics(
-            data, step_norm, history=self.lbfgs_model.history
-        )
-
-
-class DimerFIREState:
-    """FIRE dynamical state acting on the projected dimer force."""
-
-    def __init__(
-        self,
-        dt=0.1,
-        dtmax=1.0,
-        Nmin=5,
-        finc=1.1,
-        fdec=0.5,
-        astart=0.1,
-        fa=0.99,
-    ):
-        self.dt_initial = float(dt)
-        self.dt = float(dt)
-        self.dtmax = float(dtmax)
-        self.Nmin = int(Nmin)
-        self.finc = float(finc)
-        self.fdec = float(fdec)
-        self.astart = float(astart)
-        self.a = float(astart)
-        self.fa = float(fa)
-        self.Nsteps = 0
-        self.velocity = None
-
-    def reset(self):
-        self.dt = self.dt_initial
-        self.a = self.astart
-        self.Nsteps = 0
-        self.velocity = None
-
-    def compute_step(self, force, maximum_translation):
+    def step(self, force):
         force = np.asarray(force, dtype=float)
-        flat = force.reshape(-1)
-        if self.velocity is None:
-            self.velocity = np.zeros_like(flat)
+        position_before = np.asarray(
+            self.optimizer.optimizable.get_x(), dtype=float
+        ).reshape(-1).copy()
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Please do not pass forces to step\(\)\..*",
+                category=UserWarning,
+                module=r"ase\.optimize\.optimize",
+            )
+            self.optimizer.step(forces=force)
+        position_after = np.asarray(
+            self.optimizer.optimizable.get_x(), dtype=float
+        ).reshape(-1)
+        displacement = position_after - position_before
+        step_metric = float(norm(displacement))
+        raw_direction = np.asarray(self.optimizer.p, dtype=float).reshape(-1)
+        raw_metric = float(
+            self.optimizer.optimizable.gradient_norm(raw_direction)
+        )
+        # ASE clips the raw direction before multiplying by damping.
+        clipped = bool(raw_metric >= self.optimizer.maxstep)
+        alignment = _cosine_alignment(raw_direction, force)
+        return step_metric, clipped, alignment
+
+
+class _DimerLBFGSLogMixin:
+    """Retain the dimer optimizer log columns while using ASE optimizers."""
+
+    def _initialize_dimer_log(self, write_header=True):
+        self._last_step_size = None
+        if write_header and self.logfile is not None:
+            self.logfile.write(
+                "MinModeTranslate: STEP      TIME          ENERGY    "
+                "MAX-FORCE     STEPSIZE    CURVATURE  ROT-STEPS\n"
+            )
+
+    def log(self, gradient):
+        import time
+
+        force = -np.asarray(gradient, dtype=float).reshape(-1, 3)
+        fmax = _projected_fmax(force)
+        energy = self.dimeratoms.get_potential_energy()
+        curvature = self.dimeratoms.get_curvature()
+        rotsteps = self.dimeratoms.control.get_counter("rotcount")
+        if self.logfile is None:
+            return
+        now = time.localtime()
+        if self._last_step_size is None:
+            step_field = "    --------"
         else:
-            vf = float(np.dot(flat, self.velocity))
-            f2 = float(np.dot(flat, flat))
-            if vf > 0.0 and f2 > 0.0:
-                v2 = float(np.dot(self.velocity, self.velocity))
-                self.velocity = (
-                    (1.0 - self.a) * self.velocity
-                    + self.a * flat / np.sqrt(f2) * np.sqrt(v2)
-                )
-                if self.Nsteps > self.Nmin:
-                    self.dt = min(self.dt * self.finc, self.dtmax)
-                    self.a *= self.fa
-                self.Nsteps += 1
-            else:
-                self.velocity[:] = 0.0
-                self.a = self.astart
-                self.dt *= self.fdec
-                self.Nsteps = 0
-        self.velocity += self.dt * flat
-        raw_step = (self.dt * self.velocity).reshape(force.shape)
-        raw_norm = float(norm(raw_step))
-        step, step_norm = _global_step_clip(raw_step, maximum_translation)
-        return step, step_norm, bool(step_norm + 1.0e-15 < raw_norm)
+            step_field = f"{float(self._last_step_size):12.6f}"
+        line = (
+            f"MinModeTranslate: {self.nsteps:4d}  "
+            f"{now[3]:02d}:{now[4]:02d}:{now[5]:02d} "
+            f"{energy:15.6f} {fmax:12.4f} {step_field} "
+            f"{curvature:12.6f} {rotsteps:10d}\n"
+        )
+        self.logfile.write(line)
+
+
+class LBFGSMinModeTranslate(
+    _TranslationDiagnosticsMixin, _DimerLBFGSLogMixin, LBFGS
+):
+    """ASE ``LBFGS`` applied directly to ``MinModeAtoms`` projected forces."""
+
+    def __init__(self, dimeratoms, logfile="-", trajectory=None, lbfgs_options=None):
+        options = dict(lbfgs_options or {})
+        self.dimeratoms = dimeratoms
+        self.control = dimeratoms.get_control()
+        self.reset_on_regime_change = bool(
+            options.pop("reset_on_regime_change", True)
+        )
+        # Legacy custom-recursion knobs are accepted but intentionally ignored.
+        options.pop("dynamic_h0", None)
+        options.pop("curvature_epsilon", None)
+        memory = int(options.pop("memory", 10))
+        alpha = float(options.pop("initial_hessian", 70.0))
+        damping = float(options.pop("damping", 1.0))
+        if options:
+            raise TypeError(f"Unknown ASE dimer L-BFGS options: {sorted(options)}")
+        self._sm_memory = memory
+        self._sm_alpha = alpha
+        self._sm_damping = damping
+        self._sm_regime = None
+        self._sm_reset_count = 0
+        self._sm_last_reset_reason = "initial"
+        LBFGS.__init__(
+            self,
+            dimeratoms,
+            restart=None,
+            logfile=logfile,
+            trajectory=trajectory,
+            maxstep=float(self.control.get_parameter("maximum_translation")),
+            memory=memory,
+            damping=damping,
+            alpha=alpha,
+            use_line_search=False,
+        )
+        self._initialize_step_diagnostics()
+        self._initialize_dimer_log()
+
+    def _reset_native_history(self, reason):
+        _ase_lbfgs_reset_history(self, self._sm_memory)
+        self._sm_reset_count += 1
+        self._sm_last_reset_reason = str(reason)
+
+    def _native_metrics(self):
+        return {
+            "history_size": _ase_lbfgs_history_size(self),
+            "pairs_accepted_total": _ase_lbfgs_pairs_total(self),
+            "pairs_rejected_total": 0,
+            "reset_count": self._sm_reset_count,
+            "last_reset_reason": self._sm_last_reset_reason,
+        }
+
+    def step(self, forces=None):
+        if forces is None:
+            forces = self.dimeratoms.get_forces()
+        forces = np.asarray(forces, dtype=float)
+        regime = str(getattr(self.dimeratoms, "translation_regime", "standard"))
+        if (
+            self._sm_regime is not None
+            and regime != self._sm_regime
+            and self.reset_on_regime_change
+        ):
+            self._reset_native_history(
+                f"translation_regime:{self._sm_regime}->{regime}"
+            )
+        self._sm_regime = regime
+
+        data = self._start_step_diagnostics(forces, "ase_lbfgs")
+        before = np.asarray(self.optimizable.get_x(), dtype=float).reshape(-1).copy()
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Please do not pass forces to step\(\)\..*",
+                category=UserWarning,
+                module=r"ase\.optimize\.optimize",
+            )
+            LBFGS.step(self, forces=forces)
+        after = np.asarray(self.optimizable.get_x(), dtype=float).reshape(-1)
+        displacement = after - before
+        step_metric = float(norm(displacement))
+        raw_direction = np.asarray(self.p, dtype=float).reshape(-1)
+        raw_metric = float(self.optimizable.gradient_norm(raw_direction))
+        data.update(
+            {
+                "direction_alignment": _cosine_alignment(raw_direction, forces),
+                "step_clipped": int(raw_metric >= self.maxstep),
+            }
+        )
+        self._last_step_size = step_metric
+        self._finish_step_diagnostics(
+            data, step_metric, lbfgs_metrics=self._native_metrics()
+        )
 
 
 @dataclass
@@ -716,7 +808,7 @@ class HybridDecision:
 
 
 class HybridDimerStateController:
-    """FIRE -> L-BFGS controller with fmax/curvature hysteresis."""
+    """FIRE -> ASE-LBFGS controller with fmax/curvature hysteresis."""
 
     def __init__(
         self,
@@ -746,9 +838,7 @@ class HybridDimerStateController:
         if self.exit_fmax < self.enter_fmax:
             raise ValueError("hybrid exit_fmax must be >= enter_fmax")
         if self.exit_curvature < self.enter_curvature:
-            raise ValueError(
-                "hybrid exit_curvature must be >= enter_curvature"
-            )
+            raise ValueError("hybrid exit_curvature must be >= enter_curvature")
         self.state = "fire"
         self._enter_count = 0
         self._exit_count = 0
@@ -759,20 +849,17 @@ class HybridDimerStateController:
         self._exit_count = 0
         return HybridDecision("fire", str(event), 0)
 
-    def update(self, fmax, curvature, history_size) -> HybridDecision:
+    def update(self, fmax, curvature, history_pairs) -> HybridDecision:
         if not self.enabled:
             return HybridDecision("fire", "", 0)
-
-        fmax = float(fmax)
-        curvature = float(curvature)
         history_ready = (
             not self.warm_start_history
-            or int(history_size) >= self.minimum_history_pairs
+            or int(history_pairs) >= self.minimum_history_pairs
         )
         if self.state == "fire":
             enter = (
-                fmax <= self.enter_fmax
-                and curvature <= self.enter_curvature
+                float(fmax) <= self.enter_fmax
+                and float(curvature) <= self.enter_curvature
                 and history_ready
             )
             self._enter_count = self._enter_count + 1 if enter else 0
@@ -781,12 +868,12 @@ class HybridDimerStateController:
                 self.state = "lbfgs"
                 self._enter_count = 0
                 return HybridDecision(
-                    "lbfgs", "fire_to_lbfgs", int(history_size)
+                    "lbfgs", "fire_to_lbfgs", int(history_pairs)
                 )
         else:
             exit_now = (
-                fmax >= self.exit_fmax
-                or curvature >= self.exit_curvature
+                float(fmax) >= self.exit_fmax
+                or float(curvature) >= self.exit_curvature
             )
             self._exit_count = self._exit_count + 1 if exit_now else 0
             self._enter_count = 0
@@ -794,19 +881,15 @@ class HybridDimerStateController:
                 self.state = "fire"
                 self._exit_count = 0
                 return HybridDecision(
-                    "fire", "lbfgs_to_fire_threshold", int(history_size)
+                    "fire", "lbfgs_to_fire_threshold", int(history_pairs)
                 )
         return HybridDecision(self.state, "", 0)
 
 
-class HybridMinModeTranslate(_TranslationDiagnosticsMixin, MinModeTranslate):
-    """Warm-started FIRE/L-BFGS dimer translation.
-
-    FIRE takes the early accepted translations.  When
-    ``warm_start_history=True``, those same accepted positions and projected
-    forces populate the live L-BFGS history.  Switching therefore does not
-    require passing a restart object or replaying a trajectory.
-    """
+class HybridMinModeTranslate(
+    _TranslationDiagnosticsMixin, _DimerLBFGSLogMixin, MinModeTranslate
+):
+    """ASE FIRE warm-up followed by ASE L-BFGS on ``MinModeAtoms``."""
 
     def __init__(
         self,
@@ -816,9 +899,24 @@ class HybridMinModeTranslate(_TranslationDiagnosticsMixin, MinModeTranslate):
         lbfgs_options=None,
         hybrid_options=None,
     ):
-        super().__init__(dimeratoms, logfile=logfile, trajectory=trajectory)
+        MinModeTranslate.__init__(
+            self, dimeratoms, logfile=logfile, trajectory=trajectory
+        )
         self._initialize_step_diagnostics()
-        self.lbfgs_model = LBFGSTranslationModel(**dict(lbfgs_options or {}))
+        self._initialize_dimer_log(write_header=False)
+
+        lbfgs = dict(lbfgs_options or {})
+        self.reset_on_regime_change = bool(
+            lbfgs.pop("reset_on_regime_change", True)
+        )
+        lbfgs.pop("dynamic_h0", None)
+        lbfgs.pop("curvature_epsilon", None)
+        self.lbfgs_memory = int(lbfgs.pop("memory", 10))
+        self.lbfgs_alpha = float(lbfgs.pop("initial_hessian", 70.0))
+        self.lbfgs_damping = float(lbfgs.pop("damping", 1.0))
+        if lbfgs:
+            raise TypeError(f"Unknown ASE dimer L-BFGS options: {sorted(lbfgs)}")
+
         options = dict(hybrid_options or {})
         fire_keys = {
             "fire_dt": "dt",
@@ -829,7 +927,7 @@ class HybridMinModeTranslate(_TranslationDiagnosticsMixin, MinModeTranslate):
             "fire_astart": "astart",
             "fire_fa": "fa",
         }
-        fire_options = {
+        self.fire_options = {
             target: options.pop(source)
             for source, target in fire_keys.items()
             if source in options
@@ -837,116 +935,120 @@ class HybridMinModeTranslate(_TranslationDiagnosticsMixin, MinModeTranslate):
         self.reset_history_on_exit = bool(
             options.pop("reset_history_on_exit", True)
         )
-        self.fire_state = DimerFIREState(**fire_options)
-        self.hybrid_controller = HybridDimerStateController(**options)
-        self.warm_start_history = self.hybrid_controller.warm_start_history
+        self.controller = HybridDimerStateController(**options)
+        self.warm_start_history = self.controller.warm_start_history
+        self.snapshots = deque(maxlen=self.lbfgs_memory + 1)
+        self.fire_optimizer = self._new_fire_optimizer()
+        self.lbfgs_state = _ASELBFGSState(
+            dimeratoms,
+            maxstep=self.max_step,
+            memory=self.lbfgs_memory,
+            damping=self.lbfgs_damping,
+            alpha=self.lbfgs_alpha,
+        )
+        self._last_regime = None
+
+    def _new_fire_optimizer(self):
+        return FIRE(
+            self.dimeratoms,
+            restart=None,
+            logfile=None,
+            trajectory=None,
+            maxstep=self.max_step,
+            downhill_check=False,
+            **self.fire_options,
+        )
+
+    def _append_snapshot(self, position, force):
+        item = (
+            np.asarray(position, dtype=float).reshape(-1).copy(),
+            np.asarray(force, dtype=float).reshape(-1).copy(),
+        )
+        if self.snapshots and np.array_equal(self.snapshots[-1][0], item[0]):
+            self.snapshots[-1] = item
+        else:
+            self.snapshots.append(item)
 
     def step(self, f=None):
         if f is None:
             f = self.dimeratoms.get_forces()
         f = np.asarray(f, dtype=float)
-        r = self.dimeratoms.get_positions().copy()
-        regime = getattr(self.dimeratoms, "translation_regime", "standard")
-        fmax = _projected_fmax(f)
-        curvature = float(self.dimeratoms.get_curvature())
-        state_before = self.hybrid_controller.state
+        position = np.asarray(self.optimizable.get_x(), dtype=float).reshape(-1)
+        regime = str(getattr(self.dimeratoms, "translation_regime", "standard"))
+        regime_changed = self._last_regime is not None and regime != self._last_regime
+        self._last_regime = regime
+        if regime_changed and self.reset_on_regime_change:
+            self.snapshots.clear()
+            self.lbfgs_state.reset(f"translation_regime_change:{regime}")
+            self.fire_optimizer = self._new_fire_optimizer()
+            if self.controller.state == "lbfgs":
+                self.controller.force_fire("lbfgs_to_fire_regime_change")
 
-        # The current state closes the secant pair generated by the previous
-        # accepted step.  During FIRE this is the shadow warm-start update.
-        observed = False
-        if state_before == "lbfgs" or self.warm_start_history:
-            self.lbfgs_model.observe(r, f, regime=regime)
-            observed = True
-
-        if state_before == "lbfgs" and self.lbfgs_model.last_regime_changed:
-            decision = self.hybrid_controller.force_fire(
-                "lbfgs_to_fire_regime_change"
-            )
-            self.fire_state.reset()
-        else:
-            decision = self.hybrid_controller.update(
-                fmax, curvature, self.lbfgs_model.history.size
-            )
-        if decision.switch_event == "fire_to_lbfgs" and not self.warm_start_history:
-            self.lbfgs_model.reset("cold_start_fire_to_lbfgs")
-            self.lbfgs_model.observe(r, f, regime=regime)
-            observed = True
-        elif decision.switch_event == "lbfgs_to_fire_threshold":
-            self.fire_state.reset()
-            if self.reset_history_on_exit:
-                self.lbfgs_model.reset("lbfgs_to_fire_threshold")
-                if self.warm_start_history:
-                    self.lbfgs_model.observe(r, f, regime=regime)
-                    observed = True
-
-        if decision.state == "fire":
-            data = self._start_step_diagnostics(
-                f,
-                "fire",
-                hybrid_state="fire",
-                switch_event=decision.switch_event,
-            )
-            step, step_norm, clipped = self.fire_state.compute_step(
-                f, self.max_step
-            )
-            data.update({
-                "direction_alignment": "",
-                "step_clipped": int(clipped),
-                "hybrid_history_pairs_at_switch": int(
-                    decision.history_pairs_at_switch
-                ),
-                "hybrid_warm_start_history": int(self.warm_start_history),
-            })
-        else:
-            data = self._start_step_diagnostics(
-                f,
-                "lbfgs",
-                hybrid_state="lbfgs",
-                switch_event=decision.switch_event,
-            )
-            step, step_norm, valid = self.lbfgs_model.compute_step(
-                r,
-                f,
-                maximum_translation=self.max_step,
-                regime=regime,
-                observe=not observed,
-                fallback_to_force=False,
-            )
-            if not valid or step is None:
-                invalid_alignment = self.lbfgs_model.last_direction_alignment
-                self.lbfgs_model.reset("non_descent_translation_direction")
-                decision = self.hybrid_controller.force_fire(
-                    "lbfgs_to_fire_non_descent"
-                )
-                self.fire_state.reset()
-                if self.warm_start_history:
-                    self.lbfgs_model.observe(r, f, regime=regime)
-                step, step_norm, clipped = self.fire_state.compute_step(
-                    f, self.max_step
-                )
-                data["translation_algorithm"] = "fire"
-                data["hybrid_state"] = "fire"
-                data["hybrid_switch_event"] = decision.switch_event
-                data.update({
-                    "direction_alignment": invalid_alignment,
-                    "step_clipped": int(clipped),
-                })
-            else:
-                data.update({
-                    "direction_alignment": self.lbfgs_model.last_direction_alignment,
-                    "step_clipped": int(self.lbfgs_model.last_step_clipped),
-                })
-            data.update({
-                "hybrid_history_pairs_at_switch": int(
-                    decision.history_pairs_at_switch
-                ),
-                "hybrid_warm_start_history": int(self.warm_start_history),
-            })
-
-        self.log(f, step_norm)
-        self.dimeratoms.set_positions(r + step)
-        self.f0 = f.flat.copy()
-        self.r0 = r.flat.copy()
-        self._finish_step_diagnostics(
-            data, step_norm, history=self.lbfgs_model.history
+        self._append_snapshot(position, f)
+        available_pairs = max(0, len(self.snapshots) - 1)
+        decision = self.controller.update(
+            _projected_fmax(f),
+            float(self.dimeratoms.get_curvature()),
+            available_pairs,
         )
+
+        if decision.switch_event == "fire_to_lbfgs":
+            if self.warm_start_history:
+                self.lbfgs_state.rebuild(
+                    self.snapshots, reason="warm_start_fire_to_lbfgs"
+                )
+            else:
+                self.lbfgs_state.reset("cold_start_fire_to_lbfgs")
+        elif decision.switch_event == "lbfgs_to_fire_threshold":
+            self.fire_optimizer = self._new_fire_optimizer()
+            if self.reset_history_on_exit:
+                self.lbfgs_state.reset("lbfgs_to_fire_threshold")
+                self.snapshots.clear()
+                self._append_snapshot(position, f)
+
+        data = self._start_step_diagnostics(
+            f,
+            decision.state,
+            hybrid_state=decision.state,
+            switch_event=decision.switch_event,
+        )
+        if decision.state == "fire":
+            before = position.copy()
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"Please do not pass forces to step\(\)\..*",
+                    category=UserWarning,
+                    module=r"ase\.optimize\.optimize",
+                )
+                self.fire_optimizer.step(f=f)
+            after = np.asarray(self.optimizable.get_x(), dtype=float).reshape(-1)
+            displacement = after - before
+            step_metric = float(norm(displacement))
+            data.update(
+                {
+                    "direction_alignment": "",
+                    "step_clipped": int(norm(displacement) >= self.max_step),
+                }
+            )
+            metrics = self.lbfgs_state.metrics()
+        else:
+            step_metric, clipped, alignment = self.lbfgs_state.step(f)
+            data.update(
+                {
+                    "direction_alignment": alignment,
+                    "step_clipped": int(clipped),
+                }
+            )
+            metrics = self.lbfgs_state.metrics()
+
+        data.update(
+            {
+                "hybrid_history_pairs_at_switch": int(
+                    decision.history_pairs_at_switch
+                ),
+                "hybrid_warm_start_history": int(self.warm_start_history),
+            }
+        )
+        self._last_step_size = step_metric
+        self._finish_step_diagnostics(data, step_metric, metrics)
