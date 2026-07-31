@@ -196,6 +196,9 @@ def _maybe_gaussian(disp_dict, center_idx, p=0.1):
     Returning {"displacement_center": center_idx} tells ASE's MinModeAtoms to apply
     a random Gaussian displacement centred on that atom, which lets the dimer discover
     reaction types that the directed guess might miss.
+
+    Retained for backward compatibility. All in-tree bulk callers now use
+    _maybe_gauss_or_concentrate, which is this plus the concentration hook.
     """
     if random.random() < p:
         return {"displacement_center": int(center_idx)}
@@ -211,12 +214,18 @@ def _swap_prob(config_dict):
     return config_dict["ourDimer"].get("gaussian_swap_prob", 0.1)
 
 def _concentrate_params(config_dict):
-    """(prob, power, std) for power-law-concentrated Gaussian swaps.
+    """(prob, power, std, max_disp, envelope) for power-law-concentrated swaps.
     concentrate_prob=0 (default) disables the feature — no behavior change."""
+    if config_dict is None:
+        # Matches _swap_prob / _displacement_radius: the reuse generators accept
+        # config_dict=None, and prob=0 means "never concentrate".
+        return (0.0, 1.5, 0.2, 0.0, 0.0)
     d = config_dict["ourDimer"]
     return (float(d.get("concentrate_prob", 0.0)),
             float(d.get("concentrate_power", 1.5)),
-            float(d.get("concentrate_std", 0.2)))
+            float(d.get("concentrate_std", 0.2)),
+            float(d.get("concentrate_max_disp", 0.0)),
+            float(d.get("concentrate_envelope", 0.0)))
 
 
 def _displacement_radius(config_dict, default=3.0):
@@ -240,42 +249,77 @@ def _atoms_within_radius(atoms, center_idx, radius):
     return np.where(np.linalg.norm(deltas, axis=1) <= radius)[0]
 
 
-def _power_law_vector(natoms, eligible_indices, power, std):
+def _power_law_vector(natoms, eligible_indices, power, std, max_disp=0.0,
+                      envelope=0.0, atoms=None, center_idx=None):
     """Concentrated random displacement: iid Gaussian on the eligible atoms,
-    each atom's magnitude raised to `power` (ratios sharpen), then renormalized
-    so the total norm equals std*sqrt(3*n_eligible) — the same total an iid
-    Gaussian of this std would inject, just redistributed. power=1 == plain."""
+    each atom's magnitude raised to `power` (ratios sharpen), then renormalized.
+
+    Normalization, pick one:
+      max_disp <= 0  legacy: total norm = std*sqrt(3*n_eligible), the same total
+                     an iid Gaussian of this std would inject, just redistributed.
+                     power=1 == plain. Size-EXTENSIVE: the largest single-atom
+                     displacement grows like n_eligible**0.25, so one std means a
+                     different kick size on lemat bulk vs an OC22 slab.
+      max_disp  > 0  largest single-atom displacement = max_disp exactly. Size-
+                     intensive; `std` is unused on this path.
+
+    envelope > 0 weights each eligible atom by exp(-r^2/(2*envelope^2)) about
+    center_idx before the power is applied, so the surviving displacement is a
+    contiguous cluster rather than atoms scattered through the cell. Ignored
+    unless both `atoms` and `center_idx` are supplied."""
     d = np.zeros((natoms, 3))
     idx = np.asarray(sorted(set(int(i) for i in eligible_indices)), dtype=int)
     if len(idx) == 0:
         return d
     d[idx] = np.random.standard_normal((len(idx), 3))
+    if envelope > 0.0 and atoms is not None and center_idx is not None:
+        deltas = mic(atoms.positions[idx] - atoms.positions[int(center_idx)],
+                     atoms.get_cell())
+        w = np.exp(-np.sum(deltas ** 2, axis=1) / (2.0 * envelope ** 2))
+        d[idx] *= w[:, None]
     mag = np.linalg.norm(d[idx], axis=1, keepdims=True)
     d[idx] = np.where(mag > 1e-12, d[idx] * mag ** (power - 1), 0.0)
-    total = np.linalg.norm(d)
-    if total > 1e-12:
-        d *= (std * np.sqrt(3 * len(idx))) / total
+    if max_disp > 0.0:
+        peak = np.linalg.norm(d[idx], axis=1).max()
+        if peak > 1e-12:
+            d *= max_disp / peak
+    else:
+        total = np.linalg.norm(d)
+        if total > 1e-12:
+            d *= (std * np.sqrt(3 * len(idx))) / total
     return d
 
 
-def _maybe_concentrate(disp_dict, eligible_indices, natoms, config_dict):
+def _maybe_concentrate(disp_dict, eligible_indices, natoms, config_dict,
+                       atoms=None, center_idx=None):
     """With probability concentrate_prob, replace an ASE Gaussian dict with an
-    explicit power-law-concentrated vector. Returns (dict, was_concentrated)."""
-    q, power, std = _concentrate_params(config_dict)
+    explicit power-law-concentrated vector. Returns (dict, was_concentrated).
+
+    `atoms`/`center_idx` are only consulted when concentrate_envelope > 0. If no
+    center is given, a random eligible atom becomes the envelope center."""
+    q, power, std, max_disp, envelope = _concentrate_params(config_dict)
     if q <= 0.0 or random.random() >= q:
         return disp_dict, False
-    vec = _power_law_vector(natoms, eligible_indices, power, std)
+    if envelope > 0.0 and atoms is not None and center_idx is None:
+        pool = [int(i) for i in eligible_indices]
+        if pool:
+            center_idx = random.choice(pool)
+    vec = _power_law_vector(natoms, eligible_indices, power, std,
+                            max_disp=max_disp, envelope=envelope,
+                            atoms=atoms, center_idx=center_idx)
     return {"displacement_vector": vec, "method": "vector"}, True
 
 def _gauss_or_concentrate(atoms_new, center_idx, config_dict):
     """Return (disp_dict, suffix). Gaussian centered on center_idx; with prob
     concentrate_prob, a power-law vector over atoms within displacement_radius.
     suffix: '' for plain Gaussian, '_conc' when concentrated."""
-    q, power, std = _concentrate_params(config_dict)
+    q, power, std, max_disp, envelope = _concentrate_params(config_dict)
     if q > 0.0 and random.random() < q:
         radius = _displacement_radius(config_dict)
         eligible = _atoms_within_radius(atoms_new, int(center_idx), radius)
-        vec = _power_law_vector(len(atoms_new), eligible, power, std)
+        vec = _power_law_vector(len(atoms_new), eligible, power, std,
+                                max_disp=max_disp, envelope=envelope,
+                                atoms=atoms_new, center_idx=int(center_idx))
         return {"displacement_vector": vec, "method": "vector"}, "_conc"
     return {"displacement_center": int(center_idx)}, ""
 
@@ -364,8 +408,9 @@ def get_vacancy_attempts(atoms, config_dict, num_attempts):
        hops into the NN's original site.
 
     All mechanisms displace atoms halfway along the hop vector (good saddle-point guess).
-    With 10% probability, the directed displacement is replaced by Gaussian noise centred
-    on the primary atom (allows the dimer to discover unexpected reaction paths).
+    With probability gaussian_swap_prob the directed displacement is replaced by
+    Gaussian noise centred on the primary atom (allows the dimer to discover unexpected
+    reaction paths); that swap is itself subject to concentrate_prob.
     """
     cell = atoms.get_cell()
     p = _swap_prob(config_dict)
@@ -399,10 +444,12 @@ def get_vacancy_attempts(atoms, config_dict, num_attempts):
             disp_vector = np.zeros((len(atoms_new), 3))
             disp_vector[new_nn_idx] = 0.5 * mic(vacancy_pos - nn_pos, cell)
 
-            atoms_new.info['reaction_type'] = 'vacancy'
+            disp, suffix = _maybe_gauss_or_concentrate(
+                {"displacement_vector": disp_vector, "method": "vector"},
+                new_nn_idx, atoms_new, config_dict, p)
+            atoms_new.info['reaction_type'] = 'vacancy' + suffix
             images.append(atoms_new)
-            displacement_dicts.append(_maybe_gaussian(
-                {"displacement_vector": disp_vector, "method": "vector"}, new_nn_idx, p=p))
+            displacement_dicts.append(disp)
             selected_indices.append(rm_idx)
 
         elif mechanism == 1:
@@ -426,10 +473,13 @@ def get_vacancy_attempts(atoms, config_dict, num_attempts):
 
                 disp_vector = np.zeros((len(atoms_new), 3))
                 disp_vector[new_nn_idx] = 0.5 * mic(vacancy_pos - nn_pos, cell)
-                atoms_new.info['reaction_type'] = 'vacancy'
+
+                disp, suffix = _maybe_gauss_or_concentrate(
+                    {"displacement_vector": disp_vector, "method": "vector"},
+                    new_nn_idx, atoms_new, config_dict, p)
+                atoms_new.info['reaction_type'] = 'vacancy' + suffix
                 images.append(atoms_new)
-                displacement_dicts.append(_maybe_gaussian(
-                    {"displacement_vector": disp_vector, "method": "vector"}, new_nn_idx, p=p))
+                displacement_dicts.append(disp)
                 selected_indices.append(rm_idx)
                 continue
 
@@ -444,10 +494,12 @@ def get_vacancy_attempts(atoms, config_dict, num_attempts):
             # NNN hops directly toward the vacancy (not toward via-NN)
             disp_vector[new_nnn_idx] = 0.5 * mic(vacancy_pos - nnn_pos, cell)
 
-            atoms_new.info['reaction_type'] = 'vacancy'
+            disp, suffix = _maybe_gauss_or_concentrate(
+                {"displacement_vector": disp_vector, "method": "vector"},
+                new_nnn_idx, atoms_new, config_dict, p)
+            atoms_new.info['reaction_type'] = 'vacancy' + suffix
             images.append(atoms_new)
-            displacement_dicts.append(_maybe_gaussian(
-                {"displacement_vector": disp_vector, "method": "vector"}, new_nnn_idx, p=p))
+            displacement_dicts.append(disp)
             selected_indices.append(rm_idx)
 
         else:  # mechanism == 2
@@ -472,10 +524,12 @@ def get_vacancy_attempts(atoms, config_dict, num_attempts):
                 new_nnn_idx = chosen_nnn if chosen_nnn < rm_idx else chosen_nnn - 1
                 disp_vector[new_nnn_idx] = 0.5 * mic(nn_pos - nnn_pos, cell)
 
-            atoms_new.info['reaction_type'] = 'vacancy'
+            disp, suffix = _maybe_gauss_or_concentrate(
+                {"displacement_vector": disp_vector, "method": "vector"},
+                new_nn_idx, atoms_new, config_dict, p)
+            atoms_new.info['reaction_type'] = 'vacancy' + suffix
             images.append(atoms_new)
-            displacement_dicts.append(_maybe_gaussian(
-                {"displacement_vector": disp_vector, "method": "vector"}, new_nn_idx, p=p))
+            displacement_dicts.append(disp)
             selected_indices.append(rm_idx)
 
     return images, displacement_dicts, selected_indices
@@ -558,7 +612,8 @@ def get_hop_reuse_attempts(atoms, num_attempts, config_dict=None):
 def get_hop_insert_attempts(atoms, num_attempts, config_dict=None):
     """Insert a new small atom at an interstitial site, displace halfway to nearest neighbor site.
 
-    With 10% probability, Gaussian noise is used instead.
+    With probability gaussian_swap_prob, Gaussian noise (possibly concentrated) is
+    used instead.
     """
     sites = find_interstitial_sites(atoms)
 
@@ -586,14 +641,17 @@ def get_hop_insert_attempts(atoms, num_attempts, config_dict=None):
         atoms_new = atoms.copy()
         atoms_new.append(Atom(element_z, position=site_a))
         new_atom_idx = len(atoms_new) - 1
-        atoms_new.info['reaction_type'] = 'hop_insert'
 
         disp_vector = np.zeros((len(atoms_new), 3))
         disp_vector[new_atom_idx] = 0.5 * delta_ab
 
+        disp, suffix = _maybe_gauss_or_concentrate(
+            {"displacement_vector": disp_vector, "method": "vector"},
+            new_atom_idx, atoms_new, config_dict, p)
+        atoms_new.info['reaction_type'] = 'hop_insert' + suffix
+
         images.append(atoms_new)
-        displacement_dicts.append(_maybe_gaussian(
-            {"displacement_vector": disp_vector, "method": "vector"}, new_atom_idx, p=p))
+        displacement_dicts.append(disp)
         selected_indices.append(int(new_atom_idx))
 
     return images, displacement_dicts, selected_indices
@@ -817,7 +875,8 @@ def get_kickout_insert_attempts(atoms, num_attempts, config_dict=None):
     3. Find the nearest lattice atom — this is the atom being kicked.
     4. Inserted atom displaced halfway toward kicked atom's position.
     5. Kicked atom displaced halfway toward site B.
-    With 10% probability, Gaussian noise is used instead.
+    With probability gaussian_swap_prob, Gaussian noise (possibly concentrated) is
+    used instead.
     """
     sites = find_interstitial_sites(atoms)
 
@@ -851,15 +910,18 @@ def get_kickout_insert_attempts(atoms, num_attempts, config_dict=None):
         atoms_new = atoms.copy()
         atoms_new.append(Atom(element_z, position=site_a))
         inserted_idx = len(atoms_new) - 1
-        atoms_new.info['reaction_type'] = 'kickout_insert'
 
         disp_vector = np.zeros((len(atoms_new), 3))
         disp_vector[inserted_idx] = 0.5 * mic(kicked_pos - site_a, cell)
         disp_vector[kicked_idx] = 0.5 * mic(site_b - kicked_pos, cell)
 
+        disp, suffix = _maybe_gauss_or_concentrate(
+            {"displacement_vector": disp_vector, "method": "vector"},
+            inserted_idx, atoms_new, config_dict, p)
+        atoms_new.info['reaction_type'] = 'kickout_insert' + suffix
+
         images.append(atoms_new)
-        displacement_dicts.append(_maybe_gaussian(
-            {"displacement_vector": disp_vector, "method": "vector"}, inserted_idx, p=p))
+        displacement_dicts.append(disp)
         selected_indices.append(int(inserted_idx))
 
     return images, displacement_dicts, selected_indices
@@ -1042,7 +1104,8 @@ def get_adsorbate_attempts(atoms, config_dict, num_attempts):
     images, displacement_dicts, selected_indices = [], [], []
     for _ in range(num_attempts):
         atoms_new = atoms.copy()
-        disp, conc = _maybe_concentrate({"mask": mask}, eligible, len(atoms_new), config_dict)
+        disp, conc = _maybe_concentrate({"mask": mask}, eligible, len(atoms_new),
+                                        config_dict, atoms_new)
         atoms_new.info['reaction_type'] = 'adsorbate_conc' if conc else 'adsorbate'
         images.append(atoms_new)
         displacement_dicts.append(disp)
@@ -1064,7 +1127,8 @@ def get_adsorbate_surface_attempts(atoms, config_dict, num_attempts):
     images, displacement_dicts, selected_indices = [], [], []
     for _ in range(num_attempts):
         atoms_new = atoms.copy()
-        disp, conc = _maybe_concentrate({"mask": mask}, eligible, len(atoms_new), config_dict)
+        disp, conc = _maybe_concentrate({"mask": mask}, eligible, len(atoms_new),
+                                        config_dict, atoms_new)
         atoms_new.info['reaction_type'] = 'adsorbate_surface_conc' if conc else 'adsorbate_surface'
         images.append(atoms_new)
         displacement_dicts.append(disp)
@@ -1093,7 +1157,8 @@ def get_adsorbate_atom_neighbors_attempts(atoms, config_dict, num_attempts):
             eligible = [int(i) for i in near if int(i) in movable]
         else:
             eligible = [int(idx)]
-        disp, conc = _maybe_concentrate(disp, eligible, len(atoms_new), config_dict)
+        disp, conc = _maybe_concentrate(disp, eligible, len(atoms_new),
+                                        config_dict, atoms_new, int(idx))
         atoms_new.info['reaction_type'] = 'adsorbate_atom_neighbors_conc' if conc else 'adsorbate_atom_neighbors'
         images.append(atoms_new)
         displacement_dicts.append(disp)
@@ -1123,7 +1188,8 @@ def get_surface_attempts(atoms, config_dict, num_attempts):
             eligible = [int(i) for i in near if int(i) in movable]
         else:
             eligible = [int(idx)]
-        disp, conc = _maybe_concentrate(disp, eligible, len(atoms_new), config_dict)
+        disp, conc = _maybe_concentrate(disp, eligible, len(atoms_new),
+                                        config_dict, atoms_new, int(idx))
         atoms_new.info['reaction_type'] = 'surface_conc' if conc else 'surface'
         images.append(atoms_new)
         displacement_dicts.append(disp)
@@ -1183,16 +1249,17 @@ def get_all_movable_attempts(atoms, config_dict, num_attempts):
     images, displacement_dicts, selected_indices = [], [], []
     for _ in range(num_attempts):
         atoms_new = atoms.copy()
-        
-        # This will return a power-law vector if concentrate_prob triggers, 
+
+        # This will return a power-law vector if concentrate_prob triggers,
         # otherwise it returns the standard boolean mask for ASE to use.
-        disp, conc = _maybe_concentrate({"mask": mask}, eligible, len(atoms_new), config_dict)
-        
+        disp, conc = _maybe_concentrate({"mask": mask}, eligible, len(atoms_new),
+                                        config_dict, atoms_new)
+
         atoms_new.info['reaction_type'] = 'all_movable_conc' if conc else 'all_movable'
         images.append(atoms_new)
         displacement_dicts.append(disp)
         selected_indices.append(-1)
-        
+
     return images, displacement_dicts, selected_indices
 
 def get_all_atoms_attempts(atoms, config_dict, num_attempts):
@@ -1203,7 +1270,8 @@ def get_all_atoms_attempts(atoms, config_dict, num_attempts):
     images, displacement_dicts, selected_indices = [], [], []
     for _ in range(num_attempts):
         atoms_new = atoms.copy()
-        disp, conc = _maybe_concentrate({"mask": mask}, eligible, len(atoms_new), config_dict)
+        disp, conc = _maybe_concentrate({"mask": mask}, eligible, len(atoms_new),
+                                        config_dict, atoms_new)
         atoms_new.info['reaction_type'] = 'all_atoms_conc' if conc else 'all_atoms'
         images.append(atoms_new)
         displacement_dicts.append(disp)
@@ -1212,44 +1280,45 @@ def get_all_atoms_attempts(atoms, config_dict, num_attempts):
 
 def get_random_bubble_attempts(atoms, config_dict, num_attempts):
     """Localized noise on a random atom and its neighbors within displacement_radius.
-    
-    Picks a random center atom. Finds all atoms within displacement_radius. 
+
+    Picks a random center atom. Finds all atoms within displacement_radius.
     If concentrate_prob is set, applies power-law concentration *only* to this bubble.
     Otherwise, applies standard Gaussian noise to the bubble via displacement_center.
     """
     radius = _displacement_radius(config_dict, default=4.0)
-    
+
     # If running OpenCatalyst (OC), restrict centers and eligible atoms to movable ones
     movable = _movable_oc(atoms) if config_dict["ourDimer"]["dataset_type"] == "oc" else set(range(len(atoms)))
-    
+
     if not movable:
         warnings.warn("No movable atoms found; skipping 'random_bubble'.")
         return [None] * num_attempts, [None] * num_attempts, [-1] * num_attempts
 
     movable_list = list(movable)
     images, displacement_dicts, selected_indices = [], [], []
-    
+
     for _ in range(num_attempts):
         atoms_new = atoms.copy()
-        
+
         # Pick a random movable atom to be the center of the bubble
         center_idx = random.choice(movable_list)
-        
+
         # Find who is inside the bubble
         near_indices = _atoms_within_radius(atoms_new, center_idx, radius)
         eligible = [int(i) for i in near_indices if int(i) in movable]
-        
+
         # We start with a base dict telling ASE to center the Gaussian here
         base_disp = {"displacement_center": int(center_idx)}
-        
+
         # If concentrate_prob > 0, this intercepts the base_disp and returns a custom power-law vector
-        disp, conc = _maybe_concentrate(base_disp, eligible, len(atoms_new), config_dict)
-        
+        disp, conc = _maybe_concentrate(base_disp, eligible, len(atoms_new),
+                                        config_dict, atoms_new, int(center_idx))
+
         atoms_new.info['reaction_type'] = 'random_bubble_conc' if conc else 'random_bubble'
         images.append(atoms_new)
         displacement_dicts.append(disp)
         selected_indices.append(int(center_idx))
-        
+
     return images, displacement_dicts, selected_indices
 
 def get_rotation_attempts(atoms, config_dict, num_attempts):
