@@ -125,7 +125,10 @@ class ConfigManager:
             "concentrate_prob": 0.3,     # fraction of gaussian OC attempts that get concentrated; 0 = off
             "concentrate_power": 1.5,    # 1 = plain gaussian, 1.5 = gentle, 2 = your "squaring", 3+ = very peaked
             "concentrate_std": 0.2,      # sets total kick norm = std*sqrt(3*n_eligible); matches adsorbate_atom's std
-
+            "concentrate_max_disp": 0.0, # 0 = legacy std-based norm. >0 = scale so the largest single-atom
+                                         # displacement is exactly this many Å; size-intensive, concentrate_std unused.
+            "concentrate_envelope": 0.0, # 0 = off. >0 = Gaussian spatial envelope width (Å) about the kick center,
+                                         # so the kick lands on a contiguous cluster, not atoms scattered cell-wide.
         },
         "ourDimerLBFGS": {
             # Inert unless an L-BFGS optimizer is explicitly selected.
