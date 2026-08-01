@@ -121,6 +121,11 @@ class KappaMinModeAtoms(MinModeAtoms):
         self.kappa_mode = None
         self.translation_regime = "kappa"
         self.last_rotation_diagnostics = {}
+        # Gamma scaling actually applied at the last CENTER evaluation. Exposed
+        # so the translator can report how strongly the projected force is
+        # being attenuated relative to the real force.
+        self.last_gamma_1 = 1.0
+        self.last_gamma_2 = 1.0
 
     @staticmethod
     def _ase_rotation_diagnostics(control):
@@ -212,6 +217,21 @@ class KappaMinModeAtoms(MinModeAtoms):
             "phase_b": phase_b_diag,
         }
 
+    def real_fmax(self):
+        """True atomic fmax at the current center, with no gamma attenuation.
+
+        ``get_projected_forces`` scales the real force by gamma_1/gamma_2, and
+        the optimizer's convergence test reads that scaled force. When
+        gamma_2 -> 0 the perpendicular component is discarded entirely, so a
+        geometry whose force is largely perpendicular to the mode can register
+        as converged while the real force is still large. Callers use this to
+        gate convergence on the physical quantity.
+        """
+        forces = np.asarray(self.forces0, dtype=float)
+        if forces.size == 0:
+            return 0.0
+        return float(np.sqrt((forces * forces).sum(axis=1).max()))
+
     def get_projected_forces(self, pos=None):
         if pos is not None:
             forces = self.get_forces(real=True, pos=pos).copy()
@@ -222,17 +242,30 @@ class KappaMinModeAtoms(MinModeAtoms):
         f_parallel = parallel_vector(forces, eigenmode)
         f_perp = forces - f_parallel
 
-        fmax_atom = np.sqrt((self.forces0 ** 2).sum(axis=1).max())
+        # Decide the regime from the SAME geometry whose forces are being
+        # projected. Previously this always read self.forces0, so a trial
+        # evaluation at `pos` was scaled by the regime of the center instead
+        # of its own, making the trial force inconsistent with the point it
+        # was evaluated at.
+        fmax_atom = float(np.sqrt((forces ** 2).sum(axis=1).max()))
         if fmax_atom < self.recover_fmax:
             gamma_1 = 1.0
             gamma_2 = 1.0
-            self.translation_regime = "standard"
+            regime = "standard"
         else:
             bk = np.clip(self.beta * self.kappa, -500.0, 500.0)
             exp_term = np.exp(bk)
             gamma_1 = (2.0 / (1.0 + exp_term)) - 1.0
             gamma_2 = 1.0 - (1.0 / (1.0 + exp_term))
-            self.translation_regime = "kappa"
+            regime = "kappa"
+
+        # Only the center evaluation defines the optimizer's current regime.
+        # Trial-position evaluations must not mutate it, or the translation
+        # history-reset key flickers on points that were never accepted.
+        if pos is None:
+            self.translation_regime = regime
+            self.last_gamma_1 = float(gamma_1)
+            self.last_gamma_2 = float(gamma_2)
 
         return -(gamma_1 * f_parallel) + (gamma_2 * f_perp)
 

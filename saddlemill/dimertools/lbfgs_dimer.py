@@ -13,6 +13,33 @@ The FIRE/L-BFGS hybrid delegates FIRE steps to ``ase.optimize.FIRE`` and
 L-BFGS steps to ``ase.optimize.LBFGS``.  Warm starts rebuild ASE's own L-BFGS
 state from accepted generalized-coordinate/force snapshots; SaddleMill does
 not implement a second L-BFGS two-loop recursion for translation.
+
+Three safeguards are layered on top of ASE, because ASE's ``LBFGSMethod`` and
+its convergence test are written for ordinary minimization and assume a
+conservative field:
+
+1. Curvature damping.  ``LBFGSMethod.update`` stores every secant pair as
+   ``rho = 1/(s.y)`` with no sign or magnitude guard.  The min-mode-following
+   force is not the gradient of any scalar function, so ``s.y <= 0`` occurs
+   routinely and inserts a negative ``rho`` that actively corrupts the search
+   direction; ``s.y ~ 0`` produces an unbounded ``rho``.  Every pair is passed
+   through Powell damping first, which guarantees positive curvature while
+   keeping ASE's bookkeeping (``iteration``/``s``/``y``/``rho`` stay aligned,
+   so ``compute_step`` indexes the newest pairs as intended).
+
+2. Effective-state history resets.  ``MinModeAtoms.get_projected_forces``
+   switches functional form on the sign of the curvature -- it returns
+   ``-parallel_vector(f, mode)`` when curvature > 0 and ``f - 2*parallel(f,
+   mode)`` when curvature < 0 -- and ``KappaMinModeAtoms`` additionally
+   switches gamma scaling on ``translation_regime``.  Those are different
+   vector fields, so history that straddles a switch is invalid.  The reset
+   key covers both.  Previously only ``translation_regime`` was consulted, and
+   ``ConfigurableRotationMinModeAtoms`` never sets that attribute, so under
+   ``engine=ase`` the history was never reset at all.
+
+3. Real-force convergence.  ASE converges on the projected force, which the
+   kappa gamma scaling and ASE's own curvature branch can drive to zero while
+   the real force is large.  Convergence now requires both.
 """
 
 from __future__ import annotations
@@ -38,6 +65,10 @@ from ase.mep.dimer import (
 )
 
 norm = np.linalg.norm
+
+# Minimum curvature (eV/A^2) accepted along a secant pair before Powell
+# damping intervenes. Small enough to be inert on well-behaved steps.
+DEFAULT_CURVATURE_FLOOR = 1.0e-3
 
 
 def _ase_lbfgs_container(optimizer):
@@ -103,6 +134,89 @@ def _ase_lbfgs_reset_history(optimizer, memory):
     optimizer.f0 = None
     optimizer.e0 = None
     optimizer.task = "START"
+
+
+def _damp_secant_forces(pos, forces, r0, f0, curvature_floor):
+    """Powell-damp the secant pair ASE is about to store.
+
+    ASE forms ``s = pos - r0`` and ``y = (-forces) - (-f0) = f0 - forces``.
+    When ``s.y`` falls below ``curvature_floor * |s|^2`` the pair is replaced
+    by ``y' = y + theta*s`` with ``theta`` chosen so ``s.y' == floor``, which
+    is achieved by handing ASE ``forces - theta*s`` instead of ``forces``.
+
+    Returns ``(forces_for_update, was_damped, raw_sy)``.
+    """
+    s = np.asarray(pos, dtype=float).reshape(-1) - np.asarray(
+        r0, dtype=float
+    ).reshape(-1)
+    y = np.asarray(f0, dtype=float).reshape(-1) - np.asarray(
+        forces, dtype=float
+    ).reshape(-1)
+    ss = float(np.dot(s, s))
+    sy = float(np.dot(s, y))
+    if not np.isfinite(ss) or not np.isfinite(sy) or ss <= 0.0:
+        return forces, False, sy
+    floor = float(curvature_floor) * ss
+    if sy >= floor:
+        return forces, False, sy
+    theta = (floor - sy) / ss
+    damped = np.asarray(forces, dtype=float).reshape(-1) - theta * s
+    return damped.reshape(np.shape(forces)), True, sy
+
+
+class _CurvatureGuardedLBFGS(LBFGS):
+    """ASE ``LBFGS`` with Powell damping applied before each history update.
+
+    Only ``update`` is overridden; direction generation, scaling, max-step
+    handling, and the two-loop recursion remain ASE's.
+    """
+
+    def __init__(self, *args, curvature_floor=DEFAULT_CURVATURE_FLOOR, **kwargs):
+        self.curvature_floor = float(curvature_floor)
+        self.sm_pairs_damped = 0
+        self.sm_pairs_seen = 0
+        self.sm_worst_sy = float("inf")
+        super().__init__(*args, **kwargs)
+
+    def update(self, pos, forces, r0, f0):
+        container = _ase_lbfgs_container(self)
+        if int(getattr(container, "iteration", 0)) > 0 and r0 is not None:
+            forces, damped, raw_sy = _damp_secant_forces(
+                pos, forces, r0, f0, self.curvature_floor
+            )
+            self.sm_pairs_seen += 1
+            if np.isfinite(raw_sy):
+                self.sm_worst_sy = min(self.sm_worst_sy, raw_sy)
+            if damped:
+                self.sm_pairs_damped += 1
+        super().update(pos, forces, r0, f0)
+
+    def sm_guard_metrics(self):
+        return {
+            "pairs_seen": int(self.sm_pairs_seen),
+            "pairs_damped": int(self.sm_pairs_damped),
+            "worst_sy": (
+                float(self.sm_worst_sy)
+                if np.isfinite(self.sm_worst_sy)
+                else ""
+            ),
+        }
+
+
+def _translation_state_key(dimeratoms):
+    """Identity of the effective force field currently being optimized.
+
+    Both the kappa gamma regime and ASE's curvature-sign branch in
+    ``get_projected_forces`` change which function the optimizer is following.
+    History accumulated under one is meaningless under the other.
+    """
+    regime = str(getattr(dimeratoms, "translation_regime", "standard"))
+    try:
+        curvature = float(dimeratoms.get_curvature())
+    except Exception:
+        curvature = -1.0
+    branch = "convex" if curvature > 0.0 else "concave"
+    return f"{regime}:{branch}"
 
 
 class LimitedMemoryInverseHessian:
@@ -388,6 +502,9 @@ class ConfigurableRotationMinModeAtoms(MinModeAtoms):
         self.rotation_optimizer = str(rotation_optimizer).lower()
         self.rotation_lbfgs_options = dict(rotation_lbfgs_options or {})
         self.last_rotation_diagnostics = {}
+        # Declared so the translation-history reset key is meaningful under the
+        # ASE engine too; the curvature branch is what actually varies here.
+        self.translation_regime = "standard"
         if self.rotation_optimizer not in {"ase", "lbfgs"}:
             raise ValueError(
                 "rotation_optimizer must be 'ase' or 'lbfgs'; got "
@@ -453,6 +570,24 @@ def _projected_fmax(force) -> float:
     return float(np.sqrt((force * force).sum(axis=1).max()))
 
 
+def _real_fmax(dimeratoms) -> float:
+    """True atomic fmax, independent of any projection or gamma scaling.
+
+    ``MinModeTranslate`` converges on the projected force.  Under the kappa
+    gamma scaling, and under ASE's curvature-sign branch, the projected force
+    can vanish while the real force is large, which registers as a converged
+    run that is not a stationary point.  Recorded here so the condition is at
+    least visible in the optimizer diagnostics.
+    """
+    try:
+        real = np.asarray(dimeratoms.get_forces(real=True), dtype=float)
+    except Exception:
+        return float("nan")
+    if real.size == 0:
+        return 0.0
+    return float(np.sqrt((real * real).sum(axis=1).max()))
+
+
 def _cosine_alignment(direction, force):
     direction = np.asarray(direction, dtype=float).reshape(-1)
     force = np.asarray(force, dtype=float).reshape(-1)
@@ -483,6 +618,44 @@ def _flatten_rotation_diagnostics(dimeratoms):
     }
 
 
+class _RealForceConvergenceMixin:
+    """Gate convergence on the real force, not the projected one.
+
+    ``Optimizer.converged`` reads ``optimizable.get_gradient()``, i.e. minus
+    ``MinModeAtoms.get_forces()``, which is the projected force. Under the
+    kappa gamma scaling (gamma_2 -> 0 discards the perpendicular component)
+    and under ASE's curvature>0 branch (which discards it outright), that
+    projected force can fall below ``fmax`` while the real force is orders of
+    magnitude larger. Requiring both criteria makes a reported convergence
+    mean a stationary point.
+
+    ``get_forces(real=True)`` returns the cached ``forces0`` when no
+    recalculation is pending, so this costs no extra force calls.
+    """
+
+    def converged(self, forces=None, **kwargs):
+        if not super().converged(forces, **kwargs):
+            return False
+        fmax = getattr(self, "fmax", None)
+        if fmax is None:
+            return True
+        try:
+            real = np.asarray(
+                self.dimeratoms.get_forces(real=True), dtype=float
+            )
+        except Exception:
+            return True
+        if real.size == 0:
+            return True
+        real_fmax = float(np.sqrt((real * real).sum(axis=1).max()))
+        if real_fmax < float(fmax):
+            return True
+        self._sm_projected_only_convergences = (
+            getattr(self, "_sm_projected_only_convergences", 0) + 1
+        )
+        return False
+
+
 class _TranslationDiagnosticsMixin:
     def _initialize_step_diagnostics(self):
         self.last_step_diagnostics = None
@@ -503,10 +676,12 @@ class _TranslationDiagnosticsMixin:
             "hybrid_state": hybrid_state,
             "hybrid_switch_event": switch_event,
             "projected_fmax": _projected_fmax(force),
+            "real_fmax": _real_fmax(self.dimeratoms),
             "curvature": float(self.dimeratoms.get_curvature()),
             "translation_regime": getattr(
                 self.dimeratoms, "translation_regime", "standard"
             ),
+            "translation_state_key": _translation_state_key(self.dimeratoms),
             "force_calls_step_entry": entry_calls,
             "force_calls_center_and_rotation": center_rotation_calls,
         }
@@ -533,6 +708,10 @@ class _TranslationDiagnosticsMixin:
                 "translation_lbfgs_pairs_rejected_total": metrics.get(
                     "pairs_rejected_total", 0
                 ),
+                "translation_lbfgs_pairs_damped_total": metrics.get(
+                    "pairs_damped_total", 0
+                ),
+                "translation_lbfgs_worst_sy": metrics.get("worst_sy", ""),
                 "translation_lbfgs_resets": metrics.get("reset_count", 0),
                 "translation_lbfgs_last_reset_reason": metrics.get(
                     "last_reset_reason", ""
@@ -544,7 +723,9 @@ class _TranslationDiagnosticsMixin:
         self._previous_force_calls_after_step = max(after_calls, 0)
 
 
-class DiagnosticMinModeTranslate(_TranslationDiagnosticsMixin, MinModeTranslate):
+class DiagnosticMinModeTranslate(
+    _RealForceConvergenceMixin, _TranslationDiagnosticsMixin, MinModeTranslate
+):
     """Stock ASE ``MinModeTranslate`` with diagnostics only."""
 
     def __init__(self, dimeratoms, logfile="-", trajectory=None):
@@ -570,19 +751,23 @@ class _ASELBFGSState:
     warm starts also work for filters such as ``FrechetCellFilter``.
     """
 
-    def __init__(self, target, *, maxstep, memory, damping, alpha):
+    def __init__(self, target, *, maxstep, memory, damping, alpha,
+                 curvature_floor=DEFAULT_CURVATURE_FLOOR):
         self.target = target
         self.maxstep = float(maxstep)
         self.memory = int(memory)
         self.damping = float(damping)
         self.alpha = float(alpha)
+        self.curvature_floor = float(curvature_floor)
         self.optimizer = self._new_optimizer()
         self.reset_count = 0
         self.last_reset_reason = "initial"
-        self.pairs_rejected_total = 0  # ASE 3.29 LBFGS stores every replay/update pair.
+        self.pairs_damped_carry = 0
+        self.pairs_seen_carry = 0
+        self.worst_sy_carry = float("inf")
 
     def _new_optimizer(self):
-        return LBFGS(
+        return _CurvatureGuardedLBFGS(
             self.target,
             restart=None,
             logfile=None,
@@ -592,9 +777,19 @@ class _ASELBFGSState:
             damping=self.damping,
             alpha=self.alpha,
             use_line_search=False,
+            curvature_floor=self.curvature_floor,
         )
 
+    def _absorb_counters(self):
+        """Carry guard counters across optimizer replacement."""
+        g = self.optimizer.sm_guard_metrics()
+        self.pairs_damped_carry += int(g["pairs_damped"])
+        self.pairs_seen_carry += int(g["pairs_seen"])
+        if g["worst_sy"] != "":
+            self.worst_sy_carry = min(self.worst_sy_carry, float(g["worst_sy"]))
+
     def reset(self, reason="manual"):
+        self._absorb_counters()
         self.optimizer = self._new_optimizer()
         self.reset_count += 1
         self.last_reset_reason = str(reason)
@@ -610,10 +805,19 @@ class _ASELBFGSState:
         return _ase_lbfgs_pairs_total(self.optimizer)
 
     def metrics(self):
+        g = self.optimizer.sm_guard_metrics()
+        damped = self.pairs_damped_carry + int(g["pairs_damped"])
+        worst = self.worst_sy_carry
+        if g["worst_sy"] != "":
+            worst = min(worst, float(g["worst_sy"]))
         return {
             "history_size": self.history_size,
             "pairs_accepted_total": self.pairs_accepted_total,
-            "pairs_rejected_total": self.pairs_rejected_total,
+            # Damped rather than dropped: ASE's compute_step indexes s/y/rho by
+            # iteration, so removing a pair would desynchronize its bookkeeping.
+            "pairs_rejected_total": damped,
+            "pairs_damped_total": damped,
+            "worst_sy": float(worst) if np.isfinite(worst) else "",
             "reset_count": self.reset_count,
             "last_reset_reason": self.last_reset_reason,
             "ase_lbfgs_api": _ase_lbfgs_api_name(self.optimizer),
@@ -704,7 +908,10 @@ class _DimerLBFGSLogMixin:
 
 
 class LBFGSMinModeTranslate(
-    _TranslationDiagnosticsMixin, _DimerLBFGSLogMixin, LBFGS
+    _RealForceConvergenceMixin,
+    _TranslationDiagnosticsMixin,
+    _DimerLBFGSLogMixin,
+    _CurvatureGuardedLBFGS,
 ):
     """ASE ``LBFGS`` applied directly to ``MinModeAtoms`` projected forces."""
 
@@ -721,15 +928,18 @@ class LBFGSMinModeTranslate(
         memory = int(options.pop("memory", 10))
         alpha = float(options.pop("initial_hessian", 70.0))
         damping = float(options.pop("damping", 1.0))
+        curvature_floor = float(
+            options.pop("curvature_floor", DEFAULT_CURVATURE_FLOOR)
+        )
         if options:
             raise TypeError(f"Unknown ASE dimer L-BFGS options: {sorted(options)}")
         self._sm_memory = memory
         self._sm_alpha = alpha
         self._sm_damping = damping
-        self._sm_regime = None
+        self._sm_state_key = None
         self._sm_reset_count = 0
         self._sm_last_reset_reason = "initial"
-        LBFGS.__init__(
+        _CurvatureGuardedLBFGS.__init__(
             self,
             dimeratoms,
             restart=None,
@@ -740,6 +950,7 @@ class LBFGSMinModeTranslate(
             damping=damping,
             alpha=alpha,
             use_line_search=False,
+            curvature_floor=curvature_floor,
         )
         self._initialize_step_diagnostics()
         self._initialize_dimer_log()
@@ -750,10 +961,13 @@ class LBFGSMinModeTranslate(
         self._sm_last_reset_reason = str(reason)
 
     def _native_metrics(self):
+        guard = self.sm_guard_metrics()
         return {
             "history_size": _ase_lbfgs_history_size(self),
             "pairs_accepted_total": _ase_lbfgs_pairs_total(self),
-            "pairs_rejected_total": 0,
+            "pairs_rejected_total": int(guard["pairs_damped"]),
+            "pairs_damped_total": int(guard["pairs_damped"]),
+            "worst_sy": guard["worst_sy"],
             "reset_count": self._sm_reset_count,
             "last_reset_reason": self._sm_last_reset_reason,
         }
@@ -762,16 +976,17 @@ class LBFGSMinModeTranslate(
         if forces is None:
             forces = self.dimeratoms.get_forces()
         forces = np.asarray(forces, dtype=float)
-        regime = str(getattr(self.dimeratoms, "translation_regime", "standard"))
+        # Covers both the kappa gamma regime and ASE's curvature-sign branch.
+        state_key = _translation_state_key(self.dimeratoms)
         if (
-            self._sm_regime is not None
-            and regime != self._sm_regime
+            self._sm_state_key is not None
+            and state_key != self._sm_state_key
             and self.reset_on_regime_change
         ):
             self._reset_native_history(
-                f"translation_regime:{self._sm_regime}->{regime}"
+                f"translation_state:{self._sm_state_key}->{state_key}"
             )
-        self._sm_regime = regime
+        self._sm_state_key = state_key
 
         data = self._start_step_diagnostics(forces, "ase_lbfgs")
         before = np.asarray(self.optimizable.get_x(), dtype=float).reshape(-1).copy()
@@ -782,7 +997,7 @@ class LBFGSMinModeTranslate(
                 category=UserWarning,
                 module=r"ase\.optimize\.optimize",
             )
-            LBFGS.step(self, forces=forces)
+            _CurvatureGuardedLBFGS.step(self, forces=forces)
         after = np.asarray(self.optimizable.get_x(), dtype=float).reshape(-1)
         displacement = after - before
         step_metric = float(norm(displacement))
@@ -887,7 +1102,10 @@ class HybridDimerStateController:
 
 
 class HybridMinModeTranslate(
-    _TranslationDiagnosticsMixin, _DimerLBFGSLogMixin, MinModeTranslate
+    _RealForceConvergenceMixin,
+    _TranslationDiagnosticsMixin,
+    _DimerLBFGSLogMixin,
+    MinModeTranslate,
 ):
     """ASE FIRE warm-up followed by ASE L-BFGS on ``MinModeAtoms``."""
 
@@ -914,6 +1132,9 @@ class HybridMinModeTranslate(
         self.lbfgs_memory = int(lbfgs.pop("memory", 10))
         self.lbfgs_alpha = float(lbfgs.pop("initial_hessian", 70.0))
         self.lbfgs_damping = float(lbfgs.pop("damping", 1.0))
+        self.lbfgs_curvature_floor = float(
+            lbfgs.pop("curvature_floor", DEFAULT_CURVATURE_FLOOR)
+        )
         if lbfgs:
             raise TypeError(f"Unknown ASE dimer L-BFGS options: {sorted(lbfgs)}")
 
@@ -945,8 +1166,9 @@ class HybridMinModeTranslate(
             memory=self.lbfgs_memory,
             damping=self.lbfgs_damping,
             alpha=self.lbfgs_alpha,
+            curvature_floor=self.lbfgs_curvature_floor,
         )
-        self._last_regime = None
+        self._last_state_key = None
 
     def _new_fire_optimizer(self):
         return FIRE(
@@ -974,15 +1196,17 @@ class HybridMinModeTranslate(
             f = self.dimeratoms.get_forces()
         f = np.asarray(f, dtype=float)
         position = np.asarray(self.optimizable.get_x(), dtype=float).reshape(-1)
-        regime = str(getattr(self.dimeratoms, "translation_regime", "standard"))
-        regime_changed = self._last_regime is not None and regime != self._last_regime
-        self._last_regime = regime
-        if regime_changed and self.reset_on_regime_change:
+        state_key = _translation_state_key(self.dimeratoms)
+        state_changed = (
+            self._last_state_key is not None and state_key != self._last_state_key
+        )
+        self._last_state_key = state_key
+        if state_changed and self.reset_on_regime_change:
             self.snapshots.clear()
-            self.lbfgs_state.reset(f"translation_regime_change:{regime}")
+            self.lbfgs_state.reset(f"translation_state_change:{state_key}")
             self.fire_optimizer = self._new_fire_optimizer()
             if self.controller.state == "lbfgs":
-                self.controller.force_fire("lbfgs_to_fire_regime_change")
+                self.controller.force_fire("lbfgs_to_fire_state_change")
 
         self._append_snapshot(position, f)
         available_pairs = max(0, len(self.snapshots) - 1)
