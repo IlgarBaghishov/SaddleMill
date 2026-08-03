@@ -73,18 +73,27 @@ OPTIMIZER_DIAGNOSTIC_FIELDS = [
     "attempt_id",
     "selected_index",
     "reaction_type",
+
+    "diagnostic_serial",
+
     "accepted_translation_step",
     "translation_algorithm",
     "hybrid_state",
     "hybrid_switch_event",
+
     "projected_fmax",
+    "real_fmax",
+
     "curvature",
     "translation_regime",
+    "translation_state_key",
+
     "step_norm",
     "step_clipped",
     "direction_alignment",
     "hybrid_history_pairs_at_switch",
     "hybrid_warm_start_history",
+
     "rotation_optimizer",
     "rotation_steps",
     "rotation_lbfgs_history_size",
@@ -92,26 +101,31 @@ OPTIMIZER_DIAGNOSTIC_FIELDS = [
     "rotation_lbfgs_pairs_rejected",
     "rotation_lbfgs_resets",
     "rotation_lbfgs_fallbacks",
+
     "kappa_rotation_optimizer",
     "kappa_rotation_steps",
     "kappa_rotation_lbfgs_pairs_accepted",
     "kappa_rotation_lbfgs_pairs_rejected",
+
     "translation_lbfgs_history_size",
     "translation_lbfgs_pairs_accepted_total",
     "translation_lbfgs_pairs_rejected_total",
+    "translation_lbfgs_pairs_damped_total",
+    "translation_lbfgs_worst_sy",
     "translation_lbfgs_resets",
     "translation_lbfgs_last_reset_reason",
+
     "force_calls_step_entry",
     "force_calls_center_and_rotation",
     "force_calls_translation_trial",
     "force_calls_cumulative_after_step",
+
     "final_force_calls",
     "force_calls_final_evaluation",
     "final_translation_steps",
     "converged",
     "status",
 ]
-
 
 def _append_csv_row(path, fieldnames, row):
     """Append one row and create a header only for a new/empty shard."""

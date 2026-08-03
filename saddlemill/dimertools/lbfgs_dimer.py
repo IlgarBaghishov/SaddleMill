@@ -619,42 +619,41 @@ def _flatten_rotation_diagnostics(dimeratoms):
 
 
 class _RealForceConvergenceMixin:
-    """Gate convergence on the real force, not the projected one.
+    """Require both projected and real atomic forces to satisfy fmax."""
 
-    ``Optimizer.converged`` reads ``optimizable.get_gradient()``, i.e. minus
-    ``MinModeAtoms.get_forces()``, which is the projected force. Under the
-    kappa gamma scaling (gamma_2 -> 0 discards the perpendicular component)
-    and under ASE's curvature>0 branch (which discards it outright), that
-    projected force can fall below ``fmax`` while the real force is orders of
-    magnitude larger. Requiring both criteria makes a reported convergence
-    mean a stationary point.
-
-    ``get_forces(real=True)`` returns the cached ``forces0`` when no
-    recalculation is pending, so this costs no extra force calls.
-    """
-
-    def converged(self, forces=None, **kwargs):
-        if not super().converged(forces, **kwargs):
+    def gradient_converged(self, gradient):
+        # First apply ASE/Dimer's normal projected-force and curvature test.
+        if not super().gradient_converged(gradient):
             return False
+
         fmax = getattr(self, "fmax", None)
         if fmax is None:
             return True
+
         try:
             real = np.asarray(
-                self.dimeratoms.get_forces(real=True), dtype=float
+                self.dimeratoms.get_forces(real=True),
+                dtype=float,
             )
-        except Exception:
-            return True
+        except Exception as exc:
+            raise RuntimeError(
+                "Unable to evaluate real force for Dimer convergence"
+            ) from exc
+
         if real.size == 0:
             return True
-        real_fmax = float(np.sqrt((real * real).sum(axis=1).max()))
+
+        real_fmax = float(
+            np.sqrt((real * real).sum(axis=1).max())
+        )
+
         if real_fmax < float(fmax):
             return True
+
         self._sm_projected_only_convergences = (
             getattr(self, "_sm_projected_only_convergences", 0) + 1
         )
         return False
-
 
 class _TranslationDiagnosticsMixin:
     def _initialize_step_diagnostics(self):
