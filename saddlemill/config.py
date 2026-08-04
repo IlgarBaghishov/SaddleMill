@@ -105,11 +105,24 @@ class ConfigManager:
         },
         "ourDimer": {
             "dataset_type": None,
-            "reaction_types": None, # Bulk: vacancy hop_reuse hop_insert kickout_reuse kickout_insert ring initial_guess
-                                   # OC: adsorbate_atom adsorbate_atom_neighbors adsorbate diffusion rotation adsorbate_surface surface custom initial_guess
+            "reaction_types": None, # Bulk: vacancy hop_reuse hop_insert kickout_reuse displace_kickout_reuse
+                                   #       kickout_insert ring initial_guess all_atoms random_bubble
+                                   # OC: all_movable adsorbate_atom adsorbate_atom_neighbors adsorbate diffusion
+                                   #     rotation adsorbate_surface surface custom initial_guess random_bubble
             "num_attempts_per_type": 1,
-            "gaussian_swap_prob": 0.1,
+            # Deterministic schedule: N normal attempts, then one Gaussian replacement.
+            # 0 disables scheduled Gaussian replacements.
+            "gaussian_normal_attempts": 0,
+            # Deprecated integer-only compatibility alias. Decimal probabilities fail loudly.
+            "gaussian_swap_prob": None,
+            # Ranked mechanisms never synthesize Gaussian attempts after candidate exhaustion.
+            "reuse_exhaustion": "stop",
             "ring_sizes": "3 4",
+            "ring_mode": "arc",
+            "ring_frac": 0.2,
+            "ring_neighbor_mult": 1.20,
+            "ring_neighbor_cutoff": None,
+            "ring_max_cycles": 20000,
             "supercell": True,
             "delocalization_threshold": 0.8,
             "extension_check_fmax": 0.4,
@@ -121,14 +134,15 @@ class ConfigManager:
             "kappa_recover_fmax": 0.3,  # only used when engine = kappa
             "vasp_command": None,
             "vasp_ncore": None,
-            "bulk_reuse_offset": 0,
-            "concentrate_prob": 0.0,     # fraction of gaussian OC attempts that get concentrated; 0 = off
-            "concentrate_power": 1.5,    # 1 = plain gaussian, 1.5 = gentle, 2 = your "squaring", 3+ = very peaked
-            "concentrate_std": 0.2,      # sets total kick norm = std*sqrt(3*n_eligible); matches adsorbate_atom's std
-            "concentrate_max_disp": 0.0, # 0 = legacy std-based norm. >0 = scale so the largest single-atom
-                                         # displacement is exactly this many Å; size-intensive, concentrate_std unused.
-            "concentrate_envelope": 0.0, # 0 = off. >0 = Gaussian spatial envelope width (Å) about the kick center,
-                                         # so the kick lands on a contiguous cluster, not atoms scattered cell-wide.
+            # Ranked-candidate offset. Effective default is 0. None permits the
+            # sm_offset/SM_OFFSET compatibility fallback in structure_edit.py.
+            "bulk_reuse_offset": None,
+            "sm_offset": None,
+            "concentrate_prob": 0.0,     # fraction of Gaussian attempts replaced by concentration; 0 = off
+            "concentrate_power": 1.5,    # 1 = plain gaussian, 1.5 = gentle, 2 = "squaring", 3+ = very peaked
+            "concentrate_std": 0.2,      # total kick norm = std*sqrt(3*n_eligible) when max_disp=0
+            "concentrate_max_disp": 0.0, # >0 fixes the largest single-atom displacement to this value (A)
+            "concentrate_envelope": 0.0, # >0 Gaussian spatial envelope width (A) around the kick center
         },
         "ourDimerLBFGS": {
             # Inert unless an L-BFGS optimizer is explicitly selected.

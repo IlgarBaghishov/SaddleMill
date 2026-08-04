@@ -32,3 +32,4 @@ examples/nebopt_interesting_cases_aseneb_aselinear/**
 examples/nebopt_interesting_cases_impr_tang_aselinear/**
 examples/SinglePoint_VTSTDimer_MP20Bat/bench/**
 .saddlemill_backups/
+.backup*/

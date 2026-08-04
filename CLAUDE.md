@@ -144,53 +144,28 @@ Auxiliary entry points:
 - `Dimer_optimizer_csvs/optimizer_rank_<rank>.csv`: one `step` row per applied Cartesian translation plus one `summary` row. The CSV columns are preserved. Translation-history counts now report ASE's stored/update state; ASE 3.29 does not apply the former custom positive-`s dot y` pair-rejection rule. `step_norm` remains the actual global displacement norm, while `step_clipped` follows the active ASE optimizer's native max-step rule.
 <!-- END DIMER_LBFGS_DOCS -->
 
-### `dimertools/structure_edit.py` - Reaction Types for Dimer
-Reaction types configured via `reaction_types` (space-separated list). Bulk and OC dispatched via `_BULK_REACTION_TYPE_DISPATCH` / `_OC_REACTION_TYPE_DISPATCH`.
+### `dimertools/structure_edit.py` - Reaction Attempts for Dimer
+`get_attempts()` returns three position-aligned lists: generated `Atoms`, ASE Dimer displacement dictionaries, and selected atom indices. Their list position is the global Dimer `attempt_id`, so every configured reaction type must retain exactly its requested number of slots. A mechanism that cannot generate a candidate returns `None` in that slot; it must not shorten the list and shift later reaction types.
 
-**Bulk reaction types** (`dataset_type = bulk`):
+**Bulk reaction types** (`dataset_type = bulk`): `vacancy`, `hop_reuse`, `hop_insert`, `kickout_reuse`, `displace_kickout_reuse`, `kickout_insert`, `ring`, `initial_guess`, `all_atoms`, and `random_bubble`.
 
-| Type | Function | Description | Atoms displaced |
-|------|----------|-------------|-----------------|
-| `vacancy` | `get_vacancy_attempts()` | Remove atom, then one of three sub-mechanisms (NN hop into vacancy, NNN hop, concerted 2-atom chain) chosen at random per attempt | 1–N (center-based) |
-| `hop_reuse` | `get_hop_reuse_attempts()` | Existing atom relocated to interstitial site | 1 (vector) |
-| `hop_insert` | `get_hop_insert_attempts()` | New small atom (H/C/N/O/B) inserted at interstitial | 1 (vector) |
-| `kickout_reuse` | `get_kickout_reuse_attempts()` | Existing atom to interstitial, kicks nearest into another | 2 (vector) |
-| `kickout_insert` | `get_kickout_insert_attempts()` | New similar-sized atom at interstitial, kicks nearest lattice atom | 2 (vector) |
-| `ring` | `get_ring_attempts()` | Ring of 2+ atoms rotate cooperatively; size from `ring_sizes` config. `ring_sizes = 2` for pairwise exchange. | N (vector) |
-| `initial_guess` | `get_initial_guess_attempts()` | No displacement — starts from input as-is (supercell skipped). For pre-prepared TS guesses. Exclusive: ignores other types with warning. Always 1 attempt. Works with both `bulk` and `oc`. Uses eigenmode from `atoms.info['eigenmode']` or `atoms.info['orig_info']['eigenmode']` if present. | 0 (none) |
+- `hop_reuse`, `kickout_reuse`, `displace_kickout_reuse`, and `ring` enumerate deterministic ranked candidates. `[ourDimer] bulk_reuse_offset` selects the first ranked candidate; `sm_offset` and `SM_OFFSET` are compatibility aliases. `SM_SEED_OFFSET` is deliberately unrelated: it changes the random realization in `dimeropt.py`, not the ranked candidate index.
+- Ranked-candidate exhaustion never creates Gaussian filler. `[ourDimer] reuse_exhaustion = stop` is the only accepted policy. When candidates run out, the mechanism pads the remaining configured slots with `None`, preserving attempt IDs and configured reaction-type accounting.
+- `kickout_reuse` is the site-driven existing-atom mechanism. `displace_kickout_reuse` explicitly enumerates `(void, kicked, kicker)` collision chains, moving the kicker toward the kicked atom and the kicked atom toward the selected void.
+- `ring` enumerates simple cycles for `ring_sizes`, ranks them deterministically, and supports `ring_mode = arc | chord | legacy`. `ring_frac` is the fraction of a full `2*pi/n` exchange rotation; the default arc mode preserves ring bond lengths during the initial displacement.
+- `initial_guess` is exclusive, skips supercell expansion, and always returns one near-zero-displacement attempt. A top-level `atoms.info['eigenmode']` is authoritative; nested `orig_info['eigenmode']` is used only when the top-level mode is absent.
 
-All bulk types (except `initial_guess`) route directed displacement candidates through `_maybe_gaussian()`, which with 10% probability replaces the directed vector with broad isotropic Gaussian noise on the same atom set — keeps a stochastic exploration tail on top of the geometric heuristics.
+**OC reaction types** (`dataset_type = oc`): `all_movable`, `adsorbate_atom`, `adsorbate_atom_neighbors`, `adsorbate`, `diffusion`, `rotation`, `adsorbate_surface`, `surface`, `custom`, `initial_guess`, and `random_bubble`. Tag-0 substrate atoms are fixed. Adsorbate-specific generators require tag 2.
 
-**OC reaction types** (`dataset_type = oc`):
+**Gaussian and concentrated replacements:**
+- `[ourDimer] gaussian_normal_attempts = N` gives a deterministic sequence of `N` directed attempts followed by one Gaussian replacement; `0` disables scheduled Gaussian replacements. The first slot is always directed. Scheduled Gaussian slots preserve the directed mechanism's atom set and do not consume its ranked candidate.
+- `gaussian_swap_prob` is a deprecated integer-only alias for `gaussian_normal_attempts`; decimal probabilities fail loudly instead of silently changing meaning.
+- `[ourDimer] concentrate_prob` independently replaces a Gaussian displacement with the power-law-concentrated vector on the same eligible atom set. Its default is `0.0` (off). `concentrate_power`, `concentrate_std`, `concentrate_max_disp`, and `concentrate_envelope` control the concentration shape and normalization.
 
-Adsorbate atoms: tag=2 only (no fallback). Substrate (tag=0) fixed via `FixAtoms`. If no tag=2 atoms exist, OC reaction-type generators emit a warning and return no attempts.
-
-| Type | Function | Description | Displacement mechanism |
-|------|----------|-------------|----------------------|
-| `adsorbate_atom` | `get_adsorbate_atom_attempts()` | Tight Gaussian on one adsorbate atom — only that atom moves | `displacement_center` + `gauss_std=0.2, number_of_atoms=1` |
-| `adsorbate_atom_neighbors` | `get_adsorbate_atom_neighbors_attempts()` | Broad Gaussian on one adsorbate atom — nearby atoms also displaced | `displacement_center` (default DimerControl std) |
-| `adsorbate` | `get_adsorbate_attempts()` | Random noise on all adsorbate atoms (isomerization) | Adsorbate-only mask |
-| `diffusion` | `get_diffusion_attempts()` | Uniform translation of all adsorbate atoms in random 3D direction | `displacement_vector` (same direction, ~0.1 Å) |
-| `rotation` | `get_rotation_attempts()` | Rigid-body rotation around adsorbate COM. Skips single-atom adsorbates. | `displacement_vector` (tangential, ~0.05 rad) |
-| `adsorbate_surface` | `get_adsorbate_surface_attempts()` | Random noise on adsorbate + neighboring substrate | Adsorbate+neighbors mask (natural_cutoffs * 1.25) |
-| `surface` | `get_surface_attempts()` | Broad Gaussian on one surface atom (tag=1) — surface reconstruction | `displacement_center` (default DimerControl std) |
-| `custom` | `get_custom_attempts()` | Displacement fully controlled by `[DimerControl]` settings | Empty dict (pure DimerControl defaults) |
-| `initial_guess` | `get_initial_guess_attempts()` | Same as bulk `initial_guess` | 0 (none) |
-
-**OC helpers:** `_get_oc_adsorbate_indices(atoms)` (tag=2 only), `_get_oc_neighbor_mask(atoms, adsorbate_indices)` (natural_cutoffs * 1.25), `_sample_adsorbate_atoms(adsorbate_indices, num_needed)` (cycles if fewer available).
-
-**Key infrastructure:**
-- `find_interstitial_sites(atoms, min_dist_frac=0.4)`: Voronoi on 3x3x3 periodic images → filter by min distance (`min_dist_frac * avg_nn_dist`) → cluster within 0.5 Å. Uses `scipy.spatial.Voronoi` and `scipy.cluster.hierarchy`.
-- `_mic_vector()` / `_nearest_site()`: Minimum image convention helpers.
-- `_find_ring(neighbors_dict, seed, ring_size)`: Finds closed rings via constrained random walk. Size=2 → pairwise exchange (with perpendicular dodge vectors so the two atoms don't collide along the bond axis); ≥3 → cooperative rotation.
-- Element sampling: `hop_insert` weights by 1/covalent_radius via `_sample_hop_insert_element` (H favored). `kickout_insert` uses Gaussian weight centered on host avg covalent radius (σ=0.2 Å) from 30 metals/semiconductors via `_sample_kickout_insert_element`.
-- `_get_atom_selection_weights(atoms)`: inverse-covalent-radius weights for picking which existing atom to displace (small atoms favored).
-- `_shuffled_site_indices(num_sites)`: cycles through interstitial sites without repeats, generator pattern.
-- `_maybe_gaussian(displacement, atoms, gauss_prob=0.1, gauss_std=0.4)`: bulk-types pass directed displacements through this. Controlled by `[ourDimer] gaussian_swap_prob` (which overrides the default `gauss_prob`), this adds an exploration tail by replacing the directed vector with broad Gaussian noise on the same atom set.- `turn_into_supercell(atoms, min_length=7.0)`: Preserves `.info` across `make_supercell()`. Enforces min 7 Å cell dimensions (fairchem uses 5 Å radius graph cutoff). Called in `get_attempts()` for all types except `initial_guess` (controlled by `supercell` config, default `True`).
-- Dispatch: `get_attempts()` selects dispatch dict by `dataset_type`. `initial_guess` handled early (before bulk/oc branch) and is also registered in both `_BULK_REACTION_TYPE_DISPATCH` and `_OC_REACTION_TYPE_DISPATCH`.
-- `_safe_normalize(vec)`: Returns random unit vector if norm ≈ 0.
-- `_build_neighbor_dict(atoms)`: Skips self-interactions (`i == j`) in small periodic cells.
-- Defensive guards: zero-weight fallback in `_sample_kickout_insert_element`, empty `ring_sizes` early return, missing adsorbate early return in OC mode.
+**Other infrastructure:**
+- `turn_into_supercell(atoms, min_length=7.0)` preserves `.info` and is centralized in `get_attempts()`. OC systems containing an adsorbate are not expanded because that would duplicate the adsorbate.
+- `find_interstitial_sites()` uses Voronoi vertices from periodic images, a nearest-atom distance filter, and 0.5 A clustering.
+- `num_attempts_per_type` may be one integer for all configured types or a position-aligned list with one count per type.
 
 ### `geomopt.py` - Geometry Optimization
 - `geomopt()`: Standard relaxation with optional cell relaxation (FrechetCellFilter). Output frames carry `task_name` (from `get_task_name`).
@@ -368,18 +343,33 @@ allow_shared_calculator = True
 
 [ourDimer]
 dataset_type = oc            # oc | bulk
-reaction_types = vacancy     # Bulk: vacancy hop_reuse hop_insert kickout_reuse kickout_insert ring initial_guess
-                             # OC: adsorbate_atom adsorbate_atom_neighbors adsorbate diffusion rotation adsorbate_surface surface custom initial_guess
-num_attempts_per_type = 1    # 5 5 5 10 5 5 5 10 5  Multiple numbers will give corresponding attempts per reaction type (Ex: 5 adsorbate_atom, 5 adsorbate_atom_neighbors, 5 adsorbate, 10 diffusion ... etc.)
-ring_sizes = 3 4             # For 'ring' type (bulk only)
-gaussian_swap_prob = 0.1     # Probability bulk reactions are rerouted to a gaussian kick
-supercell = True             # Min 7 Å expansion
+reaction_types = vacancy     # Bulk includes vacancy, hop_reuse, hop_insert, kickout_reuse,
+                             # displace_kickout_reuse, kickout_insert, ring, all_atoms,
+                             # random_bubble, and initial_guess.
+                             # OC includes all_movable, adsorbate*, diffusion, rotation,
+                             # surface, custom, random_bubble, and initial_guess.
+num_attempts_per_type = 1    # One count for all types, or one position-aligned count per type.
+gaussian_normal_attempts = 0 # 0=off; N gives N directed attempts then one Gaussian replacement.
+reuse_exhaustion = stop      # Only supported policy; exhausted ranked slots become explicit None attempts.
+bulk_reuse_offset =          # Effective default 0; independent of SM_SEED_OFFSET.
+ring_sizes = 3 4
+ring_mode = arc              # arc | chord | legacy
+ring_frac = 0.2              # Fraction of a full 2*pi/n exchange rotation.
+ring_neighbor_mult = 1.20
+ring_neighbor_cutoff =       # Optional flat cutoff override in A.
+ring_max_cycles = 20000
+concentrate_prob = 0.0       # Off by default; fraction of Gaussian slots made concentrated.
+concentrate_power = 1.5
+concentrate_std = 0.2
+concentrate_max_disp = 0.0
+concentrate_envelope = 0.0
+supercell = True             # Min 7 A expansion; skipped for OC structures with adsorbates.
 delocalization_threshold = 0.8
 extension_check_fmax = 0.4
 extension_check_curvature = -0.2
 engine = ase                 # ase (default) | kappa
-kappa_beta = 5.0,          # only used when engine = kappa
-kappa_recover_fmax = 0.3  # only used when engine = kappa
+kappa_beta = 5.0             # only used when engine = kappa
+kappa_recover_fmax = 0.3     # only used when engine = kappa
 
 [DimerControl]
 max_num_rot = 1
