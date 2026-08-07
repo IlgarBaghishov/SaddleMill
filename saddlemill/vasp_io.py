@@ -9,7 +9,8 @@ POTCAR selection, and the ``VaspInteractive`` interactive flags are all handled
 correctly. The generator only decides *what settings to use*, never writes files.
 
 Selection lives in ``[ourVasp] input_generator`` and may be:
-  - a built-in name: ``omat24_static``, ``omat24_relax``, ``cheap_omat``, ``oc20``
+  - a built-in name: ``omat24_static``, ``omat24_relax``, ``cheap_omat``,
+    ``oc20``, ``cheap_oc20``, ``oc22``, ``cheap_oc22``
   - ``package.module:func`` — import an installed module and use ``func``
   - ``/abs/or/rel/file.py:func`` — load a local ``.py`` file and use ``func``
 
@@ -45,6 +46,11 @@ import warnings
 # INCAR tags selecting VASP's *internal* ionic driver. SaddleMill controls
 # geometry via ASE optimizers, so these must never come from a generator.
 _DRIVER_KEYS = {"ibrion", "nsw", "potim", "ediffg"}
+
+# Lanthanides whose f-in-core ``_3`` POTCARs the cheap_* generators must keep:
+# the f-in-valence potentials that a light/minimal base would pick make the SCF
+# non-convergent on partially-filled-4f systems. (La/Ce/Eu/Gd stay standard.)
+_LANTH_FCORE = {"Pr", "Nd", "Pm", "Sm", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu"}
 
 
 def _to_native(v):
@@ -149,11 +155,8 @@ def cheap_omat(atoms):
     kwargs = _omat24(atoms, "OMat24StaticSet",
                      user_kpoints_settings={"reciprocal_density": 16})
     setups = {"base": "minimal", "O": "_s", "C": "_s", "N": "_s"}
-    # Preserve the f-in-core ``_3`` lanthanide POTCARs that OMat24StaticSet selects (only
-    # for lanthanides actually present). The ``minimal`` base would otherwise revert them to
-    # f-in-valence potentials, whose partially-filled 4f shell makes the SCF non-convergent
-    # on these systems. (La/Ce/Eu/Gd stay standard, matching OMat24StaticSet.)
-    _LANTH_FCORE = {"Pr", "Nd", "Pm", "Sm", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu"}
+    # Preserve the f-in-core ``_3`` lanthanide POTCARs that OMat24StaticSet
+    # selects (only for lanthanides actually present) — see _LANTH_FCORE.
     for _el in _LANTH_FCORE.intersection(atoms.get_chemical_symbols()):
         setups[_el] = "_3"
     kwargs["setups"] = setups
@@ -171,11 +174,205 @@ def oc20(atoms):
     return kwargs
 
 
+def cheap_oc20(atoms):
+    """OC20 recipe tuned DOWN for a cheap first-pass saddle search.
+
+    Two changes vs :func:`oc20`, mirroring :func:`cheap_omat`: the surface
+    k-point multiplier is halved from 40 to 20 (~4x fewer in-plane k-points),
+    and the POTCARs get soft ``_s`` O/C/N on top of the ``minimal`` base OC20
+    already uses — so ENCUT can fall to ~300 (set it in ``[Vasp]``; the
+    generator keeps OC20's 350). Reconverge the resulting saddle with
+    :func:`oc20`. All other electronic knobs are left to the ``[Vasp]`` section.
+
+    Note: there is no soft ``_s`` POTCAR for F (and a few other hard anions),
+    so fluorine-bearing systems still need a higher ENCUT than 300.
+    """
+    import numpy as np
+    kwargs = oc20(atoms)
+    # Same formula as fairchem's calculate_surface_k_points (inf-norm + round),
+    # with the multiplier halved.
+    cell = atoms.get_cell()
+    a0 = np.linalg.norm(cell[0], ord=np.inf)
+    b0 = np.linalg.norm(cell[1], ord=np.inf)
+    kwargs["kpts"] = (max(1, int(round(20 / a0))), max(1, int(round(20 / b0))), 1)
+    setups = {"base": "minimal", "O": "_s", "C": "_s", "N": "_s"}
+    for _el in _LANTH_FCORE.intersection(atoms.get_chemical_symbols()):
+        setups[_el] = "_3"
+    kwargs["setups"] = setups
+    return kwargs
+
+
+#==============================================================================
+### OC22 (exact Meta settings, frozen)
+#
+# The OC22 dataset (arXiv:2206.08917) was generated with the WhereWulff
+# ``MOSurfaceSet`` (a ``MVLSlabSet``/MPRelaxSet subclass) from the
+# ``OC22_dataset`` branch of Open-Catalyst-Project/Open-Catalyst-Dataset,
+# rendered with 2022-era pymatgen (v2022.4.19). Today's pymatgen has drifted
+# from what Meta actually ran (it now injects ENAUG=4000 and EDIFF=1e-5,
+# changed the LDAU-applicability rule, and updated POTCAR mappings), so the
+# effective settings are frozen here verbatim instead of being re-derived
+# through pymatgen. Every value below was cross-checked against the paper's
+# "Additional DFT settings" SI section.
+
+# Materials Project GGA+U values (d-shell, J=0) — SI Table 18.
+_OC22_U = {"Co": 3.32, "Cr": 3.7, "Fe": 5.3, "Mn": 3.9,
+           "Mo": 4.38, "Ni": 6.2, "V": 3.25, "W": 6.2}
+
+# MP element-default initial moments (2022 VASPIncarBase.yaml MAGMOM, sans
+# oxidation-state variants); everything else 0.6. Implements the paper's
+# "ferromagnetic or nonmagnetic per Horton et al." initialization.
+_OC22_MAGMOM = {"Ce": 5, "Co": 0.6, "Cr": 5, "Eu": 10, "Fe": 5,
+                "Mn": 5, "Mo": 5, "Ni": 5, "V": 5, "W": 5}
+
+# 2022-era MPRelaxSet POTCAR table (suffixed entries only; unlisted elements
+# use the bare-symbol POTCAR) with the OC22 W_pv -> W_sv fix (W_pv does not
+# exist in the PBE 5.4 library Meta used).
+_OC22_SETUPS = {
+    "Ba": "_sv", "Be": "_sv", "Ca": "_sv", "Cr": "_pv", "Cs": "_sv",
+    "Cu": "_pv", "Dy": "_3", "Er": "_3", "Fe": "_pv", "Ga": "_d",
+    "Ge": "_d", "Hf": "_pv", "Ho": "_3", "In": "_d", "K": "_sv",
+    "Li": "_sv", "Lu": "_3", "Mg": "_pv", "Mn": "_pv", "Mo": "_pv",
+    "Na": "_pv", "Nb": "_pv", "Nd": "_3", "Ni": "_pv", "Os": "_pv",
+    "Pb": "_d", "Pm": "_3", "Pr": "_3", "Rb": "_sv", "Re": "_pv",
+    "Rh": "_pv", "Ru": "_pv", "Sc": "_sv", "Sm": "_3", "Sn": "_d",
+    "Sr": "_sv", "Ta": "_pv", "Tb": "_3", "Tc": "_pv", "Ti": "_pv",
+    "Tl": "_d", "Tm": "_3", "V": "_pv", "W": "_sv", "Y": "_sv",
+    "Yb": "_2", "Zr": "_sv",
+}
+
+
+def _oc22_kwargs(atoms, k_product):
+    import numpy as np
+    symbols = set(atoms.get_chemical_symbols())
+    kwargs = {
+        "gga": "PE", "pp": "PBE", "xc": "PBE",
+        "encut": 500.0,
+        "ediff": 1e-4,
+        "algo": "Fast",
+        "prec": "Accurate",
+        "ismear": 0,
+        "sigma": 0.05,
+        "ispin": 2,
+        "isif": 0,
+        "isym": 0,
+        "symprec": 1e-10,
+        "lreal": False,
+        "lasph": True,
+        "lorbit": 11,
+        "nelm": 60,
+        "nelmin": 8,
+        "ncore": 4,
+        "istart": 1,
+        "lwave": True,
+        "lvtot": True,
+    }
+
+    # Gamma-centered ceil(k_product/a) x ceil(k_product/b) x 1 surface mesh
+    # ("non-integer values rounded up to the nearest integer" — the paper).
+    abc = atoms.cell.lengths()
+    kwargs["kpts"] = (int(np.ceil(k_product / abc[0])),
+                      int(np.ceil(k_product / abc[1])), 1)
+    kwargs["gamma"] = True
+
+    # Hubbard U when the most electronegative element is O or F — only F beats
+    # O on the Pauling scale, so that reduces to "O or F present" — and at
+    # least one U-corrected metal is in the cell. Element-keyed ldau_luj so U
+    # survives ASE's atom re-sort; ASE gives unlisted elements L=-1/U=0, which
+    # is physically identical to the U=0 rows in Meta's INCARs.
+    u_elts = symbols & set(_OC22_U)
+    if symbols & {"O", "F"} and u_elts:
+        kwargs["ldau"] = True
+        kwargs["ldautype"] = 2
+        kwargs["ldauprint"] = 1
+        kwargs["ldau_luj"] = {el: {"L": 2, "U": _OC22_U[el], "J": 0.0}
+                              for el in sorted(u_elts)}
+
+    # LMAXMIX by d/f-block presence (2022 DictSet rule, applied regardless of U).
+    numbers = atoms.get_atomic_numbers()
+    if (numbers > 56).any():
+        kwargs["lmaxmix"] = 6
+    elif (numbers > 20).any():
+        kwargs["lmaxmix"] = 4
+
+    # MAGMOM: magmoms already on the atoms win (ASE writes them itself, like
+    # pymatgen's site-magmom precedence); else MP element defaults.
+    if not atoms.get_initial_magnetic_moments().any():
+        kwargs["magmom"] = [_OC22_MAGMOM.get(s, 0.6)
+                            for s in atoms.get_chemical_symbols()]
+
+    # Dipole correction for adsorbate+slabs only (Meta's auto_dipole rule);
+    # SaddleMill marks adsorbate atoms with tag==2 (the OC convention). DIPOL
+    # is the mass-weighted center of mass in fractional coordinates.
+    if (atoms.get_tags() == 2).any():
+        com = np.average(atoms.get_scaled_positions(),
+                         weights=atoms.get_masses(), axis=0)
+        kwargs["ldipol"] = True
+        kwargs["idipol"] = 3
+        kwargs["dipol"] = [float(x) for x in com]
+
+    kwargs["setups"] = {el: _OC22_SETUPS[el]
+                        for el in sorted(symbols & set(_OC22_SETUPS))}
+    return kwargs
+
+
+def oc22(atoms):
+    """OC22 oxide slab/adslab settings, exactly as Meta generated the dataset.
+
+    PBE (GGA=PE) + Materials Project Hubbard U (element-keyed, only when O/F is
+    the most electronegative element present), spin-polarized with MP-default
+    initial moments (atoms' own magmoms win if set), ENCUT 500, EDIFF 1e-4,
+    Gaussian smearing (ISMEAR 0, SIGMA 0.05), Gamma-centered
+    ceil(30/a) x ceil(30/b) x 1 k-mesh, 2022-era MPRelaxSet POTCAR setups with
+    the W_sv fix, and dipole correction iff the structure has tag==2 adsorbate
+    atoms (Meta applied it to adsorbate+slabs only). Meta used the PBE 5.4
+    POTCAR library — set ``pp_version = 54`` in ``[Vasp]`` if your
+    ``$VASP_PP_PATH`` uses versioned ``potpaw_PBE.54`` folders.
+
+    Meta's ionic-driver tags (IBRION=2, NSW=300, EDIFFG=-0.05) are stripped as
+    usual — SaddleMill drives geometry through ASE optimizers; put ``ediffg``
+    in ``[Vasp]`` for a VASP-internal run (e.g. the VTST dimer launcher).
+    Note OC22 wrote WAVECAR/LOCPOT (ISTART=1, LWAVE/LVTOT=True) — override in
+    ``[Vasp]`` if you don't want the disk traffic.
+    """
+    return _oc22_kwargs(atoms, k_product=30)
+
+
+def cheap_oc22(atoms):
+    """OC22 recipe tuned DOWN for a cheap first-pass saddle search.
+
+    Two changes vs :func:`oc22`, mirroring :func:`cheap_omat`: the k-point
+    product drops from 30 to 15 (~4x fewer in-plane k-points), and the POTCARs
+    are lightened to ASE's ``minimal`` base with soft ``_s`` O/C/N — so ENCUT
+    can fall to ~300 (set it in ``[Vasp]``; the generator keeps OC22's 500).
+    The physics-defining settings (ISPIN=2, Hubbard U, PBE) are kept, so the
+    cheap pass stays on the same PES — reconverge the resulting saddle with
+    :func:`oc22`. All other electronic knobs are left to the ``[Vasp]``
+    section.
+
+    Lanthanides keep OC22's f-in-core POTCARs (``_3``, Yb ``_2``); the
+    f-in-valence ones a bare ``minimal`` base would pick make the SCF
+    non-convergent on partially-filled-4f systems. There is no soft ``_s``
+    POTCAR for F, so fluorine-bearing systems still need a higher ENCUT.
+    """
+    kwargs = _oc22_kwargs(atoms, k_product=15)
+    setups = {"base": "minimal", "O": "_s", "C": "_s", "N": "_s"}
+    for el in set(atoms.get_chemical_symbols()):
+        suf = _OC22_SETUPS.get(el)
+        if suf in ("_2", "_3"):
+            setups[el] = suf
+    kwargs["setups"] = setups
+    return kwargs
+
+
 _BUILTINS = {
     "omat24_static": omat24_static,
     "omat24_relax": omat24_relax,
     "cheap_omat": cheap_omat,
     "oc20": oc20,
+    "cheap_oc20": cheap_oc20,
+    "oc22": oc22,
+    "cheap_oc22": cheap_oc22,
 }
 
 
