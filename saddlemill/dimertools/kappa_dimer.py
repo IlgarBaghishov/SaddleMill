@@ -1,5 +1,9 @@
 import numpy as np
 from ase.mep.dimer import DimerEigenmodeSearch, MinModeAtoms, perpendicular_vector, parallel_vector, DimerControl
+from saddlemill.dimertools.lbfgs_dimer import (
+    LBFGSRotationMixin,
+    LBFGSDimerEigenmodeSearch,
+)
 
 norm = np.linalg.norm
 
@@ -66,18 +70,31 @@ class KappaEigenmodeSearch(DimerEigenmodeSearch):
         self.control.increment_counter('rotcount')
 
 
+class LBFGSKappaEigenmodeSearch(LBFGSRotationMixin, KappaEigenmodeSearch):
+    """L-BFGS direction optimizer for constrained Phase-B rotation."""
+
+
+
 class KappaMinModeAtoms(MinModeAtoms):
     """
     Extended MinModeAtoms to handle the Phase A/B double rotation and 
     the kappa-weighted translation forces.
     """
-    def __init__(self, atoms, beta=2.0, recover_fmax = 0.3, kappa_control=None, **kwargs):
+    def __init__(self, atoms, beta=2.0, recover_fmax = 0.3, kappa_control=None,
+                 rotation_optimizer="ase", rotation_lbfgs_options=None, **kwargs):
         super().__init__(atoms, **kwargs)
         
         # Tuning parameters for the translation step
         self.beta = beta           # Steepness of the switching function
         self.kappa = 0.0           # Initialize isopotential curvature
-        self.recover_fmax = recover_fmax # max atom force norm (like EDIFFG). to determine if to switch back to normal dimer method. 
+        self.recover_fmax = recover_fmax # max atom force norm (like EDIFFG). to determine if to switch back to normal dimer method.
+        self.rotation_optimizer = str(rotation_optimizer).lower()
+        self.rotation_lbfgs_options = dict(rotation_lbfgs_options or {})
+        if self.rotation_optimizer not in {"ase", "lbfgs"}:
+            raise ValueError(
+                "rotation_optimizer must be 'ase' or 'lbfgs'; got "
+                f"{rotation_optimizer!r}"
+            )
         if kappa_control is not None:
             self.kappa_control = kappa_control
         else:
@@ -89,7 +106,23 @@ class KappaMinModeAtoms(MinModeAtoms):
                 f_rot_min=0.01, f_rot_max=2.0,   # don't bail after one rotation
                 max_num_rot=4,
                 logfile=self.control.logfile, eigenmode_logfile=self.control.logfile)  
-        self.kappa_mode = None    
+        self.kappa_mode = None
+        self.kappa_active = True
+        self.translation_regime = "kappa"
+
+    def _run_search(self, search_class, control, eigenmode):
+        kwargs = {}
+        if self.rotation_optimizer == "lbfgs":
+            kwargs["lbfgs_options"] = self.rotation_lbfgs_options
+        search = search_class(self, control, eigenmode=eigenmode, **kwargs)
+        search.converge_to_eigenmode()
+        return search
+
+    def real_fmax(self):
+        forces = np.asarray(self.forces0, dtype=float)
+        if forces.size == 0:
+            return 0.0
+        return float(np.sqrt((forces * forces).sum(axis=1).max()))
  
     def find_eigenmodes(self, order=1):
         """
@@ -102,8 +135,12 @@ class KappaMinModeAtoms(MinModeAtoms):
         # ---------------------------------------------------------
         # PHASE A: Standard unconstrained rotation to find eigenmode and curvature_A
         # ---------------------------------------------------------
-        search_A = DimerEigenmodeSearch(self, self.control, eigenmode=self.eigenmodes[0])
-        search_A.converge_to_eigenmode()
+        phase_a_class = (
+            LBFGSDimerEigenmodeSearch
+            if self.rotation_optimizer == "lbfgs"
+            else DimerEigenmodeSearch
+        )
+        search_A = self._run_search(phase_a_class, self.control, self.eigenmodes[0])
         search_A.set_up_for_optimization_step()
         
         eigenmode = search_A.get_eigenmode()
@@ -112,6 +149,23 @@ class KappaMinModeAtoms(MinModeAtoms):
         # Store true minimum mode and curvature
         self.eigenmodes[0] = eigenmode
         self.curvatures[0] = curvature_A
+
+        # Positive curvature uses ASE Dimer's drag-up branch. Kappa Phase B
+        # and gamma weighting are mathematically unused there.
+        if curvature_A > 0.0:
+            self.kappa = 0.0
+            self.kappa_active = False
+            self.translation_regime = "standard"
+            return
+
+        # recover_fmax is a center-geometry switch back to normal Dimer.
+        # Decide it once here so trial positions cannot flip the regime.
+        self.kappa_active = self.real_fmax() >= self.recover_fmax
+        if not self.kappa_active:
+            self.kappa = 0.0
+            self.translation_regime = "standard"
+            return
+        self.translation_regime = "kappa"
 
         # ---------------------------------------------------------
         # PHASE B: Constrained rotation to find kappa_mode and kappa
@@ -138,8 +192,12 @@ class KappaMinModeAtoms(MinModeAtoms):
         else:
             guess = fresh_guess()
 
-        search_B = KappaEigenmodeSearch(self, self.kappa_control, eigenmode=guess)
-        search_B.converge_to_eigenmode()
+        phase_b_class = (
+            LBFGSKappaEigenmodeSearch
+            if self.rotation_optimizer == "lbfgs"
+            else KappaEigenmodeSearch
+        )
+        search_B = self._run_search(phase_b_class, self.kappa_control, guess)
         self.kappa_mode = search_B.get_eigenmode().copy() 
        
         curvature_kappa = search_B.get_curvature()
@@ -165,19 +223,29 @@ class KappaMinModeAtoms(MinModeAtoms):
         f_parallel = parallel_vector(forces, eigenmode)
         f_perp = forces - f_parallel
 
-        # 2. Calculate switching functions based on kappa
-        # gamma_1 ranges from [-1, 1], gamma_2 ranges from [0, 1]
-        # switches to normal dimer method when fmax < 0.1
+        # Positive curvature is stock Dimer drag-up. Do not apply Kappa
+        # gamma weighting before the inflection point.
+        if self.curvatures[0] > 0.0:
+            if pos is None:
+                self.translation_regime = "standard"
+            return -f_parallel
 
-        fmax_atom = np.sqrt((self.forces0 ** 2).sum(axis=1).max())
-        if fmax_atom < self.recover_fmax:
+        # 2. Calculate switching functions based on the accepted CENTER regime.
+        # Trial positions evaluated by an optimizer do not independently switch
+        # Kappa on/off.
+        if not self.kappa_active:
             gamma_1 = 1.0
             gamma_2 = 1.0
+            regime = "standard"
         else:
             bk = np.clip(self.beta * self.kappa, -500.0, 500.0)
             exp_term = np.exp(bk)
             gamma_1 = (2.0 / (1.0 + exp_term)) - 1.0
             gamma_2 = 1.0 - (1.0 / (1.0 + exp_term))
+            regime = "kappa"
+
+        if pos is None:
+            self.translation_regime = regime
 
         # 3. Construct the final modified translation force
         # A standard dimer is simply: f_translated = f_perp - f_parallel

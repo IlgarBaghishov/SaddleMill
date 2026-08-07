@@ -4,6 +4,8 @@
 
 SaddleMill is a Python library for creating datasets of Transition States (TS) using neural network potentials (FAIRChemCalculator / Meta's UMA model) or DFT (VASP / VaspInteractive). It supports distributed GPU execution on HPC systems (4 A100 per node, GH200, 3 A100 per node) via executorlib + Flux.
 
+> **Configuration source-of-truth rule.** Current checked-out SaddleMill source, `config.py`, and this `CLAUDE.md` define the accepted schema. Historical campaign configs are scientific records, not schema authority; validate them against the current parser before reuse and stop on changed/invalid semantics rather than silently translating them.
+
 ## Dependencies
 
 Minimum required versions (baseline, enforced in `pyproject.toml`):
@@ -121,9 +123,17 @@ Auxiliary entry points:
 - **Consecutive error tracking**: Structure-level `consecutive_errors` counter (from `init_function`). All attempts fail → increment; any success → reset to 0. At `max_consecutive_errors`, worker calls `sys.exit(1)` for executorlib restart.
 - **Per-attempt execution**: Accepts `entries_to_run` (set of attempt_ids) and `continuation_data` (dict: attempt_id → Atoms). Calls `get_attempts()` on original input, then per attempt: skips if not in `entries_to_run`, uses `continuation_data[attempt_id]` if available (near-zero displacement),
 - else fresh attempt. Eigenmode/reaction_type read from top-level `.info` first, `orig_info` fallback.
-- **Engine Selection**: Supports both standard ASE dimer (`engine = dimer`, default) and the Kappa dimer (`engine = kappa`). The Kappa dimer utilizes a Phase A/Phase B double rotation scheme to constrain the dimer rotation to the isopotential hyperplane via `KappaMinModeAtoms`. It smoothly blends translation forces using a switching function governed by `beta` (steepness) and automatically recovers to the standard normal dimer method when maximum atomic forces drop below `recover_fmax`.
+- **Engine Selection**: `[ourDimer] engine` supports standard ASE Dimer (`ase`, default), Kappa Dimer (`kappa`), and Sella (`sella`). Sella is opt-in and dispatched through `sella_engine.py`; default ASE behavior stays on the stock ASE path.
+- **Corrected Kappa regime**: Phase B runs only after Phase A finds non-positive curvature and the real center `fmax >= kappa_recover_fmax`. Positive Phase-A curvature never uses Kappa gamma weighting; translation is stock Dimer `-F_parallel`. Below `kappa_recover_fmax`, Kappa is inactive and standard Dimer translation is used.
+- **Independent Dimer optimizers**: `rotation_optimizer = ase | lbfgs` and `translation_optimizer = ase | lbfgs`. Defaults remain ASE. Kappa uses the same single `dimertools/kappa_dimer.py`; there is no separate Kappa-LBFGS implementation.
 - **Reaction Attempts Mapping**: `num_attempts_per_type` accepts either a single integer (applied globally to all configured `reaction_types`) or a space-separated list of integers mapping 1:1 to the `reaction_types` list.
 - **Status CSV Tracking**: The Dimer status CSV now records the total number of **force calls** for each attempt, providing a direct metric for computational cost alongside the convergence status.
+
+### `sella_engine.py` - Optional Sella Saddle Engine
+- `[ourDimer] engine = sella` reuses the existing Dimer attempt/resume/status workflow but runs Sella 2.5.0 as the saddle optimizer.
+- `rotation_optimizer` and `translation_optimizer` apply only to ASE/Kappa Dimer and must remain `ase` when Sella is selected.
+- Validated mode is Cartesian (`internal = False`).
+- SaddleMill records Sella `optimizer.pes.neval` as `n_force_calls`; cross-engine benchmarks should also count calculator evaluations independently.
 ### `dimertools/structure_edit.py` - Reaction Types for Dimer
 Reaction types configured via `reaction_types` (space-separated list). Bulk and OC dispatched via `_BULK_REACTION_TYPE_DISPATCH` / `_OC_REACTION_TYPE_DISPATCH`.
 
@@ -345,7 +355,9 @@ supercell = True             # Min 7 Å expansion
 delocalization_threshold = 0.8
 extension_check_fmax = 0.4
 extension_check_curvature = -0.2
-engine = ase                 # ase (default) | kappa
+engine = ase                 # ase (default) | kappa | sella
+rotation_optimizer = ase     # ase (default) | lbfgs; leave ase for sella
+translation_optimizer = ase  # ase (default) | lbfgs; leave ase for sella
 kappa_beta = 5.0,          # only used when engine = kappa
 kappa_recover_fmax = 0.3  # only used when engine = kappa
 

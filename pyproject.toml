@@ -16,6 +16,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+sella = [
+    "sella==2.5.0",
+]
 test = [
     "pytest>=7.0",
     "pytest-timeout",
