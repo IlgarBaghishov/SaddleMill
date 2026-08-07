@@ -127,7 +127,7 @@ class ConfigManager:
             "delocalization_threshold": 0.8,
             "extension_check_fmax": 0.4,
             "extension_check_curvature": -0.2,
-            "engine": "ase",            # ase (stock ASE dimer) | kappa
+            "engine": "ase",            # ase (stock ASE dimer) | kappa | sella
             "rotation_optimizer": "ase",    # ase | lbfgs
             "translation_optimizer": "ase", # ase | lbfgs | fire_lbfgs (hybrid alias accepted)
             "kappa_beta": 2.0,          # only used when engine = kappa
@@ -177,6 +177,34 @@ class ConfigManager:
             "fire_fdec": 0.5,
             "fire_astart": 0.1,
             "fire_fa": 0.99,
+        },
+        "ourSella": {
+            # Used only when [ourDimer] engine = sella. Sella is a distinct
+            # first-order saddle engine; Dimer rotation/translation selectors
+            # remain at their defaults and are not applied to Sella.
+            "internal": False,
+            "eig": True,
+            "method": "prfo",
+            "delta0": 0.1,
+            "eta": 1.0e-4,
+            "gamma": 0.1,
+            "threepoint": False,
+            "constraints_tol": 1.0e-5,
+            "nsteps_per_diag": 3,
+            "diag_every_n": None,
+            "restricted_step": None,
+            "sigma_inc": None,
+            "sigma_dec": None,
+            "rho_inc": None,
+            "rho_dec": None,
+            "allow_fragments": False,
+            "project_translations": None,
+            "project_rotations": None,
+            "require_first_order_model": True,
+            "negative_eigenvalue_tolerance": 1.0e-6,
+            "check_desorption": True,
+            "check_delocalization": False,
+            "check_interval": 5,
         },
         # SaddleMill-side VASP-input orchestration (the [Vasp] section itself is a
         # pure pass-through to ASE's Vasp calculator and never holds our keys).
@@ -371,12 +399,26 @@ def load_method(config_dict):
     # SaddleMill L-BFGS dimer validation
     if method_name == "Dimer":
         dimer_cfg = config_dict["ourDimer"]
+        engine = str(dimer_cfg.get("engine", "ase")).lower()
+        if engine not in {"ase", "kappa", "sella"}:
+            raise ValueError(
+                "[ourDimer] engine must be ase, kappa, or sella; "
+                f"got {engine!r}."
+            )
         rotation_optimizer = str(
             dimer_cfg.get("rotation_optimizer", "ase")
         ).lower()
         translation_optimizer = str(
             dimer_cfg.get("translation_optimizer", "ase")
         ).lower()
+        if engine == "sella" and (
+            rotation_optimizer != "ase" or translation_optimizer != "ase"
+        ):
+            raise ValueError(
+                "[ourDimer] engine=sella cannot be combined with the dimer "
+                "rotation_optimizer or translation_optimizer selectors. "
+                "Leave both at ase and configure Sella in [ourSella]."
+            )
         if rotation_optimizer not in {"ase", "lbfgs"}:
             raise ValueError(
                 "[ourDimer] rotation_optimizer must be ase or lbfgs; "
@@ -387,6 +429,43 @@ def load_method(config_dict):
                 "[ourDimer] translation_optimizer must be ase, lbfgs, or "
                 f"fire_lbfgs; got {translation_optimizer!r}."
             )
+
+        if engine == "sella":
+            from saddlemill.sella_engine import validate_sella_environment
+            validate_sella_environment()
+            sella_cfg = config_dict.get("ourSella", {}) or {}
+            method = str(sella_cfg.get("method", "prfo")).strip()
+            if not method:
+                raise ValueError("[ourSella] method must be a non-empty string")
+            for key in (
+                "internal", "eig", "threepoint", "allow_fragments",
+                "require_first_order_model", "check_desorption",
+                "check_delocalization",
+            ):
+                if not isinstance(sella_cfg.get(key), bool):
+                    raise ValueError(f"[ourSella] {key} must be True or False")
+            for key in ("project_translations", "project_rotations"):
+                value = sella_cfg.get(key, None)
+                if value not in (None, "", "None", "none") and not isinstance(value, bool):
+                    raise ValueError(
+                        f"[ourSella] {key} must be True, False, or blank"
+                    )
+            for key in ("delta0", "eta", "gamma", "constraints_tol"):
+                if float(sella_cfg.get(key, 0.0)) <= 0.0:
+                    raise ValueError(f"[ourSella] {key} must be > 0")
+            for key in ("sigma_inc", "sigma_dec", "rho_inc", "rho_dec"):
+                value = sella_cfg.get(key, None)
+                if value not in (None, "", "None", "none") and float(value) <= 0.0:
+                    raise ValueError(f"[ourSella] {key} must be > 0 or None")
+            if int(sella_cfg.get("nsteps_per_diag", 3)) < 1:
+                raise ValueError("[ourSella] nsteps_per_diag must be >= 1")
+            diag_every_n = sella_cfg.get("diag_every_n", None)
+            if diag_every_n not in (None, "", "None", "none") and int(diag_every_n) < 1:
+                raise ValueError("[ourSella] diag_every_n must be >= 1 or None")
+            if float(sella_cfg.get("negative_eigenvalue_tolerance", 1.0e-6)) < 0.0:
+                raise ValueError("[ourSella] negative_eigenvalue_tolerance must be >= 0")
+            if int(sella_cfg.get("check_interval", 5)) < 1:
+                raise ValueError("[ourSella] check_interval must be >= 1")
 
         lbfgs_cfg = config_dict.get("ourDimerLBFGS", {}) or {}
         for key in ("rotation_memory", "translation_memory"):

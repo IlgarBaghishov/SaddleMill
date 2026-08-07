@@ -119,6 +119,7 @@ class KappaMinModeAtoms(MinModeAtoms):
                 eigenmode_logfile=self.control.logfile,
             )
         self.kappa_mode = None
+        self.kappa_active = True
         self.translation_regime = "kappa"
         self.last_rotation_diagnostics = {}
         # Gamma scaling actually applied at the last CENTER evaluation. Exposed
@@ -176,6 +177,25 @@ class KappaMinModeAtoms(MinModeAtoms):
         self.eigenmodes[0] = eigenmode
         self.curvatures[0] = curvature_A
 
+        # Phase B is unused in the stock-dimer positive-curvature branch.
+        if curvature_A > 0.0:
+            self.kappa = 0.0
+            self.kappa_active = False
+            self.translation_regime = "standard"
+            self.last_rotation_diagnostics = {"phase_a": phase_a_diag}
+            return
+
+        # recover_fmax is a center-geometry switch back to normal dimer.
+        # Decide it once here so rotation and translation use the same regime
+        # throughout this optimization step, including trial positions.
+        self.kappa_active = self.real_fmax() >= self.recover_fmax
+        if not self.kappa_active:
+            self.kappa = 0.0
+            self.translation_regime = "standard"
+            self.last_rotation_diagnostics = {"phase_a": phase_a_diag}
+            return
+
+        self.translation_regime = "kappa"
         true_forces = self.forces0
         force_norm = norm(true_forces)
         f_hat = true_forces / force_norm if force_norm > 1.0e-8 else None
@@ -242,13 +262,18 @@ class KappaMinModeAtoms(MinModeAtoms):
         f_parallel = parallel_vector(forces, eigenmode)
         f_perp = forces - f_parallel
 
-        # Decide the regime from the SAME geometry whose forces are being
-        # projected. Previously this always read self.forces0, so a trial
-        # evaluation at `pos` was scaled by the regime of the center instead
-        # of its own, making the trial force inconsistent with the point it
-        # was evaluated at.
-        fmax_atom = float(np.sqrt((forces ** 2).sum(axis=1).max()))
-        if fmax_atom < self.recover_fmax:
+        # Stock dimer behavior above the inflection point: drag directly uphill
+        # along the current mode. Phase B and kappa do not enter this force.
+        if self.curvatures[0] > 0.0:
+            if pos is None:
+                self.translation_regime = "standard"
+                self.last_gamma_1 = 1.0
+                self.last_gamma_2 = 0.0
+            return -f_parallel
+
+        # kappa_active was set from the center geometry in find_eigenmodes().
+        # Do not switch regimes on optimizer trial positions.
+        if not self.kappa_active:
             gamma_1 = 1.0
             gamma_2 = 1.0
             regime = "standard"
@@ -259,9 +284,7 @@ class KappaMinModeAtoms(MinModeAtoms):
             gamma_2 = 1.0 - (1.0 / (1.0 + exp_term))
             regime = "kappa"
 
-        # Only the center evaluation defines the optimizer's current regime.
-        # Trial-position evaluations must not mutate it, or the translation
-        # history-reset key flickers on points that were never accepted.
+        # Trial-position evaluations must not mutate the accepted center state.
         if pos is None:
             self.translation_regime = regime
             self.last_gamma_1 = float(gamma_1)

@@ -4,6 +4,9 @@
 
 SaddleMill is a Python library for creating datasets of Transition States (TS) using neural network potentials (FAIRChemCalculator / Meta's UMA model) or DFT (VASP / VaspInteractive). It supports distributed GPU execution on HPC systems (4 A100 per node, GH200, 3 A100 per node) via executorlib + Flux.
 
+
+> **Configuration source-of-truth rule.** Current checked-out SaddleMill source, `config.py`, and this `CLAUDE.md` define the accepted schema. Historical campaign configs are scientific records, not schema authority; validate them against the current parser before reuse and stop on changed/invalid semantics rather than silently translating them.
+
 ## Dependencies
 
 Minimum required versions (baseline, enforced in `pyproject.toml`):
@@ -121,12 +124,14 @@ Auxiliary entry points:
 - **Consecutive error tracking**: Structure-level `consecutive_errors` counter (from `init_function`). All attempts fail → increment; any success → reset to 0. At `max_consecutive_errors`, worker calls `sys.exit(1)` for executorlib restart.
 - **Per-attempt execution**: Accepts `entries_to_run` (set of attempt_ids) and `continuation_data` (dict: attempt_id → Atoms). Calls `get_attempts()` on original input, then per attempt: skips if not in `entries_to_run`, uses `continuation_data[attempt_id]` if available (near-zero displacement),
 - else fresh attempt. Eigenmode/reaction_type read from top-level `.info` first, `orig_info` fallback.
-- **Engine Selection**: Supports both standard ASE dimer (`engine = dimer`, default) and the Kappa dimer (`engine = kappa`). The Kappa dimer utilizes a Phase A/Phase B double rotation scheme to constrain the dimer rotation to the isopotential hyperplane via `KappaMinModeAtoms`. It smoothly blends translation forces using a switching function governed by `beta` (steepness) and automatically recovers to the standard normal dimer method when maximum atomic forces drop below `recover_fmax`.
+- **Engine Selection**: `[ourDimer] engine` supports standard ASE Dimer (`ase`, default), Kappa Dimer (`kappa`), and Sella (`sella`). Sella is dispatched through `sella_engine.py`; ASE/Kappa Dimer behavior remains on the existing path unless `engine = sella` is explicitly selected.
+- **Corrected Kappa regime**: Phase B is run only after Phase A finds non-positive curvature **and** the real center `fmax >= kappa_recover_fmax`. Positive Phase-A curvature never uses Kappa gamma weighting; translation is the stock Dimer drag-up force `-F_parallel`. Below `kappa_recover_fmax`, Kappa is inactive and translation is the normal Dimer force. Trial positions do not independently flip the accepted center's Kappa regime.
+- **Independent Dimer optimizers**: `rotation_optimizer = ase | lbfgs` and `translation_optimizer = ase | lbfgs`. These selectors apply only to ASE/Kappa Dimer. Selecting either L-BFGS option is a scientific-method change; the default remains ASE. No separate Kappa-LBFGS module exists: Kappa rotation selection is implemented in the single authoritative `dimertools/kappa_dimer.py`.
 - **Reaction Attempts Mapping**: `num_attempts_per_type` accepts either a single integer (applied globally to all configured `reaction_types`) or a space-separated list of integers mapping 1:1 to the `reaction_types` list.
 - **Status CSV Tracking**: The Dimer status CSV now records the total number of **force calls** for each attempt, providing a direct metric for computational cost alongside the convergence status.
 <!-- BEGIN DIMER_LBFGS_DOCS -->
 ### `dimertools/lbfgs_dimer.py` - Configurable Dimer Rotation and Translation
-- **Independent solver selection**: `_setup_dimer()` treats the dimer engine, rotational optimizer, and translational optimizer as separate choices. `[ourDimer] engine = ase | kappa`, `rotation_optimizer = ase | lbfgs`, and `translation_optimizer = ase | lbfgs | fire_lbfgs` (`hybrid` remains a compatibility alias for `fire_lbfgs`). Defaults remain ASE rotation and stock ASE dimer translation.
+- **Independent solver selection**: `_setup_dimer()` treats the dimer engine, rotational optimizer, and translational optimizer as separate choices. `[ourDimer] engine = ase | kappa | sella`, `rotation_optimizer = ase | lbfgs`, and `translation_optimizer = ase | lbfgs | fire_lbfgs` (`hybrid` remains a compatibility alias for `fire_lbfgs`). Defaults remain ASE rotation and stock ASE dimer translation.
 - **L-BFGS rotation remains specialized**: `LimitedMemoryInverseHessian` is now used only by the custom rotational search. `LBFGSDimerEigenmodeSearch` changes the rotational search direction in the tangent space of the normalized dimer mode while retaining ASE's trial-angle evaluation, Fourier interpolation, endpoint-force extrapolation, curvature definition, and physical rotational-force stopping criteria. Rotation history exists only within the rotations at one centre geometry and is reset after translation because a new search object is created.
 - **Kappa rotation histories**: With `engine = kappa` and `rotation_optimizer = lbfgs`, Phase A and constrained Phase B each receive a separate rotational history. This changes only the rotational direction solver; it does not remove or redefine the constrained Phase-B curvature calculation.
 - **Pure L-BFGS translation is ASE-backed**: `LBFGSMinModeTranslate` subclasses `ase.optimize.LBFGS` and passes the live `MinModeAtoms` object directly to it. `MinModeAtoms.get_forces()` therefore supplies ASE LBFGS with the projected minimum-mode-following force. SaddleMill does not implement a second translation two-loop recursion. `use_line_search=False` because the physical potential energy is not the scalar objective whose gradient is the projected saddle-search force.
@@ -143,6 +148,15 @@ Auxiliary entry points:
 - `Dimer_mode_csvs/mode_rank_<rank>.csv`: one row at translation state 0 and after each applied translation, including cumulative force calls, curvature, participation ratio, projective mode angles, mode coherence, and atom-participation overlap over 5- and 10-state windows.
 - `Dimer_optimizer_csvs/optimizer_rank_<rank>.csv`: one `step` row per applied Cartesian translation plus one `summary` row. The CSV columns are preserved. Translation-history counts now report ASE's stored/update state; ASE 3.29 does not apply the former custom positive-`s dot y` pair-rejection rule. `step_norm` remains the actual global displacement norm, while `step_clipped` follows the active ASE optimizer's native max-step rule.
 <!-- END DIMER_LBFGS_DOCS -->
+
+
+<!-- BEGIN SELLA_ENGINE_DOCS -->
+### `sella_engine.py` - Optional Sella Saddle Engine
+- `[ourDimer] engine = sella` dispatches the existing Dimer attempt workflow to Sella 2.5.0 while preserving attempt generation, resume identity, status CSVs, collected trajectories, calculator lifecycle, and per-attempt error handling.
+- Sella is a separate first-order saddle-search algorithm. `rotation_optimizer` and `translation_optimizer` apply only to ASE/Kappa Dimer and must remain `ase` when `engine = sella`; Sella options live in `[ourSella]`.
+- Default/validated mode is Cartesian (`internal = False`). Convergence may optionally require exactly one negative eigenvalue in Sella's final approximate constrained model Hessian.
+- Canonical Dimer metadata stores Sella's PES evaluation counter (`optimizer.pes.neval`) as `n_force_calls`. This is also written to the status CSV; benchmark scripts should independently count calculator evaluations when exact cross-engine accounting matters.
+<!-- END SELLA_ENGINE_DOCS -->
 
 ### `dimertools/structure_edit.py` - Reaction Attempts for Dimer
 `get_attempts()` returns three position-aligned lists: generated `Atoms`, ASE Dimer displacement dictionaries, and selected atom indices. Their list position is the global Dimer `attempt_id`, so every configured reaction type must retain exactly its requested number of slots. A mechanism that cannot generate a candidate returns `None` in that slot; it must not shorten the list and shift later reaction types.
@@ -367,7 +381,9 @@ supercell = True             # Min 7 A expansion; skipped for OC structures with
 delocalization_threshold = 0.8
 extension_check_fmax = 0.4
 extension_check_curvature = -0.2
-engine = ase                 # ase (default) | kappa
+engine = ase                 # ase (default) | kappa | sella
+rotation_optimizer = ase     # ase (default) | lbfgs; leave ase for sella
+translation_optimizer = ase  # ase (default) | lbfgs; leave ase for sella
 kappa_beta = 5.0             # only used when engine = kappa
 kappa_recover_fmax = 0.3     # only used when engine = kappa
 
