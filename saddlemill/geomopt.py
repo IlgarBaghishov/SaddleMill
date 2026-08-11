@@ -325,6 +325,39 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
                                          enabled=config_dict['Main']['zip'])
 
 
+def _sp_resume_seed_writers(continuation_data, atoms, config_dict, i, rank):
+    """Return ([seed_writer], banked_steps) to resume a wall-killed SP VASP run,
+    or (None, None) to run from scratch.
+
+    ``continuation_data`` is the banked-state dict from
+    ``tools.bank_singlepoint_vasp_restarts`` (or None). Gated by
+    ``continue_from_result`` and re-validated against the live input frame's atom
+    count; on ANY doubt we fall back to scratch (never seed a run with mismatched
+    or missing state).
+    """
+    if not continuation_data or not config_dict["Main"]["continue_from_result"]:
+        return None, None
+    resume_dir = continuation_data.get("resume_dir")
+    if not resume_dir:
+        return None, None
+    for name in ("POSCAR", "MODECAR"):
+        p = os.path.join(resume_dir, name)
+        if not os.path.isfile(p) or os.path.getsize(p) == 0:
+            return None, None
+    if continuation_data.get("natoms") != len(atoms):
+        print(f"Rank {rank}: SP job {i} banked state atom-count "
+              f"{continuation_data.get('natoms')} != input {len(atoms)}; "
+              f"running from scratch.", flush=True)
+        return None, None
+    from saddlemill.tools import make_sp_resume_seed_writer
+    banked_steps = continuation_data.get("banked_steps")
+    print(f"Rank {rank}: SP job {i} RESUMING from banked mid-run state "
+          f"(geom={continuation_data.get('geom_src')}, "
+          f"mode={continuation_data.get('mode_src')}, "
+          f"ionic_steps={banked_steps}).", flush=True)
+    return [make_sp_resume_seed_writer(resume_dir)], banked_steps
+
+
 def singlepoint(i, config_dict, atoms, calc, consecutive_errors=None,
                 executorlib_worker_id=None, **kwargs):
     """Single-point energy/force calculation. Writes results to traj or LMDB.
@@ -368,8 +401,19 @@ def singlepoint(i, config_dict, atoms, calc, consecutive_errors=None,
                 raise ValueError(
                     f"SinglePoint+VASP requires frames_per_job=1; got {len(frames)} frames.")
             a = frames[0]
-            vasp_calc = resolve_vasp_calc(config_dict, calc, i, None, "ourSinglePoint", atoms=a)
+            # Resume a wall-killed VTST-dimer run from its banked mid-run state
+            # (POSCAR<-CENTCAR, MODECAR<-NEWMODECAR) when one was banked for this
+            # job; otherwise seed_writers is None and the run starts from scratch.
+            seed_writers, banked_steps = _sp_resume_seed_writers(
+                kwargs.get('continuation_data'), a, config_dict, i, rank)
+            # Pass extra_writers only when resuming, so the from-scratch call is
+            # unchanged (no new kwarg) from the pre-resume behavior.
+            resume_kw = {"extra_writers": seed_writers} if seed_writers is not None else {}
+            vasp_calc = resolve_vasp_calc(config_dict, calc, i, None, "ourSinglePoint",
+                                          atoms=a, **resume_kw)
             a.calc = vasp_calc
+            if seed_writers is not None:
+                a.info['resumed_from_banked_steps'] = banked_steps
             energy_v = a.get_potential_energy()
             forces_v = a.get_forces()
             finalize_if_vasp_interactive(config_dict, vasp_calc)

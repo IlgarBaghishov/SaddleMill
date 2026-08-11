@@ -118,31 +118,39 @@ def _with_extra_io(calc_cls, writers, parsers):
     return _CalcWithExtraIO
 
 
-def resolve_vasp_calc_class(config_dict, calc):
+def resolve_vasp_calc_class(config_dict, calc, extra_writers=None):
     """Return *calc*, wrapped for ``[ourVasp] extra_input_files`` / ``extra_outputs`` (if set).
 
-    No-op for FAIRChem or when neither key is set. Shared by ``resolve_vasp_calc``
-    and ``nebopt._build_neb_vasp_calc`` so the hooks are identical across all methods.
-    Each value is one spec or a space-separated list (built-in name, ``module:func``,
-    or ``file.py:func``). Output parsers leave their merged dict on
-    ``calc.sm_extra_outputs``; the method decides whether to stamp it onto frames.
+    No-op for FAIRChem or when neither key is set (and no ``extra_writers``).
+    Shared by ``resolve_vasp_calc`` and ``nebopt._build_neb_vasp_calc`` so the
+    hooks are identical across all methods. Each value is one spec or a
+    space-separated list (built-in name, ``module:func``, or ``file.py:func``).
+    Output parsers leave their merged dict on ``calc.sm_extra_outputs``; the
+    method decides whether to stamp it onto frames.
+
+    ``extra_writers`` is an optional list of caller-supplied writers appended
+    AFTER the config writers, so they overwrite the config-written inputs (used
+    by SinglePoint resume to seed POSCAR/MODECAR from banked mid-run state).
     """
     if config_dict["Main"]["Calculator"] not in ("Vasp", "VaspInteractive"):
         return calc
     our_vasp = config_dict.get("ourVasp", {})
     in_spec = our_vasp.get("extra_input_files")
     out_spec = our_vasp.get("extra_outputs")
-    if not in_spec and not out_spec:
+    if not in_spec and not out_spec and not extra_writers:
         return calc
     from saddlemill.vasp_io import (load_extra_input_writer,
                                                   load_extra_output_parser)
     _aslist = lambda s: [s] if isinstance(s, str) else list(s)
     writers = [load_extra_input_writer(s) for s in _aslist(in_spec)] if in_spec else []
+    if extra_writers:
+        writers = writers + list(extra_writers)   # run last -> overwrite config inputs
     parsers = [load_extra_output_parser(s) for s in _aslist(out_spec)] if out_spec else []
     return _with_extra_io(calc, writers, parsers)
 
 
-def resolve_vasp_calc(config_dict, calc, i, subunit_id, section, atoms=None):
+def resolve_vasp_calc(config_dict, calc, i, subunit_id, section, atoms=None,
+                      extra_writers=None):
     """Return an instantiated calculator for this (job, subunit).
 
     For FAIRChem, returns the shared instance unchanged. For VASP/VaspInteractive,
@@ -154,6 +162,8 @@ def resolve_vasp_calc(config_dict, calc, i, subunit_id, section, atoms=None):
     MODECAR) are written too.
     ``subunit_id=None`` produces ``VASP_{i}/`` (Minimization, SinglePoint). Pass
     ``atoms`` to enable ``input_generator`` and the extra-file writers.
+    ``extra_writers`` is forwarded to ``resolve_vasp_calc_class`` (SinglePoint
+    resume seeds POSCAR/MODECAR from banked mid-run state this way).
     """
     if config_dict["Main"]["Calculator"] not in ("Vasp", "VaspInteractive"):
         return calc
@@ -164,7 +174,7 @@ def resolve_vasp_calc(config_dict, calc, i, subunit_id, section, atoms=None):
     ncore = config_dict[section].get("vasp_ncore")
     if ncore is not None:
         kwargs["ncore"] = int(ncore)
-    return resolve_vasp_calc_class(config_dict, calc)(**kwargs)
+    return resolve_vasp_calc_class(config_dict, calc, extra_writers=extra_writers)(**kwargs)
 
 
 def remove_vasp_heavies(dir_path):
@@ -310,6 +320,161 @@ def clean_up_files(config_dict):
 
 
 #==============================================================================
+### SINGLEPOINT VASP RESUME (bank mid-run VTST-dimer state across a wall-kill)
+#
+# A wall-killed SinglePoint+VASP job (e.g. a VTST dimer: IBRION=3 IOPT=3
+# ICHAIN=2, where VASP -- not an ASE optimizer -- owns the ionic loop) never
+# reaches its cleanup, so its VASP_{id}/ workdir is left in place holding the
+# mid-run dimer state: CENTCAR (dimer-center geometry) and NEWMODECAR (current
+# mode). The output-trajectory resume path (extract_previous_results) cannot
+# help here -- a wall-killed job wrote no output frame -- so we bank those small
+# restart files BEFORE clean_up_files wipes VASP_*, then seed the resumed run's
+# POSCAR/MODECAR from them (see make_sp_resume_seed_writer and
+# geomopt.singlepoint). The VTST restart convention is POSCAR <- CENTCAR
+# (fallback CONTCAR) and MODECAR <- NEWMODECAR (fallback the run's own MODECAR).
+# On ANY doubt (missing/empty/unparseable file, or a geometry/mode atom-count
+# mismatch) the job is skipped and falls back to a clean from-scratch run --
+# e.g. a first-SCF-death dir with a 0-byte CONTCAR and no CENTCAR/NEWMODECAR.
+
+_SP_RESUME_BANK_DIR = "SinglePoint_resume_states"
+
+
+def _poscar_natoms(path):
+    """Atom count from a POSCAR/CONTCAR/CENTCAR, or None on any doubt.
+
+    Sums the integer counts line (VASP5 line 7 after the symbols line, or VASP4
+    line 6). Returns None for a missing/empty/unparseable file so callers treat
+    it as 'no usable state' and fall back to scratch.
+    """
+    if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return None
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    for idx in (6, 5):  # VASP5 counts line, then VASP4 fallback
+        if idx < len(lines):
+            parts = lines[idx].split()
+            if parts and all(p.lstrip("+").isdigit() for p in parts):
+                return sum(int(p) for p in parts)
+    return None
+
+
+def _modecar_natoms(path):
+    """Row count of a MODECAR/NEWMODECAR (one 3-float mode vector per atom), or None.
+
+    Returns None for a missing/empty file or any row that is not three floats.
+    """
+    if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return None
+    try:
+        rows = 0
+        with open(path) as f:
+            for line in f:
+                parts = line.split()
+                if not parts:
+                    continue
+                if len(parts) != 3:
+                    return None
+                [float(x) for x in parts]  # parse-check; ValueError -> not usable
+                rows += 1
+    except (OSError, ValueError):
+        return None
+    return rows or None
+
+
+def _count_oszicar_ionic_steps(directory):
+    """Best-effort count of completed ionic steps (OSZICAR ' F= ' lines), or None."""
+    oszicar = os.path.join(directory, "OSZICAR")
+    if not os.path.isfile(oszicar):
+        return None
+    try:
+        with open(oszicar) as f:
+            return sum(1 for line in f if " F= " in line)
+    except OSError:
+        return None
+
+
+def bank_singlepoint_vasp_restarts(job_ids, config_dict):
+    """Bank mid-run VTST-dimer restart files from leftover SinglePoint VASP dirs.
+
+    For each ``job_id`` whose ``VASP_{job_id}/`` workdir survived a wall-kill,
+    copy its geometry (CENTCAR, else CONTCAR) as POSCAR and its mode (NEWMODECAR,
+    else MODECAR) as MODECAR into ``SinglePoint_resume_states/{job_id}/``. Must be
+    called on resume BEFORE clean_up_files removes the VASP_* dirs.
+
+    A job is banked only when both a geometry and a mode file are non-empty,
+    parseable, and agree on the atom count; anything else is skipped (that job
+    falls back to a clean from-scratch run). Returns
+    ``{job_id: {resume_dir, banked_steps, geom_src, mode_src, natoms}}`` for the
+    banked jobs. The per-job atom count is re-checked against the live input
+    frame in geomopt.singlepoint before it is actually used.
+    """
+    results = {}
+    for job_id in job_ids:
+        workdir = f"VASP_{job_id}"
+        if not os.path.isdir(workdir):
+            continue
+
+        geom_src, geom_n = None, None
+        for name in ("CENTCAR", "CONTCAR"):
+            n = _poscar_natoms(os.path.join(workdir, name))
+            if n:
+                geom_src, geom_n = name, n
+                break
+
+        mode_src, mode_n = None, None
+        for name in ("NEWMODECAR", "MODECAR"):
+            n = _modecar_natoms(os.path.join(workdir, name))
+            if n:
+                mode_src, mode_n = name, n
+                break
+
+        if geom_src is None or mode_src is None or geom_n != mode_n:
+            print(f"  SP resume: job {job_id} has no usable mid-run state "
+                  f"(geom={geom_src}, mode={mode_src}); will run from scratch.",
+                  flush=True)
+            continue
+
+        bank_dir = os.path.join(_SP_RESUME_BANK_DIR, str(job_id))
+        if os.path.isdir(bank_dir):
+            shutil.rmtree(bank_dir)
+        os.makedirs(bank_dir)
+        shutil.copyfile(os.path.join(workdir, geom_src),
+                        os.path.join(bank_dir, "POSCAR"))
+        shutil.copyfile(os.path.join(workdir, mode_src),
+                        os.path.join(bank_dir, "MODECAR"))
+
+        banked_steps = _count_oszicar_ionic_steps(workdir)
+        results[job_id] = {"resume_dir": os.path.abspath(bank_dir),
+                           "banked_steps": banked_steps,
+                           "geom_src": geom_src, "mode_src": mode_src,
+                           "natoms": geom_n}
+        print(f"  SP resume: banked job {job_id} (geom={geom_src}, "
+              f"mode={mode_src}, natoms={geom_n}, ionic_steps={banked_steps}).",
+              flush=True)
+    return results
+
+
+def make_sp_resume_seed_writer(resume_dir):
+    """Return an extra-input writer that seeds POSCAR/MODECAR from a banked state.
+
+    Runs after ASE writes its inputs (and after any modecar writer), overwriting
+    the freshly written POSCAR with the banked dimer-center geometry and MODECAR
+    with the banked mode -- so the VTST dimer resumes from the wall-killed mid-run
+    state. The banked POSCAR is in POSCAR (symbol) order, identical to what ASE
+    just wrote for the same atoms, so no reordering is needed.
+    """
+    def _seed(calc, atoms, directory):
+        for name in ("POSCAR", "MODECAR"):
+            src = os.path.join(resume_dir, name)
+            if os.path.isfile(src) and os.path.getsize(src) > 0:
+                shutil.copyfile(src, os.path.join(directory, name))
+    return _seed
+
+
+#==============================================================================
 ### PREVIOUS RESULT EXTRACTION (for continue-from-result on resume)
 
 def _build_output_traj_index(method_name):
@@ -369,7 +534,10 @@ def extract_previous_results(job_ids, config_dict, redo_info):
             _sanitize_with_continuation(frames[0])
             results[job_id] = frames[0]
         elif method_name == "SinglePoint":
-            # SP has no continuation semantics. Skip; method ignores the data.
+            # No output-trajectory continuation for SP: a finished frame is the
+            # final result, and a wall-killed run wrote none. SP's only resume is
+            # from the mid-run VASP workdir, handled separately by
+            # bank_singlepoint_vasp_restarts (called in __main__ before cleanup).
             continue
         else:
             # Group frames by subunit_id

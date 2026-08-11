@@ -6,7 +6,7 @@ from contextlib import nullcontext
 from saddlemill.init_function import init_function
 from saddlemill.tools import (save_ordered_traj_names, read_ordered_traj_names,
                             clean_up_files, load_and_sanitize, passes_input_filter,
-                            extract_previous_results)
+                            extract_previous_results, bank_singlepoint_vasp_restarts)
 from saddlemill.config import (load_config, load_method, get_trajes_and_indices,
                             create_results_directories, get_remaining_trajes,
                             get_flux_resources, archive_and_clean_csvs,
@@ -47,6 +47,19 @@ def main():
             print(f"Extracting previous results for {len(redo_info)} jobs...", flush=True)
             previous_results = extract_previous_results(list(redo_info.keys()), config_dict, redo_info)
             print(f"  Extracted {len(previous_results)} of {len(redo_info)} results.", flush=True)
+
+        # SinglePoint+VASP resume: bank each wall-killed job's mid-run VTST-dimer
+        # state (CENTCAR/NEWMODECAR) BEFORE clean_up_files wipes the VASP_* dirs,
+        # then plumb it through the same continuation_data channel the other
+        # methods use. Gated by continue_from_result (default True).
+        if (config_dict["Main"]["method"] == "SinglePoint"
+                and config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive")
+                and config_dict["Main"]["continue_from_result"]):
+            sp_resume = bank_singlepoint_vasp_restarts(job_IDs, config_dict)
+            if sp_resume:
+                print(f"Banked SP resume state for {len(sp_resume)} wall-killed job(s).",
+                      flush=True)
+                previous_results = {**previous_results, **sp_resume}
 
         from saddlemill.config import _normalize_run_jobs
         categories_to_clean = _normalize_run_jobs(config_dict["Main"]["run_jobs"])
