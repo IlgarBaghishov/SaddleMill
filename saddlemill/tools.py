@@ -342,9 +342,14 @@ _SP_RESUME_BANK_DIR = "SinglePoint_resume_states"
 def _poscar_natoms(path):
     """Atom count from a POSCAR/CONTCAR/CENTCAR, or None on any doubt.
 
-    Sums the integer counts line (VASP5 line 7 after the symbols line, or VASP4
-    line 6). Returns None for a missing/empty/unparseable file so callers treat
-    it as 'no usable state' and fall back to scratch.
+    Locates the integer counts line (VASP5 line 7 after the symbols line, or
+    VASP4 line 6) but returns how many coordinate rows the file ACTUALLY
+    delivers, not how many the header claims. A kill landing mid-write leaves a
+    complete header above a short body; returning the short count makes the
+    caller's geometry/mode agreement check reject it. For an intact file the two
+    are identical, so nothing else changes. Returns None for a
+    missing/empty/unparseable file so callers treat it as 'no usable state' and
+    fall back to scratch.
     """
     if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
         return None
@@ -357,7 +362,17 @@ def _poscar_natoms(path):
         if idx < len(lines):
             parts = lines[idx].split()
             if parts and all(p.lstrip("+").isdigit() for p in parts):
-                return sum(int(p) for p in parts)
+                n = sum(int(p) for p in parts)
+                start = next((i + 1 for i in range(idx + 1, min(len(lines), idx + 4))
+                              if lines[i].strip()[:1].lower() in ("d", "c", "k")), None)
+                if start is None:
+                    return None
+                rows = 0
+                for line in lines[start:start + n]:
+                    if len(line.split()) < 3:
+                        break  # row truncated mid-write: stop counting here
+                    rows += 1
+                return rows or None
     return None
 
 
