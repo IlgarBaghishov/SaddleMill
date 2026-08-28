@@ -51,6 +51,7 @@ class ConfigManager:
         "ourDoubleMinimization": {
             "relax_cell": False,
             "pre_dimer_refine": False,
+            "resume_partial": False,  # resume wall/crash-killed sides from their live optimization traj (production fleets; keep False for HPO arms — resumed sides under-report n_force_calls)
             "vasp_command": None,
             "vasp_ncore": None,
         },
@@ -457,8 +458,16 @@ def read_status_csv_rows(method_name, directory="."):
     for csv_path in sorted(glob.glob(os.path.join(csv_dir, "status_rank_*.csv"))):
         with open(csv_path) as fh:
             for row in csv.reader(fh):
-                if row:
-                    rows.append(row)
+                if not row:
+                    continue
+                # Writers hand-quote the status field, so multi-line VASP/MPI
+                # error text with embedded quotes shreds into fragment rows.
+                # Real rows always start with the integer job id; drop the rest.
+                try:
+                    int(row[0])
+                except ValueError:
+                    continue
+                rows.append(row)
     return rows
 
 
@@ -629,7 +638,10 @@ def archive_and_clean_csvs(config_dict, job_ids, categories_to_clean):
     has_entries_to_clean = False
     for f in csv_files:
         with open(f) as fh:
-            rows = [row for row in csv.reader(fh) if row]
+            # Same fragment-row guard as read_status_csv_rows: hand-quoted
+            # multi-line error statuses shred into rows with non-integer ids.
+            rows = [row for row in csv.reader(fh)
+                    if row and row[0].strip().lstrip("-").isdigit()]
         if not rows:
             continue
         csv_data[f] = rows

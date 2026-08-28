@@ -3,6 +3,7 @@ import sys
 import traceback
 import zipfile
 from ase.io import Trajectory
+from ase.io import read as ase_io_read
 from ase.filters import FrechetCellFilter
 from ase.calculators.singlepoint import SinglePointCalculator
 from saddlemill.tools import (check_reaction, check_adsorbate_reaction, backup_flux_logs,
@@ -12,10 +13,11 @@ from saddlemill.tools import (check_reaction, check_adsorbate_reaction, backup_f
 from saddlemill.dimeropt import _refine_eigenmode
 
 
-def relax_structure(config_dict, optimizable, logfile, trajfile, Optimizer):
+def relax_structure(config_dict, optimizable, logfile, trajfile, Optimizer, max_steps=None):
     opt = Optimizer(optimizable, logfile=logfile, trajectory=trajfile,
                     **config_dict[config_dict["Main"]["Optimizer"]])
-    converged = opt.run(fmax=config_dict["Main"]["fmax"], steps=config_dict["Main"]["steps"])
+    steps = config_dict["Main"]["steps"] if max_steps is None else max_steps
+    converged = opt.run(fmax=config_dict["Main"]["fmax"], steps=steps)
     return converged, opt.get_number_of_steps()
 
 
@@ -224,8 +226,27 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
                     traj_f = f'optimization_{i}_{side}.traj'
                     temp_files.extend([log_f, traj_f])
 
+                    # Resume a wall/crash-killed side from its live optimization
+                    # trajectory: without this, sides needing more wall-clock than
+                    # one requeue round restart from scratch forever. The banked
+                    # frame count also debits the 600-step budget so the cap stays
+                    # a TOTAL cap across restarts. Config-gated (resume_partial)
+                    # so HPO arms keep clean from-scratch n_force_calls semantics.
+                    side_max_steps = None
+                    if (config_dict['our' + method_name].get('resume_partial')
+                            and os.path.isfile(traj_f)):
+                        try:
+                            _partial = ase_io_read(traj_f, ':')
+                            if _partial and len(_partial[-1]) == len(min_atoms):
+                                min_atoms.positions = _partial[-1].positions.copy()
+                                side_max_steps = max(
+                                    1, config_dict["Main"]["steps"] - (len(_partial) - 1))
+                        except Exception:
+                            pass  # empty/corrupt partial traj -> keep displaced start
+
                     optimizable = FrechetCellFilter(min_atoms) if config_dict['our'+method_name]['relax_cell'] else min_atoms
-                    conv, side_nfc = relax_structure(config_dict, optimizable, log_f, traj_f, Optimizer)
+                    conv, side_nfc = relax_structure(config_dict, optimizable, log_f, traj_f, Optimizer,
+                                                     max_steps=side_max_steps)
                     energy = min_atoms.get_potential_energy()
                     forces = min_atoms.get_forces()
                     if is_vasp:
