@@ -9,7 +9,8 @@ from ase.calculators.singlepoint import SinglePointCalculator
 from saddlemill.tools import (check_reaction, check_adsorbate_reaction, backup_flux_logs,
                               get_task_name, resolve_vasp_calc, remove_vasp_heavies,
                               finalize_if_vasp_interactive, archive_and_clear_temp_files,
-                              vasp_final_scf_converged)
+                              vasp_final_scf_converged,
+                              DOUBLEMIN_PARTIALS_DIR)
 from saddlemill.dimeropt import _refine_eigenmode
 
 
@@ -227,16 +228,19 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
                     temp_files.extend([log_f, traj_f])
 
                     # Resume a wall/crash-killed side from its live optimization
-                    # trajectory: without this, sides needing more wall-clock than
+                    # trajectory, banked into DoubleMinimization_partials/ by
+                    # bank_doublemin_partials before clean_up_files wiped the live
+                    # file: without this, sides needing more wall-clock than
                     # one requeue round restart from scratch forever. The banked
                     # frame count also debits the 600-step budget so the cap stays
                     # a TOTAL cap across restarts. Config-gated (resume_partial)
                     # so HPO arms keep clean from-scratch n_force_calls semantics.
                     side_max_steps = None
+                    _bank_f = os.path.join(DOUBLEMIN_PARTIALS_DIR, traj_f)
                     if (config_dict['our' + method_name].get('resume_partial')
-                            and os.path.isfile(traj_f)):
+                            and os.path.isfile(_bank_f)):
                         try:
-                            _partial = ase_io_read(traj_f, ':')
+                            _partial = ase_io_read(_bank_f, ':')
                             if _partial and len(_partial[-1]) == len(min_atoms):
                                 min_atoms.positions = _partial[-1].positions.copy()
                                 side_max_steps = max(

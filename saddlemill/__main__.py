@@ -6,7 +6,8 @@ from contextlib import nullcontext
 from saddlemill.init_function import init_function
 from saddlemill.tools import (save_ordered_traj_names, read_ordered_traj_names,
                             clean_up_files, load_and_sanitize, passes_input_filter,
-                            extract_previous_results, bank_singlepoint_vasp_restarts)
+                            extract_previous_results, bank_singlepoint_vasp_restarts,
+                            bank_doublemin_partials)
 from saddlemill.config import (load_config, load_method, get_trajes_and_indices,
                             create_results_directories, get_remaining_trajes,
                             get_flux_resources, archive_and_clean_csvs,
@@ -65,6 +66,17 @@ def main():
         categories_to_clean = _normalize_run_jobs(config_dict["Main"]["run_jobs"])
         cleaned = archive_and_clean_csvs(config_dict, job_IDs, categories_to_clean)
         archive_and_clean_outputs(config_dict, cleaned)
+        # DoubleMinimization partial resume: bank each re-run side's live
+        # trajectory BEFORE clean_up_files deletes optimization_*.traj (same
+        # ordering constraint as the SinglePoint banking above). Without this
+        # the resume in geomopt finds nothing and every wall-killed side
+        # restarts from scratch.
+        if (config_dict["Main"]["method"] == "DoubleMinimization"
+                and config_dict["ourDoubleMinimization"].get("resume_partial")):
+            n_banked = bank_doublemin_partials(job_IDs, config_dict)
+            if n_banked:
+                print(f"Banked partial trajectories for {n_banked} side(s).", flush=True)
+
         clean_up_files(config_dict)
     else:
         job_IDs = list(range(len(trajes_and_idxs)))

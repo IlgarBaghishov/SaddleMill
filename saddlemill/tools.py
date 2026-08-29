@@ -411,6 +411,52 @@ def _count_oszicar_ionic_steps(directory):
         return None
 
 
+DOUBLEMIN_PARTIALS_DIR = "DoubleMinimization_partials"
+
+
+def bank_doublemin_partials(job_ids, config_dict):
+    """Bank live DoubleMinimization side trajectories before cleanup deletes them.
+
+    ``clean_up_files`` removes ``optimization_*.traj`` from the working
+    directory on every resume, so a wall-killed side's progress is gone before
+    any worker could read it. This copies each re-run side's frames into
+    ``DoubleMinimization_partials/`` first, APPENDING so the bank stays
+    cumulative across repeated wall-kills (the step debit in geomopt reads its
+    length, which must count every banked frame, not just the last segment).
+
+    Must be called on resume BEFORE clean_up_files, same ordering constraint as
+    bank_singlepoint_vasp_restarts. Returns the number of sides banked.
+    Unreadable or empty trajectories are skipped, leaving that side to start
+    from its displaced geometry.
+    """
+    import glob as _glob
+    from ase.io import Trajectory as _Traj
+    from ase.io import read as _read
+
+    wanted = {str(j) for j in job_ids}
+    os.makedirs(DOUBLEMIN_PARTIALS_DIR, exist_ok=True)
+    banked = 0
+    for src_path in sorted(_glob.glob("optimization_*_*.traj")):
+        parts = os.path.basename(src_path)[len("optimization_"):-len(".traj")].split("_")
+        if len(parts) != 2 or parts[0] not in wanted:
+            continue
+        try:
+            frames = _read(src_path, ":")
+        except Exception:
+            continue
+        if not frames:
+            continue
+        dst = os.path.join(DOUBLEMIN_PARTIALS_DIR, os.path.basename(src_path))
+        try:
+            with _Traj(dst, "a") as bank:
+                for atoms in frames:
+                    bank.write(atoms)
+        except Exception:
+            continue
+        banked += 1
+    return banked
+
+
 def bank_singlepoint_vasp_restarts(job_ids, config_dict):
     """Bank mid-run VTST-dimer restart files from leftover SinglePoint VASP dirs.
 
