@@ -197,6 +197,11 @@ def archive_and_clear_temp_files(temp_files, zip_name, prefix="", enabled=True):
     if not existing:
         return
     if enabled:
+        # The debug-zip dir is created only on a FRESH start (setup_directories
+        # uses mkdir(exist_ok=False), which resume skips), so a hand-built or
+        # migrated shard dir has none and every finished side would die here --
+        # turning completed work into an 'errored' row. Ensure it instead.
+        os.makedirs(os.path.dirname(zip_name) or ".", exist_ok=True)
         with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zf:
             for f_name in existing:
                 if os.path.isdir(f_name):
