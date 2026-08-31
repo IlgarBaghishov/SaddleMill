@@ -4,6 +4,7 @@ import copy
 
 import numpy as np
 import pytest
+from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import Trajectory
 from ase.optimize import MDMin
 
@@ -240,6 +241,13 @@ class TestDoubleGeomopt:
             side = frame.info["side"]
             if side != 0:  # only min1 and min2, not TS
                 cont_frame = frame.copy()
+                # Mirror production: extract_previous_results hands frames that
+                # still carry their SinglePointCalculator (only .info is
+                # rewrapped). Regression guard: the kept-side branch must read
+                # E/F from this frame BEFORE .copy() drops the calculator.
+                cont_frame.calc = SinglePointCalculator(
+                    cont_frame, energy=frame.get_potential_energy(),
+                    forces=frame.get_forces())
                 cont_frame.info = {"orig_info": dict(frame.info)}
                 continuation_data[side] = cont_frame
 

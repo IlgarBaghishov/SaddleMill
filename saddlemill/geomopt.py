@@ -259,11 +259,14 @@ def doublegeomopt(i, config_dict, atoms, calc, Optimizer, consecutive_errors=Non
                 else:
                     if not (continuation_data and side in continuation_data):
                         raise ValueError(f"Missing continuation data for kept side={side}")
+                    # Read energy/forces from the original frame BEFORE copy():
+                    # Atoms.copy() drops the SinglePointCalculator, so reading
+                    # them from the copy raises "Atoms object has no calculator".
+                    energy = continuation_data[side].get_potential_energy()
+                    forces = continuation_data[side].get_forces()
                     min_atoms = continuation_data[side].copy()
                     conv = bool(min_atoms.info.get('orig_info', {}).get('converged'))
                     side_nfc = 0
-                    energy = min_atoms.get_potential_energy()
-                    forces = min_atoms.get_forces()
 
                 min_atoms.info['side'] = side
                 min_atoms.info['parent_ts_index'] = parent_source_idx
