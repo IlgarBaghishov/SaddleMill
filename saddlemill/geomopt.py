@@ -504,20 +504,25 @@ def singlepoint(i, config_dict, atoms, calc, consecutive_errors=None,
         else:
             a = frames[0]
             a.calc = calc
-            ef_pairs = [(a.get_potential_energy(), a.get_forces())]
             if our_sp.get("compute_hessian"):
                 from saddlemill.tools import hessian_outputs
+                # Hessian FIRST. The model computes energy, forces and hessian in
+                # one calculate(), so E/F below come from that same result. Doing
+                # E/F first instead leaves a retained graph that the Hessian pass
+                # duplicates: measured 41 GB (OOM) versus 4-11 GB for the same
+                # 33-atom cell when the Hessian leads.
                 hess_extra = hessian_outputs(
                     a,
                     nev_store=our_sp.get("hessian_nev_store", 8),
                     tol=our_sp.get("hessian_tol", 1e-2),
-                    chunk=our_sp.get("hessian_chunk", 4),
+                    chunk=our_sp.get("hessian_chunk", 1),
                 )
                 if not hess_extra:
                     # No analytical Hessian available (non-conservative model, or
                     # OOM). Say so rather than silently emitting a plain SP.
                     print(f"Rank {rank} WARNING structure {i}: compute_hessian "
                           f"requested but no analytical Hessian available.", flush=True)
+            ef_pairs = [(a.get_potential_energy(), a.get_forces())]
 
         if input_format == "lmdb":
             import fairchem.core.datasets  # noqa: F401  (register aselmdb backend)

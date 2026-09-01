@@ -53,7 +53,7 @@ class ConfigManager:
             "compute_hessian": False,
             "hessian_nev_store": 8,   # how many of the lowest eigenvalues to keep
             "hessian_tol": 1e-2,      # eigenvalue < -tol counts toward the index
-            "hessian_chunk": 4,       # vmap rows per batch; lower = less memory
+            "hessian_chunk": 1,       # vmap rows per batch; raise for speed if memory allows
             "frames_per_job": 1,  # 1 (default) | 3. With 3, each executorlib job processes a triplet (e.g. DM min1/TS/min2) in a single batched FAIRChem forward pass. VASP requires 1.
             "vasp_command": None,
             "vasp_ncore": None,
