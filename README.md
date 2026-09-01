@@ -138,10 +138,32 @@ pip install fairchem-data-omat
 pip install fairchem-data-oc
 # If you will need VaspInteractive
 pip install git+https://github.com/ulissigroup/vasp-interactive.git
+# If you will need method = Sella (P-RFO saddle search) — see the note below
+pip install sella
 
 # This part below is only necessary for the GH200 HPC (not for the A100-based HPCs)
 pip install "torch==2.9.0+cu128" --index-url https://download.pytorch.org/whl/cu128
 
+```
+
+**Sella (`method = Sella`):** the P-RFO saddle optimiser is an *optional* dependency — SaddleMill only imports it inside `sellaopt.py`, so every other method works without it. Install it into the application env (the one holding `fairchem-core`/`ase`):
+
+```bash
+conda activate /path/to/conda_envs/tsearch     # your SaddleMill application env
+pip freeze > /tmp/env_before.txt               # snapshot, so any change is reversible
+pip install --constraint <(grep -E "^[A-Za-z0-9_.-]+==[0-9]" /tmp/env_before.txt) sella
+```
+
+The `--constraint` file pins every package already installed, so pip physically cannot upgrade `ase`, `numpy`, `scipy` or `torch` out from under `fairchem-core`. On Python 3.12 / x86-64, Sella 2.5.0 installs from a prebuilt `manylinux` wheel and adds only `sella`, `jax`, `jaxlib` and `ml_dtypes` — no compilation and no version changes. Verify with:
+
+```bash
+python -c "import ase, torch, fairchem.core, sella; print(ase.__version__, torch.__version__)"
+```
+
+If pip ever falls back to building Sella from source (older Python, non-x86, no wheel), the build needs a GNU compiler — NVIDIA's `nvc` rejects Sella's `-fno-strict-overflow`:
+
+```bash
+CC=gcc CXX=g++ pip install --no-binary sella sella
 ```
 
 **VTST + VASP (manual ASE patch required for now):** ASE ≤ 3.28 writes the integer INCAR tag `DROTMAX` as a float (`10.000000`), which VASP's VTST dimer silently ignores (falls back to `RotMax 4`). Until fixed upstream, patch the installed ASE — in `ase/calculators/vasp/create_input.py`, move `'drotmax'` from `float_keys` to `int_keys`. The `ase` version pin will be bumped to the fixed release once available. (Guarded by `tests/test_ase_vasp_incar.py`.)

@@ -8,6 +8,26 @@ from ase.build import make_supercell
 from ase.data import covalent_radii, atomic_numbers
 
 
+def _attempts_cfg(config_dict):
+    """Return the our*-section holding this run's attempt-generation knobs.
+
+    Dimer and Sella share this whole module - same reaction types, same
+    displacement candidates - and differ only in the saddle optimiser. Each
+    therefore reads its knobs from its own section (`[ourDimer]` / `[ourSella]`)
+    so a config never configures one method through the other's section, which
+    is the section-ownership rule the rest of SaddleMill follows.
+    """
+    method = (config_dict.get("Main") or {}).get("method")
+    section = "ourSella" if method == "Sella" else "ourDimer"
+    return config_dict.get(section) or config_dict.get("ourDimer") or {}
+
+
+def _attempts_section_name(config_dict):
+    """Name of the section `_attempts_cfg` resolved to, for error messages."""
+    method = (config_dict.get("Main") or {}).get("method")
+    return "ourSella" if method == "Sella" else "ourDimer"
+
+
 def turn_into_supercell(atoms, min_length=7.0):
     """Ensure sufficient atoms AND cell dimensions to avoid self-interaction."""
     n_atoms = len(atoms)
@@ -154,12 +174,13 @@ def _maybe_gaussian(disp_dict, center_idx, p=0.1):
 
 def _swap_prob(config_dict):
     """Probability of swapping a directed displacement for ASE Gaussian noise.
-    Reads [ourDimer] gaussian_swap_prob; default 0.1 reproduces the old hardcoded
+    Reads the active method's [ourDimer]/[ourSella] gaussian_swap_prob; default
+    0.1 reproduces the old hardcoded
     value. 0.0 disables the swap entirely, 1.0 always uses Gaussian noise.
     """
     if config_dict is None:
         return 0.1
-    return config_dict["ourDimer"].get("gaussian_swap_prob", 0.1)
+    return _attempts_cfg(config_dict).get("gaussian_swap_prob", 0.1)
 
 
 def _resolve_attempts_per_type(num_per_type, reaction_types_list):
@@ -173,7 +194,7 @@ def _resolve_attempts_per_type(num_per_type, reaction_types_list):
         counts = [int(x) for x in num_per_type]
         if len(counts) != len(reaction_types_list):
             raise ValueError(
-                f"[ourDimer] num_attempts_per_type has {len(counts)} values but "
+                f"[ourDimer]/[ourSella] num_attempts_per_type has {len(counts)} values but "
                 f"reaction_types has {len(reaction_types_list)} entries. Give one "
                 f"count per type (aligned by position), or a single integer for all.")
         return counts
@@ -658,7 +679,7 @@ def get_ring_attempts(atoms, config_dict, num_attempts):
     ring_sizes = 2 3 4   # includes 2 → also covers pairwise exchange
     ring_sizes = 3 4     # only true rings (no exchange)
     """
-    ring_sizes = config_dict["ourDimer"].get("ring_sizes", [3, 4])
+    ring_sizes = _attempts_cfg(config_dict).get("ring_sizes", [3, 4])
     if isinstance(ring_sizes, (int, float)):
         ring_sizes = [int(ring_sizes)]
     elif isinstance(ring_sizes, str):
@@ -949,7 +970,7 @@ def get_attempts(atoms, config_dict):
     atoms = atoms.copy()
 
     # --- Handle initial_guess early (no supercell, works for both bulk and oc) ---
-    reaction_types = config_dict["ourDimer"].get("reaction_types")
+    reaction_types = _attempts_cfg(config_dict).get("reaction_types")
     if isinstance(reaction_types, str):
         reaction_types_list = reaction_types.split() if ' ' in reaction_types else [reaction_types]
     elif isinstance(reaction_types, list):
@@ -962,13 +983,13 @@ def get_attempts(atoms, config_dict):
         if other_types:
             warnings.warn(f"'initial_guess' is exclusive — ignoring other reaction types: {other_types}")
 
-        dataset_type = config_dict["ourDimer"]["dataset_type"]
+        dataset_type = _attempts_cfg(config_dict)["dataset_type"]
         if dataset_type == "bulk":
-            num_per_type = config_dict["ourDimer"].get("num_attempts_per_type", 1)
+            num_per_type = _attempts_cfg(config_dict).get("num_attempts_per_type", 1)
             if _attempt_count_max(num_per_type) > 1:
                 warnings.warn(f"'initial_guess' always produces 1 attempt — ignoring num_attempts_per_type={num_per_type}")
         elif dataset_type == "oc":
-            num_per_type = config_dict["ourDimer"].get("num_attempts_per_type", 1)
+            num_per_type = _attempts_cfg(config_dict).get("num_attempts_per_type", 1)
             if _attempt_count_max(num_per_type) > 1:
                 warnings.warn(f"'initial_guess' always produces 1 attempt — ignoring num_attempts_per_type={num_per_type}")
             # Apply OC constraints (fix substrate atoms)
@@ -979,7 +1000,7 @@ def get_attempts(atoms, config_dict):
         return get_initial_guess_attempts(atoms)
 
     # Centralized supercell expansion (controlled by config, default True)
-    if config_dict["ourDimer"].get("supercell", True):
+    if _attempts_cfg(config_dict).get("supercell", True):
         atoms = turn_into_supercell(atoms)
 
     # --- Normal dispatch ---
@@ -988,13 +1009,14 @@ def get_attempts(atoms, config_dict):
     displacement_dicts = []
     selected_indices = []
 
-    if config_dict["ourDimer"]["dataset_type"] == "bulk":
+    if _attempts_cfg(config_dict)["dataset_type"] == "bulk":
 
         if reaction_types is None:
-            raise ValueError("Configuration error: 'ourDimer' -> 'reaction_types' is not set. "
+            raise ValueError(f"Configuration error: '{_attempts_section_name(config_dict)}' -> "
+                             "'reaction_types' is not set. "
                              "Please specify reaction types (e.g., 'vacancy') in config.ini")
 
-        num_per_type = config_dict["ourDimer"].get("num_attempts_per_type", 1)
+        num_per_type = _attempts_cfg(config_dict).get("num_attempts_per_type", 1)
         counts = _resolve_attempts_per_type(num_per_type, reaction_types_list)
 
         for rtype, n_attempts in zip(reaction_types_list, counts):
@@ -1007,7 +1029,7 @@ def get_attempts(atoms, config_dict):
             displacement_dicts.extend(dds)
             selected_indices.extend(idxs)
 
-    elif config_dict["ourDimer"]["dataset_type"] == "oc":
+    elif _attempts_cfg(config_dict)["dataset_type"] == "oc":
 
         # Fix substrate atoms (tag=0)
         tags = atoms.get_tags()
@@ -1016,11 +1038,12 @@ def get_attempts(atoms, config_dict):
 
         if reaction_types is None:
             raise ValueError(
-                "Configuration error: 'ourDimer' -> 'reaction_types' is not set. "
+                f"Configuration error: '{_attempts_section_name(config_dict)}' -> "
+                "'reaction_types' is not set. "
                 "Please specify reaction types (e.g., 'adsorbate_atom adsorbate diffusion') in config.ini. "
                 "Supported OC types: " + ", ".join(_OC_REACTION_TYPE_DISPATCH.keys()))
 
-        num_per_type = config_dict["ourDimer"].get("num_attempts_per_type", 1)
+        num_per_type = _attempts_cfg(config_dict).get("num_attempts_per_type", 1)
         counts = _resolve_attempts_per_type(num_per_type, reaction_types_list)
 
         for rtype, n_attempts in zip(reaction_types_list, counts):
@@ -1034,6 +1057,6 @@ def get_attempts(atoms, config_dict):
             selected_indices.extend(idxs)
 
     else:
-        raise Exception("dataset_type in ourDimer must be set")
+        raise Exception(f"dataset_type in {_attempts_section_name(config_dict)} must be set")
 
     return images, displacement_dicts, selected_indices

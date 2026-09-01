@@ -60,6 +60,7 @@ def make_config_dict(method="Minimization", **overrides):
         "method": "improvedtangent", "allow_shared_calculator": True,
     })
     config.setdefault("DimerControl", {})
+    config.setdefault("Sella", {})
     config.setdefault("MDMin", {"dt": 0.05, "maxstep": 0.1})
     config.setdefault("LBFGS", {"maxstep": 0.1})
     config.setdefault("BFGS", {"maxstep": 0.1})
@@ -77,6 +78,7 @@ def make_config_dict(method="Minimization", **overrides):
     method_section_map = {
         "NEB": "ourNEB",
         "Dimer": "ourDimer",
+        "Sella": "ourSella",
         "Minimization": "ourMinimization",
         "DoubleMinimization": "ourDoubleMinimization",
         "SinglePoint": "ourSinglePoint",
@@ -90,8 +92,15 @@ def make_config_dict(method="Minimization", **overrides):
     _our_dmin_keys = set(config.get("ourDoubleMinimization", {}).keys()) - _vasp_shared_keys
     _our_sp_keys = set(config.get("ourSinglePoint", {}).keys()) - _vasp_shared_keys
 
+    _primary_keys = set(config.get(primary_method_section, {}).keys()) if primary_method_section else set()
+
     for key, val in overrides.items():
         if key in _vasp_shared_keys and primary_method_section in config:
+            config[primary_method_section][key] = val
+        elif key in _primary_keys:
+            # The active method's own our*-section wins: [ourSella] repeats most
+            # of [ourDimer]'s key names, so without this a Sella override would
+            # silently land in [ourDimer] and be ignored.
             config[primary_method_section][key] = val
         elif key in _main_keys:
             config["Main"][key] = val
@@ -109,6 +118,8 @@ def make_config_dict(method="Minimization", **overrides):
             config["BaseNEB"][key[len("BaseNEB_"):]] = val
         elif key.startswith("DimerControl_"):
             config["DimerControl"][key[len("DimerControl_"):]] = val
+        elif key.startswith("Sella_"):
+            config["Sella"][key[len("Sella_"):]] = val
         else:
             # Default: put in Main
             config["Main"][key] = val

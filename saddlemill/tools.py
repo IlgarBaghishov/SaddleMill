@@ -296,6 +296,9 @@ def clean_up_files(config_dict):
         "Dimer": [
             "dimer_control_*.log", "dimer_opt_*.log", "dimer_*.traj",
         ],
+        "Sella": [
+            "sella_control_*.log", "sella_opt_*.log", "sella_*.traj",
+        ],
         "Minimization": [
             "optimization_*.log", "optimization_*.traj",
         ],
@@ -617,7 +620,7 @@ def extract_previous_results(job_ids, config_dict, redo_info):
                 for sid in grouped:
                     grouped[sid].sort(key=lambda a: a.info.get('image_idx', 0))
 
-            if method_name in ("Dimer", "DoubleMinimization"):
+            if method_name in ("Dimer", "Sella", "DoubleMinimization"):
                 # Flatten: each subunit maps to a single Atoms
                 grouped = {sid: atoms_list[0] for sid, atoms_list in grouped.items()
                            if atoms_list}
@@ -723,3 +726,127 @@ def check_adsorbate_reaction(atoms_initial, atoms_final, neighbor_fudge=1.25, ta
 
 #==============================================================================
 
+
+#==============================================================================
+### SADDLE INDEX VERIFICATION
+
+def _analytic_hessian(atoms, chunk=4):
+    """Exact Hessian from a conservative MLIP, or None if unavailable.
+
+    UMA-S-1.2 has ``direct_forces=False`` - its forces are a true autograd
+    gradient of the energy - so ``-grad(forces)`` is the genuine energy Hessian.
+    fairchem exposes it, but its ``compute_hessian_vmap`` vmaps over the whole
+    ``eye(3N)`` and so materialises 3N backward graphs at once: that OOMs above
+    roughly 30 atoms on a 40 GB card. Chunking the vmap over groups of *chunk*
+    rows is identical arithmetic with peak memory set by the chunk rather than
+    the system size, and covers 100+ atoms in ~10-30 GB.
+
+    Returns the (3N, 3N) Hessian, or None when the calculator cannot produce one
+    (direct-force model, hessian output not enabled, or out of memory) so the
+    caller can fall back to finite differences.
+    """
+    try:
+        import torch
+        import fairchem.core.models.uma.outputs as _O
+    except Exception:
+        return None
+
+    if getattr(_O, "_sm_chunked", None) != chunk:
+        def _chunked(forces_flat, pos, create_graph, _c=chunk):
+            n = forces_flat.shape[0]
+            eye = torch.eye(n, device=forces_flat.device, dtype=forces_flat.dtype)
+            out = []
+            for i in range(0, n, _c):
+                blk = torch.vmap(lambda v: torch.autograd.grad(
+                    -1 * forces_flat, pos, grad_outputs=v,
+                    retain_graph=True, create_graph=create_graph)[0])(eye[i:i + _c])
+                out.append(blk.reshape(blk.shape[0], -1).detach())
+                del blk
+            return torch.cat(out, 0)
+        _O.compute_hessian_vmap = _chunked
+        _O._sm_chunked = chunk
+
+    try:
+        n3 = 3 * len(atoms)
+        H = np.asarray(atoms.calc.get_property("hessian", atoms)).reshape(n3, n3)
+        H = 0.5 * (H + H.T)             # symmetrise away numerical asymmetry
+    except Exception:
+        return None
+
+    # The model computes the Hessian on raw positions and is BLIND to ASE
+    # constraints - unlike atoms.get_forces(), which zeroes constrained forces.
+    # Left unprojected, a slab's frozen substrate contributes its own (spurious)
+    # modes: measured on OC20/OC22 that inflated the index >= 2 rate from ~10%
+    # to 60-75%, and left 3 acoustic modes visible where FixAtoms should give 0.
+    # Restrict to the free degrees of freedom before returning.
+    fixed = set()
+    for c in getattr(atoms, "constraints", []) or []:
+        idx = getattr(c, "index", None)
+        if idx is None and hasattr(c, "get_indices"):
+            try: idx = c.get_indices()
+            except Exception: idx = None
+        if idx is not None:
+            fixed.update(int(i) for i in np.atleast_1d(idx))
+    if fixed:
+        free = [i for i in range(len(atoms)) if i not in fixed]
+        dof = np.array([3 * i + k for i in free for k in range(3)], dtype=int)
+        H = H[np.ix_(dof, dof)]
+    return H
+
+
+def hessian_index(atoms, nev=4, eps=2e-3, tol=1e-2, maxiter=300, analytic=True):
+    """Lowest *nev* Hessian eigenvalues by finite-difference Lanczos.
+
+    Returns ``(eigenvalues, n_negative)``. A genuine first-order saddle has
+    exactly one eigenvalue below ``-tol``; ``n_negative >= 2`` means the
+    structure is a higher-order saddle.
+
+    Never forms the Hessian: ``eigsh`` only needs ``H @ v``, and ``H @ v`` is one
+    central difference of forces along ``v`` (2 force calls per matvec). Cost is
+    therefore ``~2 * nev * (Lanczos iterations)`` force calls, not ``6N``.
+
+    This is deliberately independent of any optimizer's internal curvature
+    model: Sella's quasi-Newton Hessian and the dimer's rotated mode are both
+    *approximations* fitted during the search, so using them to certify the
+    index would be marking your own homework. Both methods route through this
+    same function so their reported indices are directly comparable.
+    """
+    from scipy.sparse.linalg import LinearOperator, eigsh
+
+    # Exact route first: ~30-70x cheaper than the Lanczos below AND free of the
+    # finite-difference step error, which was measured at up to 3.9e-3 eV/A^2 -
+    # uncomfortably close to the 1e-2 tolerance this function defaults to.
+    # It also yields the full spectrum, so acoustic modes are visible.
+    if analytic:
+        H = _analytic_hessian(atoms)
+        if H is not None:
+            ev = np.linalg.eigvalsh(H)
+            return ([float(v) for v in ev[:nev]],
+                    int(sum(1 for v in ev if v < -tol)))
+
+    n = len(atoms)
+    x_center = atoms.get_positions().copy()
+
+    def hv(v):
+        v = np.asarray(v).reshape(n, 3)
+        norm = np.linalg.norm(v)
+        if norm < 1e-12:
+            return np.zeros(3 * n)
+        u = v / norm
+        atoms.set_positions(x_center + eps * u)
+        f_plus = atoms.get_forces()
+        atoms.set_positions(x_center - eps * u)
+        f_minus = atoms.get_forces()
+        atoms.set_positions(x_center)
+        return (-(f_plus - f_minus) / (2 * eps) * norm).ravel()
+
+    op = LinearOperator((3 * n, 3 * n), matvec=hv, dtype=float)
+    try:
+        w = eigsh(op, k=nev, which="SA", return_eigenvectors=False,
+                  maxiter=maxiter, tol=1e-3)
+    except Exception:
+        atoms.set_positions(x_center)
+        return None, None
+    atoms.set_positions(x_center)
+    eigs = sorted(float(x) for x in w)
+    return eigs, int(sum(1 for x in eigs if x < -tol))

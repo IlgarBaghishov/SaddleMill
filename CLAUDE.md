@@ -28,6 +28,7 @@ The `__main__.py` reads `config.ini` from the current directory, loads the metho
 |--------|-------------|--------|-------------|
 | NEB | `NEB` | `nebopt.py` | Nudged Elastic Band (with optional DNEB switching) |
 | Dimer | `Dimer` | `dimeropt.py` | Dimer method for saddle point search |
+| Sella | `Sella` | `sellaopt.py` | P-RFO saddle search. Drop-in sibling of Dimer: same attempt generation, reaction types, resume contract and output schema; only the optimizer differs. Optional dep (`pip install sella`). |
 | Minimization | `Minimization` | `geomopt.py` | Single structure geometry optimization |
 | DoubleMinimization | `DoubleMinimization` | `geomopt.py` | TS refinement: displaces along eigenmode in both directions, relaxes, checks for reaction |
 | SinglePoint | `SinglePoint` | `geomopt.py` | One E/F call per frame; only method that accepts `.aselmdb` input. `frames_per_job = N` enables a batched FAIRChem forward pass for N frames per job. With VASP/VaspInteractive, `frames_per_job` is forced to 1 (no batched DFT). |
@@ -44,7 +45,7 @@ __main__.py  -->  init_function.py (per-worker GPU setup + calculator loading)
 config.py            FluxJobExecutor (distributed) or serial mode
     |
     v
-nebopt.py / dimeropt.py / geomopt.py  (method functions)
+nebopt.py / dimeropt.py / sellaopt.py / geomopt.py  (method functions)
     |
     v
 catsunami/ocpneb.py  (OCPNEB: batched NEB with optional swDNEB)
@@ -66,7 +67,7 @@ Auxiliary entry points:
 > these — it would be forwarded to the external class (e.g. ASE's `Vasp` writes
 > unknown keys straight into INCAR via its type-based fallback) and corrupt its
 > input. All SaddleMill knobs live in `[Main]` or in an `our*` section
-> (`[ourNEB]`, `[ourDimer]`, `[ourMinimization]`, `[ourDoubleMinimization]`,
+> (`[ourNEB]`, `[ourDimer]`, `[ourSella]`, `[ourMinimization]`, `[ourDoubleMinimization]`,
 > `[ourSinglePoint]`, `[ourVasp]`). This is why `input_generator` /
 > `extra_input_files` are in `[ourVasp]`, not `[Vasp]`. The section name signals
 > ownership: a bare class name = "the user is configuring that class"; an `our`
@@ -124,6 +125,80 @@ Auxiliary entry points:
 - **Engine Selection**: Supports both standard ASE dimer (`engine = dimer`, default) and the Kappa dimer (`engine = kappa`). The Kappa dimer utilizes a Phase A/Phase B double rotation scheme to constrain the dimer rotation to the isopotential hyperplane via `KappaMinModeAtoms`. It smoothly blends translation forces using a switching function governed by `beta` (steepness) and automatically recovers to the standard normal dimer method when maximum atomic forces drop below `recover_fmax`.
 - **Reaction Attempts Mapping**: `num_attempts_per_type` accepts either a single integer (applied globally to all configured `reaction_types`) or a space-separated list of integers mapping 1:1 to the `reaction_types` list.
 - **Status CSV Tracking**: The Dimer status CSV now records the total number of **force calls** for each attempt, providing a direct metric for computational cost alongside the convergence status.
+### `sellaopt.py` - Sella (P-RFO) Saddle Search
+
+`method = Sella`. A deliberate drop-in sibling of `Dimer`: it calls the **same**
+`get_attempts()` machinery (same `reaction_types`, same displacement candidates,
+same `initial_guess` path), the same continuation/`entries_to_run` contract, the
+same status-CSV layout, and writes the same output `.info` keys — only the
+saddle optimizer differs. `sella` is an optional dependency, imported lazily
+inside `_setup_sella()`, so every other method runs without it installed.
+
+- **`_setup_sella()`**: mirror of `_setup_dimer()`. Returns `(dyn, seeded)`
+  without running. Defaults `order=1` and `internal=False` (Cartesian — these are
+  periodic solids/slabs, not molecules).
+- **`_apply_displacement()`**: `get_attempts()` emits ASE
+  `MinModeAtoms.displace()` kwargs, so the displacement is applied through a
+  throwaway `MinModeAtoms` wrapper. `displace()` is pure geometry and costs **no
+  force calls**, so this reuses the dimer toolkit verbatim and guarantees Dimer
+  and Sella see *identical attempt geometries for the same seed* — which is what
+  makes a head-to-head benchmark of the two optimizers valid.
+  `[DimerControl]` is therefore the shared displacement-machinery section, read
+  by both methods.
+- **`_seed_eigenmode()`**: the Sella analogue of the Dimer's `eigenmodes=[...]`
+  seeding. Sella's initial Rayleigh–Ritz guess is `pes.v0`, which lives in the
+  **free-DOF subspace** spanned by `pes.get_Ufree()` `(3N, nfree)` — *not* raw
+  3N. The stored mode is projected (`mode.ravel() @ Ufree`) and normalized.
+  Without that projection the seed is silently the wrong shape on any structure
+  carrying `FixAtoms` (i.e. every OC20/OC22 slab). Returns False — and seeds
+  nothing — when the mode is entirely inside the constrained subspace.
+- **`_mode_and_curvature()`**: `pes.H.evecs` is stored in full 3N Cartesian
+  space (rows of constrained atoms come back exactly zero), so column 0 reshapes
+  straight to `(N, 3)`; `pes.H.evals[0]` is the curvature. Returns `(None, None)`
+  before the first diagonalization — the normal state when a structure was
+  already converged and Sella took zero steps.
+- **Force-call accounting (important).** `n_force_calls` records
+  **`dyn.pes.neval`**, the true energy/force evaluation count — *not*
+  `dyn.get_number_of_steps()`. Sella re-diagonalizes every `nsteps_per_diag`
+  (default 3) steps and each Rayleigh–Ritz matvec spends extra gradient
+  evaluations, so the step count understates real cost by roughly **2×**
+  (measured 17 evals / 8 steps, 19 / 10 on EMT). Recording `neval` is what makes
+  the CSV's force-call column directly comparable to the Dimer's
+  `control.get_counter('forcecalls')`. `n_steps` is stored alongside it.
+- **Constraints**: Sella does not read `atoms.constraints` itself, but with
+  `internal=False` and `constraints=None` it builds `Constraints(atoms)`, whose
+  constructor merges ASE constraints (`FixAtoms` → `fix_translation`). Fixed
+  substrates are therefore handled natively and genuinely reduce the free-DOF
+  basis.
+- Same delocalization (participation-ratio) and desorption `StopRun` checks as
+  Dimer, same extension check (`extension_check_fmax`/`_curvature`), same
+  per-attempt error isolation and `consecutive_errors` worker-health tracking.
+- **Extra output keys** vs Dimer: `n_steps`, `eigenmode_seeded` (0/1), and — when
+  `[ourSella] check_index = True` — `nneg` and `eigenvalues`.
+
+**Status vocabulary is identical to Dimer** (`converged`,
+`converged_after_extension`, `converged_to_desorption`, `not_converged`,
+`not_converged_after_extension`, `not_converged_StopRun`, `error: ...`). The
+index check never alters the status string, so `run_jobs` categorization and
+`input_statuses` filtering behave exactly as they do for Dimer; the index is
+reported in `.info['nneg']` instead.
+
+### Saddle index verification — `tools.hessian_index()`
+
+`hessian_index(atoms, nev=4, eps=2e-3, tol=1e-2)` returns
+`(eigenvalues, n_negative)` from a finite-difference Lanczos on the lowest `nev`
+Hessian eigenvalues. It never forms the Hessian (`eigsh` only needs `H @ v`, and
+`H @ v` is one central difference of forces — 2 force calls per matvec), and it
+restores the geometry afterwards.
+
+Deliberately **independent of any optimizer's internal curvature model**: Sella's
+quasi-Newton Hessian and the dimer's rotated mode are approximations fitted
+*during* the search, so certifying the index with them would be marking your own
+homework. Both methods route through this one function, gated by
+`check_index` in `[ourDimer]`/`[ourSella]` (default `False`), so their reported
+indices are directly comparable. A genuine first-order saddle has exactly one
+eigenvalue below `-tol`; `n_negative >= 2` is a higher-order saddle.
+
 ### `dimertools/structure_edit.py` - Reaction Types for Dimer
 Reaction types configured via `reaction_types` (space-separated list). Bulk and OC dispatched via `_BULK_REACTION_TYPE_DISPATCH` / `_OC_REACTION_TYPE_DISPATCH`.
 
@@ -369,6 +444,34 @@ f_rot_min = 0.01
 f_rot_max = 0.50
 dimer_separation = 0.01
 
+[ourSella]                   # mirrors [ourDimer] minus the rotation-engine knobs
+dataset_type = oc            # oc | bulk
+reaction_types = initial_guess   # same vocabulary as [ourDimer]
+num_attempts_per_type = 1
+ring_sizes = 3 4
+gaussian_swap_prob = 0.1
+supercell = True
+delocalization_threshold = 0.8
+extension_check_fmax = 0.4
+extension_check_curvature = -0.2
+check_index = False          # finite-difference Lanczos index check on converged saddles
+index_nev = 4                # eigenvalues to compute
+index_eps = 2e-3             # finite-difference step (Å)
+index_tol = 1e-2             # eigenvalue < -tol counts as negative
+# Required when Calculator = Vasp or VaspInteractive:
+vasp_command = "srun --exclusive -n 64 vasp_std"
+vasp_ncore = 8
+
+[Sella]                      # pure pass-through to sella.Sella(**kwargs)
+# order = 1                  # set by SaddleMill (first-order saddle)
+# internal = False           # set by SaddleMill (Cartesian, not internal coords)
+delta0 = 0.1                 # initial trust radius (Å)
+gamma = 0.1                  # Rayleigh-Ritz convergence
+nsteps_per_diag = 3          # re-diagonalize every N steps (drives the ~2x eval/step ratio)
+
+# NOTE: [DimerControl] is the *shared* displacement-machinery section — it governs
+# how get_attempts() displacement candidates are applied, for Dimer AND Sella.
+
 [ourMinimization]
 relax_cell = False
 
@@ -389,6 +492,7 @@ vasp_ncore = 8
 |--------|------------|-------|
 | NEB | `VASP_{job}_{image_idx}/` | Separate `vasp_command_endpoints`/`_intermediates` commands. |
 | Dimer | `VASP_{job}_{attempt_id}/` | One dir per attempt — clean isolation across reaction-type displacements. |
+| Sella | `VASP_{job}_{attempt_id}/` | Identical to Dimer (same attempt granularity). |
 | Minimization | `VASP_{job}/` | Single dir per job. |
 | DoubleMinimization | `VASP_{job}_-1/`, `VASP_{job}_0/`, `VASP_{job}_1/` | Side ints match `info['side']`. TS dir reused for `pre_dimer_refine`; side dirs reused for desorption-check single-point + relaxation (WAVECAR warm-start). |
 | SinglePoint | `VASP_{job}/` | On success: heavies dropped + dir archived to `SinglePoint_debug_zips/` (`ERROR_`-prefixed on error), like the other methods; `zip = False` just deletes. FAIRChem SP keeps nothing. |
@@ -439,6 +543,7 @@ Errored entries always fall back to fresh. Continuation handled per-entry inside
 | Method | Granularity | `True` | `False` |
 |---|---|---|---|
 | Dimer | per-attempt | Continue from extracted structure with eigenmode | Fresh attempt at same `attempt_id` (same type, new displacement) |
+| Sella | per-attempt | Continue from extracted structure with eigenmode (reused verbatim — P-RFO needs no symmetry-breaking kick) | Fresh attempt at same `attempt_id` |
 | NEB | full-band | Continue from extracted images. Seeds imin/frozen/frozen_fmax from previous result. Config controls new imin/image detection on top of seeded state. | Fresh run from original input. |
 | DoubleMinimization | per-side | Continue not-converged side | Re-displace from TS |
 | Minimization | per-job | Continue from extracted structure | Original input |
@@ -501,7 +606,9 @@ All output frames also carry `task_name` (the FAIRChem task that produced them, 
 
 NEB output image metadata: `src_index`, `image_idx`, `subband_idx`, `image_type` (endpoint/intermediate_minimum/climbing/regular), `effective_fmax`, `image_converged`, `band_converged`, `band_converged_CI`, `status`, `nimages`, `interpolation_method`, `imin_set`/`climbing_set`/`frozen_set` (band-wide, stamped on each image), `task_name`, `orig_info`. CI images also get `eigenmode`, `barrier`, `dE`. Every image in a sub-band shares the sub-band's `status` (`converged` / `converged_CI` / `not_converged`). Imin images duplicated for sub-band self-containment. NEB CSV is still per-sub-band lines; band-level run_jobs categorization requires ALL sub-bands converged/converged_CI.
 
-Dimer output: `eigenmode`, `curvature`, `converged`, `src_index`, `attempt_id`, `stoprun`, `selected_index`, `reaction_type`, `status`, `task_name`, `orig_info`.
+Dimer output: `eigenmode`, `curvature`, `converged`, `src_index`, `attempt_id`, `stoprun`, `selected_index`, `reaction_type`, `status`, `task_name`, `orig_info`. Plus `nneg`/`eigenvalues` when `[ourDimer] check_index = True`.
+
+Sella output: identical to Dimer, plus `n_steps` and `eigenmode_seeded` (0/1), and `nneg`/`eigenvalues` when `[ourSella] check_index = True`. `n_force_calls` is the true evaluation count (`pes.neval`), directly comparable to Dimer's.
 
 DoubleMinimization output: `side` (-1/0/1), `parent_ts_index`, `converged`, `src_index`, full reaction-detection dict (`is_reaction`, `n_formed_bonds`, `n_broken_bonds`, `broken_bonds`, `formed_bonds`, plus `is_ads_reaction` / `n_ads_*` / `ads_*_bonds` for OC inputs), `status` (`converged` / `converged_desorption_skipped` / `not_converged`; TS frame always `converged`), `task_name`, optional `curvature` on the TS frame when `pre_dimer_refine=True`, `orig_info`. CSV: 2 lines per job `{job_id},{rank},{side_id},{parent_ts_idx},"{status}"`.
 
@@ -560,6 +667,7 @@ tests/
 ├── test_config.py               # ConfigManager, load_*, run_jobs, archive/clean (77, CPU)
 ├── test_tools.py                # load_and_sanitize, check_reaction, extraction, get_task_name, passes_input_filter (42, CPU)
 ├── test_structure_edit.py       # Bulk & OC reaction types, supercell (42, CPU)
+├── test_sellaopt.py             # Sella config/seeding/accounting/e2e on EMT (22, CPU)
 ├── test_ocpneb.py               # swDNEB, forces, frozen images (20, mixed)
 ├── test_spc_wrap_ordering.py    # SinglePointCalculator vs Atoms.wrap() ordering (4, CPU)
 ├── test_nebopt_integration.py   # Full NEB runs (8, GPU)

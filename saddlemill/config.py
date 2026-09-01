@@ -11,6 +11,7 @@ _RUN_CATEGORY_ALIASES = {"not_started": "remaining", "error": "errored"}
 _VASP_METHOD_SECTION = {
     "NEB": ("ourNEB", ["vasp_command_endpoints", "vasp_command_intermediates"]),
     "Dimer": ("ourDimer", ["vasp_command"]),
+    "Sella": ("ourSella", ["vasp_command"]),
     "Minimization": ("ourMinimization", ["vasp_command"]),
     "DoubleMinimization": ("ourDoubleMinimization", ["vasp_command"]),
     "SinglePoint": ("ourSinglePoint", ["vasp_command"]),
@@ -92,6 +93,37 @@ class ConfigManager:
             "engine": "ase",            # ase (stock ASE dimer) | kappa
             "kappa_beta": 2.0,          # only used when engine = kappa
             "kappa_recover_fmax": 0.3,  # only used when engine = kappa
+            # Independent finite-difference Lanczos index check on converged
+            # saddles (off by default; costs ~2*index_nev*iters extra force
+            # calls). Records nneg/eigenvalues in .info - it never changes the
+            # status string, so run_jobs/input_statuses behaviour is unaffected.
+            "check_index": False,
+            "index_nev": 4,
+            "index_eps": 2e-3,
+            "index_tol": 1e-2,
+            "vasp_command": None,
+            "vasp_ncore": None,
+        },
+        # Sella (P-RFO) saddle search. Deliberately mirrors [ourDimer] key for
+        # key - the two methods share the whole attempt-generation machinery and
+        # differ only in the optimiser - minus the dimer-only rotation knobs
+        # (engine/kappa_*). Sella's own optimiser knobs live in the pure
+        # pass-through [Sella] section, exactly as [DimerControl] serves Dimer.
+        "ourSella": {
+            "dataset_type": None,
+            "reaction_types": None,  # same vocabulary as [ourDimer]
+            "num_attempts_per_type": 1,
+            "gaussian_swap_prob": 0.1,
+            "ring_sizes": "3 4",
+            "supercell": True,
+            "delocalization_threshold": 0.8,
+            "extension_check_fmax": 0.4,
+            "extension_check_curvature": -0.2,
+            # Independent finite-difference Lanczos index check (see [ourDimer]).
+            "check_index": False,
+            "index_nev": 4,
+            "index_eps": 2e-3,
+            "index_tol": 1e-2,
             "vasp_command": None,
             "vasp_ncore": None,
         },
@@ -326,6 +358,8 @@ def load_method(config_dict):
         from saddlemill.nebopt import nebopt as method
     elif method_name == "Dimer":
         from saddlemill.dimeropt import dimeropt as method
+    elif method_name == "Sella":
+        from saddlemill.sellaopt import sellaopt as method
     elif method_name == "Minimization":
         from saddlemill.geomopt import geomopt as method
     elif method_name == "DoubleMinimization":
@@ -334,7 +368,7 @@ def load_method(config_dict):
         from saddlemill.geomopt import singlepoint as method
     else:
         raise NotImplementedError(
-            f"Method '{method_name}' is not implemented. Only NEB, Dimer, Minimization, DoubleMinimization, and SinglePoint are supported."
+            f"Method '{method_name}' is not implemented. Only NEB, Dimer, Sella, Minimization, DoubleMinimization, and SinglePoint are supported."
         )
     return method
 
@@ -606,7 +640,7 @@ def _get_subunit_config(method_name):
     The info_key is the corresponding key in output traj frame .info.
     Returns (None, None) for methods without sub-units (Minimization).
     """
-    if method_name == "Dimer":
+    if method_name in ("Dimer", "Sella"):
         return 2, "attempt_id"
     elif method_name == "NEB":
         return 2, "subband_idx"
@@ -704,6 +738,12 @@ def _get_debug_filename_patterns(method_name):
     elif method_name == "Dimer":
         return [
             re.compile(r'^(?:ERROR_)?dimer_(?:control_|opt_)?(\d+)_(\d+)_'),
+            # VASP debug entries: per-attempt dir → (job, attempt) per-subunit cleanup.
+            re.compile(r'^(?:ERROR_)?VASP_(\d+)_(\d+)/'),
+        ]
+    elif method_name == "Sella":
+        return [
+            re.compile(r'^(?:ERROR_)?sella_(?:control_|opt_)?(\d+)_(\d+)_'),
             # VASP debug entries: per-attempt dir → (job, attempt) per-subunit cleanup.
             re.compile(r'^(?:ERROR_)?VASP_(\d+)_(\d+)/'),
         ]

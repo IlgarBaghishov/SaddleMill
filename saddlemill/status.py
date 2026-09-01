@@ -61,8 +61,9 @@ def _get_total_jobs(directory, config):
 
 def _compute_expected_entries_per_job(method_name, config):
     """Compute expected entries per job from config, if possible."""
-    if method_name == "Dimer":
-        reaction_types = config.get_value("ourDimer", "reaction_types")
+    if method_name in ("Dimer", "Sella"):
+        section = "ourSella" if method_name == "Sella" else "ourDimer"
+        reaction_types = config.get_value(section, "reaction_types")
         if reaction_types:
             if isinstance(reaction_types, list):
                 num_types = len(reaction_types)
@@ -71,7 +72,7 @@ def _compute_expected_entries_per_job(method_name, config):
         else:
             return None
         
-        raw_num = config.get_value("ourDimer", "num_attempts_per_type", 1)
+        raw_num = config.get_value(section, "num_attempts_per_type", 1)
 
         if isinstance(raw_num, list):
             counts = [int(x) for x in raw_num]
@@ -112,9 +113,14 @@ def _get_dimer_reaction_type(attempt_id, reaction_types_list, counts):
         return reaction_types_list[type_idx]
     return "unknown"
 
-def _print_dimer_reaction_type_table(rows, config):
-    """Print per-reaction-type breakdown table for Dimer jobs."""
-    reaction_types = config.get_value("ourDimer", "reaction_types")
+def _print_dimer_reaction_type_table(rows, config, section="ourDimer"):
+    """Print per-reaction-type breakdown table for Dimer/Sella jobs.
+
+    Both methods share the reaction-type machinery and the status-CSV layout,
+    so the same table serves either; *section* selects which our*-section the
+    reaction types are read from.
+    """
+    reaction_types = config.get_value(section, "reaction_types")
     if not reaction_types:
         return
     if isinstance(reaction_types, list):
@@ -122,7 +128,7 @@ def _print_dimer_reaction_type_table(rows, config):
     else:
         reaction_types_list = reaction_types.split()
 
-    raw_num = config.get_value("ourDimer", "num_attempts_per_type", 1)
+    raw_num = config.get_value(section, "num_attempts_per_type", 1)
     if isinstance(raw_num, list):
         counts = [int(x) for x in raw_num]
     elif isinstance(raw_num, str):
@@ -301,9 +307,10 @@ def main():
         print(f"    Errored:       {cats['errored']:>6}  ({100*cats['errored']/total_entries:5.1f}% of total)")
         print()
 
-        # Per-reaction-type table (Dimer only)
-        if method == "Dimer":
-            _print_dimer_reaction_type_table(rows, config)
+        # Per-reaction-type table (Dimer / Sella)
+        if method in ("Dimer", "Sella"):
+            _print_dimer_reaction_type_table(
+                rows, config, "ourSella" if method == "Sella" else "ourDimer")
 
         # NEB per-job convergence and sub-band distribution
         if method == "NEB":

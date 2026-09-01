@@ -13,7 +13,7 @@ from ase.calculators.singlepoint import SinglePointCalculator
 from saddlemill.dimertools.structure_edit import get_attempts
 from saddlemill.tools import (backup_flux_logs, get_task_name, resolve_vasp_calc,
                               remove_vasp_heavies, finalize_if_vasp_interactive,
-                              archive_and_clear_temp_files)
+                              archive_and_clear_temp_files, hessian_index)
 
 
 class StopRun(Exception):
@@ -101,6 +101,8 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
     zip_name = f"{method_name}_debug_zips/structure_rank_{rank}_data.zip"
     task_name = get_task_name(config_dict)
     is_vasp = config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive")
+    our = config_dict["ourDimer"]
+    check_index = our.get("check_index", False)
 
     max_consecutive_errors = config_dict["Main"]["max_consecutive_errors"]
     if consecutive_errors is not None and consecutive_errors[0] >= max_consecutive_errors > 0:
@@ -255,6 +257,19 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                 n_force_calls = d_atoms.control.get_counter('forcecalls')
                 energy = atoms.get_potential_energy()
                 forces = atoms.get_forces()
+
+                # Optional independent index check. Not gated on convergence:
+                # the geometry a failed search leaves behind is exactly what the
+                # status filter exists to reject, so it has to be measurable.
+                nneg, eigs = None, None
+                if check_index:
+                    eigs, nneg = hessian_index(
+                        atoms,
+                        nev=our.get("index_nev", 4),
+                        eps=our.get("index_eps", 2e-3),
+                        tol=our.get("index_tol", 1e-2),
+                    )
+
                 finalize_if_vasp_interactive(config_dict, attempt_calc)
                 if attempt_vasp_dir is not None:
                     remove_vasp_heavies(attempt_vasp_dir)
@@ -267,6 +282,9 @@ def dimeropt(i, config_dict, atoms_orig, calc, consecutive_errors=None, executor
                 atoms.info['attempt_id'] = attempt
                 atoms.info['stoprun'] = 1 if stopped_early else 0
                 atoms.info['selected_index'] = slctd_indx
+                if nneg is not None:
+                    atoms.info['nneg'] = int(nneg)
+                    atoms.info['eigenvalues'] = list(eigs) if eigs is not None else None
                 orig = atoms.info.get('orig_info', {})
                 atoms.info['reaction_type'] = atoms.info.get('reaction_type', orig.get('reaction_type', 'unknown'))
                 if stop_reason and "desorbed" in stop_reason:
