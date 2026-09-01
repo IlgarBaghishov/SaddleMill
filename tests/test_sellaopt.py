@@ -445,3 +445,65 @@ class TestHessianOutputs:
         for mod in (sellaopt, dimeropt):
             src = inspect.getsource(mod)
             assert "atoms.info.get('eigenmode')" in src
+
+
+class TestConstraintProjection:
+    """The analytical Hessian is computed on raw positions and is blind to ASE
+    constraints. Projection onto the free DOF has silently regressed twice — once
+    by being absent, once by an edit that stranded it after a `return`. These
+    tests exercise it without a GPU by feeding a known full Hessian through.
+    """
+
+    class _FakeCalc:
+        """Minimal stand-in returning a fixed full-space Hessian."""
+        def __init__(self, n):
+            self.n = n
+            self.results = {}
+            # distinctive: H[i,i] = i, so a projection is visible in the diagonal
+            self.H = np.diag(np.arange(3 * n, dtype=float))
+
+        def get_property(self, name, atoms=None, **kw):
+            if name != "hessian":
+                raise NotImplementedError(name)
+            return self.H
+
+    def _atoms_with_fixed(self, n=6, fixed=(0, 1)):
+        from ase import Atoms
+        a = Atoms("H" * n, positions=np.random.RandomState(0).rand(n, 3) * 5)
+        a.set_constraint(FixAtoms(indices=list(fixed)))
+        a.calc = self._FakeCalc(n)
+        return a
+
+    def test_projection_reduces_dimension(self):
+        from saddlemill.tools import _analytic_hessian
+        a = self._atoms_with_fixed(n=6, fixed=(0, 1))
+        H = _analytic_hessian(a)
+        assert H is not None
+        assert H.shape == (12, 12), (
+            f"expected 3*(6-2)=12 free DOF, got {H.shape} — projection did not run")
+
+    def test_projection_keeps_the_right_rows(self):
+        """Atoms 0,1 fixed -> the surviving diagonal must start at DOF 6."""
+        from saddlemill.tools import _analytic_hessian
+        a = self._atoms_with_fixed(n=6, fixed=(0, 1))
+        H = _analytic_hessian(a)
+        assert np.allclose(np.diag(H), np.arange(6, 18)), np.diag(H)
+
+    def test_unconstrained_is_untouched(self):
+        from ase import Atoms
+        from saddlemill.tools import _analytic_hessian
+        a = Atoms("H" * 4, positions=np.random.RandomState(1).rand(4, 3) * 5)
+        a.calc = self._FakeCalc(4)
+        H = _analytic_hessian(a)
+        assert H.shape == (12, 12), "no constraints -> full space"
+
+    def test_eigenmode_maps_back_to_full_cartesian(self):
+        """hessian_outputs must return an (N,3) mode with zeros on fixed atoms."""
+        from saddlemill.tools import hessian_outputs
+        a = self._atoms_with_fixed(n=6, fixed=(0, 1))
+        out = hessian_outputs(a)
+        assert out, "expected a populated dict"
+        mode = np.asarray(out["eigenmode"])
+        assert mode.shape == (6, 3)
+        assert np.allclose(mode[[0, 1]], 0.0), "fixed atoms must not move"
+        assert np.isclose(np.linalg.norm(mode), 1.0)

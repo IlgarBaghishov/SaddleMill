@@ -808,45 +808,34 @@ def _analytic_hessian(atoms, chunk=1):
             _release(atoms, torch)
             return None
     try:
+        if H is None:
+            return None
+        # The model computes the Hessian on raw positions and is BLIND to ASE
+        # constraints - unlike atoms.get_forces(), which zeroes constrained
+        # forces. Left unprojected, a slab's frozen substrate contributes its own
+        # spurious modes: on OC20/OC22 that inflates index >= 2 from ~10% to
+        # 60-75% and leaves 3 acoustic modes where FixAtoms should give 0.
+        # This MUST run before the return - an earlier refactor left it stranded
+        # after one, silently disabling it.
+        fixed = set()
+        for c in getattr(atoms, "constraints", []) or []:
+            idx = getattr(c, "index", None)
+            if idx is None and hasattr(c, "get_indices"):
+                try:
+                    idx = c.get_indices()
+                except Exception:
+                    idx = None
+            if idx is not None:
+                fixed.update(int(i) for i in np.atleast_1d(idx))
+        if fixed:
+            free = [i for i in range(len(atoms)) if i not in fixed]
+            dof = np.array([3 * i + k for i in free for k in range(3)], dtype=int)
+            H = H[np.ix_(dof, dof)]
         return H
     finally:
+        # Release the retained autograd graph and the cached hessian tensor;
+        # without it a worker accumulates GPU memory across structures.
         _release(atoms, torch)
-        # Release the retained autograd graph and the cached hessian tensor.
-        # The chunked vmap holds the graph alive via retain_graph, and the ASE
-        # calculator keeps the result in .results; without this a worker that
-        # processes several structures in sequence accumulates GPU memory and
-        # OOMs after a handful, even at one job per GPU. Measured: 9 of 12
-        # structures failed without it, 0 with it.
-        try:
-            atoms.calc.results.pop("hessian", None)
-        except Exception:
-            pass
-        try:
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
-
-    # The model computes the Hessian on raw positions and is BLIND to ASE
-    # constraints - unlike atoms.get_forces(), which zeroes constrained forces.
-    # Left unprojected, a slab's frozen substrate contributes its own (spurious)
-    # modes: measured on OC20/OC22 that inflated the index >= 2 rate from ~10%
-    # to 60-75%, and left 3 acoustic modes visible where FixAtoms should give 0.
-    # Restrict to the free degrees of freedom before returning.
-    fixed = set()
-    for c in getattr(atoms, "constraints", []) or []:
-        idx = getattr(c, "index", None)
-        if idx is None and hasattr(c, "get_indices"):
-            try: idx = c.get_indices()
-            except Exception: idx = None
-        if idx is not None:
-            fixed.update(int(i) for i in np.atleast_1d(idx))
-    if fixed:
-        free = [i for i in range(len(atoms)) if i not in fixed]
-        dof = np.array([3 * i + k for i in free for k in range(3)], dtype=int)
-        H = H[np.ix_(dof, dof)]
-    return H
 
 
 def hessian_outputs(atoms, nev_store=8, tol=1e-2, chunk=1):
