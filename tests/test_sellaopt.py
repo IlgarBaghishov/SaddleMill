@@ -391,3 +391,57 @@ class TestAttemptGeometryParity:
                 assert a is None and b is None
                 continue
             assert np.allclose(a.get_positions(), b.get_positions())
+
+
+# --------------------------------------------------------------------------
+# SinglePoint + exact Hessian
+# --------------------------------------------------------------------------
+
+class TestSinglePointHessianConfig:
+    def test_defaults_exist(self):
+        from saddlemill.config import ConfigManager
+        sp = ConfigManager.DEFAULTS["ourSinglePoint"]
+        for k in ("compute_hessian", "hessian_nev_store", "hessian_tol", "hessian_chunk"):
+            assert k in sp, f"[ourSinglePoint] missing {k}"
+        assert sp["compute_hessian"] is False, "must be off by default"
+
+    def test_requires_frames_per_job_1(self):
+        """fairchem computes a Hessian for one system at a time."""
+        from saddlemill.config import load_method
+        c = make_config_dict(method="SinglePoint")
+        c["Main"]["Calculator"] = "FAIRChemCalculator"
+        c["ourSinglePoint"]["compute_hessian"] = True
+        c["ourSinglePoint"]["frames_per_job"] = 3
+        with pytest.raises(NotImplementedError, match="frames_per_job=1"):
+            load_method(c)
+        c["ourSinglePoint"]["frames_per_job"] = 1
+        assert load_method(c).__name__ == "singlepoint"
+
+    def test_requires_fairchem(self):
+        from saddlemill.config import load_method
+        c = make_config_dict(method="SinglePoint")
+        c["Main"]["Calculator"] = "Vasp"
+        c["ourSinglePoint"]["compute_hessian"] = True
+        c["ourSinglePoint"]["vasp_command"] = "srun vasp_std"
+        with pytest.raises(NotImplementedError, match="FAIRChemCalculator"):
+            load_method(c)
+
+
+class TestHessianOutputs:
+    def test_returns_empty_without_hessian_support(self):
+        """EMT is not a fairchem model, so there is no analytical Hessian —
+        the helper must degrade quietly rather than raise."""
+        from saddlemill.tools import hessian_outputs
+        atoms = _cu_slab(); atoms.calc = EMT()
+        assert hessian_outputs(atoms) == {}
+
+    def test_eigenmode_key_is_what_dimer_and_sella_consume(self):
+        """The reuse path between a Hessian job and the next search job is
+        atoms.info['eigenmode'] — assert the contract in both directions."""
+        import inspect
+        from saddlemill import tools, sellaopt, dimeropt
+        assert "eigenmode" in inspect.getsource(tools.hessian_outputs)
+        # both searches read info['eigenmode'] (with orig_info fallback)
+        for mod in (sellaopt, dimeropt):
+            src = inspect.getsource(mod)
+            assert "atoms.info.get('eigenmode')" in src

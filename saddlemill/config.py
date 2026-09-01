@@ -45,6 +45,15 @@ class ConfigManager:
             "vasp_ncore": None,
         },
         "ourSinglePoint": {
+            # Exact analytical Hessian for every frame (FAIRChem, conservative
+            # models only). Stamps hessian_index / hessian_nzero /
+            # hessian_eigenvalues / eigenmode / curvature onto the output, so a
+            # SinglePoint pass both verifies the index AND seeds the next
+            # Dimer/Sella run with an exact eigenmode. Forces frames_per_job=1.
+            "compute_hessian": False,
+            "hessian_nev_store": 8,   # how many of the lowest eigenvalues to keep
+            "hessian_tol": 1e-2,      # eigenvalue < -tol counts toward the index
+            "hessian_chunk": 4,       # vmap rows per batch; lower = less memory
             "frames_per_job": 1,  # 1 (default) | 3. With 3, each executorlib job processes a triplet (e.g. DM min1/TS/min2) in a single batched FAIRChem forward pass. VASP requires 1.
             "vasp_command": None,
             "vasp_ncore": None,
@@ -306,6 +315,16 @@ def load_method(config_dict):
                 f"method='SinglePoint' supports FAIRChemCalculator, Vasp, and "
                 f"VaspInteractive; got Calculator={calc_name!r}."
             )
+        if config_dict["ourSinglePoint"].get("compute_hessian"):
+            if calc_name != "FAIRChemCalculator":
+                raise NotImplementedError(
+                    "[ourSinglePoint] compute_hessian requires "
+                    f"Calculator=FAIRChemCalculator; got {calc_name!r}.")
+            fpj = config_dict["ourSinglePoint"].get("frames_per_job", 1)
+            if fpj != 1:
+                raise NotImplementedError(
+                    "[ourSinglePoint] compute_hessian requires frames_per_job=1 "
+                    f"(fairchem computes a Hessian for one system at a time); got {fpj}.")
         if calc_name in ("Vasp", "VaspInteractive"):
             fpj = config_dict["ourSinglePoint"].get("frames_per_job", 1)
             if fpj != 1:

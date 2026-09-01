@@ -794,6 +794,55 @@ def _analytic_hessian(atoms, chunk=4):
     return H
 
 
+def hessian_outputs(atoms, nev_store=8, tol=1e-2, chunk=4):
+    """Exact Hessian summary for a structure, as a dict to stamp onto output.
+
+    Returns ``{}`` when no analytical Hessian is available (direct-force model,
+    hessian output not enabled on the calculator, or out of memory) so the caller
+    degrades to a plain single point rather than failing the job.
+
+    The ``eigenmode`` key is the point of the whole thing: it is the EXACT lowest
+    eigenvector, and both ``dimeropt`` and ``sellaopt`` already read
+    ``atoms.info['eigenmode']`` to seed their search. So a SinglePoint+Hessian
+    pass feeds the next reconvergence for free, with no extra plumbing - and an
+    exact mode is a strictly better seed than the stored approximate one.
+
+    Keys: hessian_index (count below -tol), hessian_nzero, hessian_eigenvalues
+    (lowest nev_store), eigenmode (N,3), curvature (lowest eigenvalue).
+    """
+    H = _analytic_hessian(atoms, chunk=chunk)
+    if H is None:
+        return {}
+    evals, evecs = np.linalg.eigh(H)
+
+    # Map the lowest eigenvector back to full (N, 3) Cartesian. The Hessian is
+    # restricted to free DOF, so constrained atoms take zero displacement.
+    fixed = set()
+    for c in getattr(atoms, "constraints", []) or []:
+        idx = getattr(c, "index", None)
+        if idx is None and hasattr(c, "get_indices"):
+            try: idx = c.get_indices()
+            except Exception: idx = None
+        if idx is not None:
+            fixed.update(int(i) for i in np.atleast_1d(idx))
+    free = [i for i in range(len(atoms)) if i not in fixed]
+    mode = np.zeros((len(atoms), 3))
+    v = evecs[:, 0]
+    for k, i in enumerate(free):
+        mode[i] = v[3 * k:3 * k + 3]
+    n = np.linalg.norm(mode)
+    if n > 1e-12:
+        mode /= n
+
+    return {
+        "hessian_index": int((evals < -tol).sum()),
+        "hessian_nzero": int((np.abs(evals) < 1e-3).sum()),
+        "hessian_eigenvalues": [float(x) for x in evals[:nev_store]],
+        "eigenmode": mode,
+        "curvature": float(evals[0]),
+    }
+
+
 def hessian_index(atoms, nev=4, eps=2e-3, tol=1e-2, maxiter=300, analytic=True):
     """Lowest *nev* Hessian eigenvalues by finite-difference Lanczos.
 

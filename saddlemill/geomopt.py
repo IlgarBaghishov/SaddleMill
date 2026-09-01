@@ -408,6 +408,8 @@ def singlepoint(i, config_dict, atoms, calc, consecutive_errors=None,
     is_vasp = config_dict["Main"]["Calculator"] in ("Vasp", "VaspInteractive")
     status_file = f"{method_name}_status_csvs/status_rank_{rank}.csv"
     zip_name = f"{method_name}_debug_zips/structure_rank_{rank}_data.zip"
+    our_sp = config_dict.get("ourSinglePoint", {}) or {}
+    hess_extra = {}
     task_name = get_task_name(config_dict)
 
     frames = atoms if isinstance(atoms, list) else [atoms]
@@ -503,6 +505,19 @@ def singlepoint(i, config_dict, atoms, calc, consecutive_errors=None,
             a = frames[0]
             a.calc = calc
             ef_pairs = [(a.get_potential_energy(), a.get_forces())]
+            if our_sp.get("compute_hessian"):
+                from saddlemill.tools import hessian_outputs
+                hess_extra = hessian_outputs(
+                    a,
+                    nev_store=our_sp.get("hessian_nev_store", 8),
+                    tol=our_sp.get("hessian_tol", 1e-2),
+                    chunk=our_sp.get("hessian_chunk", 4),
+                )
+                if not hess_extra:
+                    # No analytical Hessian available (non-conservative model, or
+                    # OOM). Say so rather than silently emitting a plain SP.
+                    print(f"Rank {rank} WARNING structure {i}: compute_hessian "
+                          f"requested but no analytical Hessian available.", flush=True)
 
         if input_format == "lmdb":
             import fairchem.core.datasets  # noqa: F401  (register aselmdb backend)
@@ -518,6 +533,11 @@ def singlepoint(i, config_dict, atoms, calc, consecutive_errors=None,
             # as traj output. sm_extra is empty for FAIRChem (vasp_calc is None) ->
             # byte-equivalent passthrough, preserving the build_lmdb_parallel parity.
             sm_extra = getattr(vasp_calc, "sm_extra_outputs", {}) or {}
+            if hess_extra:
+                # eigenmode is (N,3); ase.db data= takes nested lists fine.
+                sm_extra = {**sm_extra,
+                            **{k: (v.tolist() if hasattr(v, "tolist") else v)
+                               for k, v in hess_extra.items()}}
             if record_converged:
                 # Record the real convergence verdict in lmdb data['info'] too
                 # (the CSV gets it via log_status regardless of output format). Only
@@ -538,6 +558,8 @@ def singlepoint(i, config_dict, atoms, calc, consecutive_errors=None,
                     a.info['src_index'] = i
                     a.info['status'] = sp_status
                     a.info['task_name'] = task_name
+                    if hess_extra:
+                        a.info.update(hess_extra)
                     if record_converged:
                         a.info['converged'] = int(sp_status == 'converged')
                     a.calc = SinglePointCalculator(a, energy=e, forces=f_arr)
