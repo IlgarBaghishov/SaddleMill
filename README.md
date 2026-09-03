@@ -137,7 +137,7 @@ pip install fairchem-data-omat
 # If you will need some of the catsunami functionality or create Vasp input files for oc20
 pip install fairchem-data-oc
 # If you will need VaspInteractive
-pip install git+https://github.com/ulissigroup/vasp-interactive.git
+pip install git+https://github.com/tiangroup-uofa/vasp-interactive.git
 # If you will need method = Sella (P-RFO saddle search) — see the note below
 pip install sella
 

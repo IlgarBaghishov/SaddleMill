@@ -12,7 +12,7 @@ Minimum required versions (baseline, enforced in `pyproject.toml`):
 
 Both are required by the package — `fairchem-core` registers the LMDB backend that `ase.db.connect` uses for `.aselmdb` files, and `ase >= 3.26.0` is the first ASE release whose `db` layer wires up that backend correctly. Any code path that does ASE LMDB I/O must `import fairchem.core.datasets` before calling `ase.db.connect`.
 
-**VaspInteractive**: always use the ulissigroup implementation (`from vasp_interactive import VaspInteractive`, installed via the git URL in `README.md`). **Never use ASE's bundled `ase.calculators.vasp.interactive.VaspInteractive` — it is broken.** Optional VASP-input-generation and VaspInteractive install steps live in `README.md`; refer there rather than hardcoding install commands.
+**VaspInteractive**: always use the maintained `tiangroup-uofa` fork (`from vasp_interactive import VaspInteractive`, installed via the git URL in `README.md`; the upstream `ulissigroup` repo is frozen and breaks on VASP >= 6.4.3). **Never use ASE's bundled `ase.calculators.vasp.interactive.VaspInteractive` — it is broken.** Optional VASP-input-generation and VaspInteractive install steps live in `README.md`; refer there rather than hardcoding install commands.
 
 ## Entry Point
 
