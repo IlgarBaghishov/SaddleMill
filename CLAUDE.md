@@ -313,7 +313,7 @@ Module-level config: `ANALYZE_STATUSES = {"not_converged", "converged"}` (set to
 ### `nebtools/`
 Standalone scripts for preparing NEB inputs. Currently `create_endpoints_for_MP_batteries.py` (Materials Project battery dataset endpoint generation by ion substitution).
 
-### `scripts/` - Downstream dataset utilities
+### `scripts/` - Downstream dataset and analysis utilities
 Standalone post-processing on a finished campaign's output dirs (not part of `python -m saddlemill`). The Dimer → DoubleMinimization → initbasinopt → SaddleFlow-dataset pipeline:
 - `build_lmdb_parallel.py` - parallel multi-shard ASE-LMDB build from DoubleMinimization `(R,S,P)` triplet `.traj`s (converged-only filter, per-frame `ms_id`, `data['info']`+`traj_path`); the "no-EF" triplet dataset (SaddleFlow dataset 1, positional `MaterialsSaddlesDataset` format).
 - `consolidate_dimer_basin_entry.py` - extracts each converged Dimer attempt's basin-entry frame (first step of the last negative-curvature stretch, from `dimer_opt_*.log`) into `dimer_basin_entry_*.traj`; the input to an `initbasinopt` Minimization run.
@@ -322,6 +322,10 @@ Standalone post-processing on a finished campaign's output dirs (not part of `py
 - `make_traj_datasets.py` - builds the SaddleFlow "trajectory→saddle" LMDB datasets: D3 (all both-converged saddles, 18 rows) and D2 (matched, +4 initbasinopt rows = 22). Each saddle = one `group_id` (`= src*16+att`, consistent across datasets); rows = saddle (flow target, energy + eigenmode) + reactant/product minima (E+F) + each DM/dimer/initbasin trajectory resampled to 6 RMSD-uniform nodes by interpolation (positions wrapped, E/F on the 3 core rows only); deterministic 90/5/5 split. Phases `locmap` / `build` (multi-node, per-zip-batched, resumable via `.done`) / `verify` / `d1split` (emit a D1 split manifest on the same `group_id` split). On-disk schema documented in `datasets/DATASETS_FOR_SADDLEFLOW.md` in the campaign dir.
 - `measure_dataset23.py` - sizing/timing measurement for the `make_traj_datasets` build (samples saddles, runs the real 6-node interpolation, writes a throwaway LMDB to estimate bytes/frame and build time).
 - `backfill_status.py`, `extract_neb_triplets.py` - status-CSV backfill / NEB-triplet extraction helpers.
+
+Campaign analysis figures:
+- `plot_guess_parity.py` - parity figure comparing two TS-guess sources run through the same DFT dimer campaign (cheap *dataset* guess vs linear-interpolation *midpoint* guess): square scatter of max per-atom displacement guess→DFT saddle per arm, marginal histogram + mean/median/p90 per arm, marker shape = convergence category, color = force-call speedup. Both arms are judged on one shared force-call budget (`--budget`, default 600 = the midpoint run's NSW), so a dataset guess needing more than that counts as unconverged and force calls are clipped for both. Input is one CSV (`mid_*`/`uma_*` maxdisp/steps/conv/fcalls columns, one row per matched structure); no split or directory layout is assumed. `--mode linear|logfix|logbreak` (exact zeros are floored to `0.5*min-positive` and starred in the log modes, plotted at the origin in linear). Writes `<out>.pdf`, plus `<out>.png` with `--png`. Prints ZEROCHECK/AXCHECK/P90CHECK/DASHCHECK self-checks; all must read OK before a figure is used.
+
 
 ## Configuration Reference (`config.ini`)
 
